@@ -13,6 +13,8 @@ jobs:
   package:
     name: ${{ matrix.distro }} package
     runs-on: ubuntu-24.04
+    env:
+      PACKAGING_CACHE_DIR: ${{ runner.temp }}/omp-native-packaging
     strategy:
       fail-fast: false
       matrix:
@@ -25,7 +27,31 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
+      - name: Restore Rust package cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PACKAGING_CACHE_DIR }}
+          key: linux-packages-rust-${{ runner.os }}-${{ runner.arch }}-${{ matrix.distro }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            linux-packages-rust-${{ runner.os }}-${{ runner.arch }}-${{ matrix.distro }}-${{ hashFiles('Cargo.lock') }}-
+            linux-packages-rust-${{ runner.os }}-${{ runner.arch }}-${{ matrix.distro }}-
+
+      - name: Set up BuildKit
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build package image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: packaging/containers/${{ matrix.distro }}.Dockerfile
+          tags: omp-native-package-${{ matrix.distro }}
+          load: true
+          cache-from: type=gha,scope=linux-packages-${{ matrix.distro }}
+          cache-to: type=gha,mode=max,scope=linux-packages-${{ matrix.distro }}
+
       - name: Build package
+        env:
+          PACKAGING_SKIP_IMAGE_BUILD: "1"
         run: ./packaging/build-packages.sh "${{ matrix.distro }}"
 
       - name: Upload package

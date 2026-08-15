@@ -18,8 +18,7 @@ PACKAGE_DESCRIPTION="$(
 )"
 
 build_release() {
-    rm -rf "$TARGET_DIR"
-    mkdir -p "$DIST_DIR" "${CARGO_HOME:-/tmp/omp-native-cargo}"
+    mkdir -p "$DIST_DIR" "${CARGO_HOME:-/tmp/omp-native-cargo}" "$TARGET_DIR"
     export CARGO_TARGET_DIR="$TARGET_DIR"
     export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(stat -c %Y "$ROOT_DIR/Cargo.lock")}"
     cargo build --locked --release --manifest-path "$ROOT_DIR/Cargo.toml"

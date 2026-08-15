@@ -19,7 +19,7 @@ pkgrel=1
 pkgdesc='$PACKAGE_DESCRIPTION'
 arch=('$ARCH')
 license=('LicenseRef-Unknown')
-depends=('gtk4>=4.22' 'libadwaita>=1.9' 'fontconfig')
+depends=('alsa-lib' 'gtk4>=4.22' 'libadwaita>=1.9' 'fontconfig')
 options=('!debug')
 source=('omp-native' 'dev.omp.Native.desktop' 'dev.omp.Native.svg')
 sha256sums=('SKIP' 'SKIP' 'SKIP')

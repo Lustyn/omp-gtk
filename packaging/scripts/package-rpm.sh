@@ -18,6 +18,7 @@ Version:        $RPM_VERSION
 Release:        1%{?dist}
 Summary:        $PACKAGE_DESCRIPTION
 License:        LicenseRef-Unknown
+Requires:        alsa-lib
 Requires:        gtk4 >= 4.22
 Requires:        libadwaita >= 1.9
 Source0:        omp-native

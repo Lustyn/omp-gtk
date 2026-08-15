@@ -1,6 +1,7 @@
 FROM fedora:44
 
 RUN dnf install --assumeyes \
+        alsa-lib-devel \
         cargo \
         fontconfig-devel \
         gcc \

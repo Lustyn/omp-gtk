@@ -11,7 +11,7 @@ install_payload "$STAGING"
 
 DEB_VERSION="${PACKAGE_VERSION//-/~}"
 DEB_ARCH="$(dpkg --print-architecture)"
-mkdir -p "$WORK_DIR/debian"
+mkdir -p "$WORK_DIR/debian" "$STAGING/DEBIAN"
 cat >"$WORK_DIR/debian/control" <<EOF
 Source: omp-native
 Section: devel
@@ -31,7 +31,6 @@ SHLIBS_DEPENDS="$(
 )"
 INSTALLED_SIZE="$(du -sk "$STAGING/usr" | cut -f1)"
 
-mkdir -p "$STAGING/DEBIAN"
 cat >"$STAGING/DEBIAN/control" <<EOF
 Package: omp-native
 Version: $DEB_VERSION
