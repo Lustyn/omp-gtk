@@ -8,6 +8,31 @@ use serde_json::Value;
 const MAX_REASSEMBLED_BYTES: usize = 64 * 1024 * 1024;
 const CHUNK_PAYLOAD_BYTES: usize = 256 * 1024;
 const MAX_CHUNKS: usize = MAX_REASSEMBLED_BYTES.div_ceil(CHUNK_PAYLOAD_BYTES);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageContentType {
+    Image,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageContent {
+    #[serde(rename = "type")]
+    pub kind: ImageContentType,
+    pub data: String,
+    pub mime_type: String,
+}
+
+impl ImageContent {
+    pub fn new(data: String, mime_type: impl Into<String>) -> Self {
+        Self {
+            kind: ImageContentType::Image,
+            data,
+            mime_type: mime_type.into(),
+        }
+    }
+}
+
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -125,6 +150,7 @@ pub struct SessionState {
 
 #[derive(Debug, Clone)]
 pub struct RpcResponse {
+    pub id: Option<String>,
     pub command: String,
     pub id: Option<String>,
     pub success: bool,
@@ -624,6 +650,23 @@ mod tests {
         assert_eq!(update.id.as_deref(), Some("CargoPackageScout"));
         assert_eq!(update.status.as_deref(), Some("running"));
         assert_eq!(update.task.as_deref(), Some("Read Cargo.toml"));
+    }
+
+    #[test]
+    fn preserves_response_id_for_submission_reconciliation() {
+        let event = decode_event(json!({
+            "type": "response",
+            "id": "native_42",
+            "command": "prompt",
+            "success": false,
+            "error": "rejected"
+        }));
+        let RpcEvent::Response(response) = event else {
+            panic!("expected an RPC response");
+        };
+        assert_eq!(response.id.as_deref(), Some("native_42"));
+        assert_eq!(response.command, "prompt");
+        assert!(!response.success);
     }
 
     #[test]

@@ -1,3 +1,7 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
 use gtk::prelude::*;
 use gtk4 as gtk;
 use crate::bridge::protocol::{InterruptMode, QueueMode};
@@ -8,6 +12,10 @@ use super::icons;
 pub(crate) struct ComposerView {
     root: gtk::Box,
     input: gtk::TextView,
+    attach: gtk::Button,
+    attachment_strip: gtk::ScrolledWindow,
+    attachment_list: gtk::Box,
+    attachment_previews: Rc<RefCell<HashMap<u64, gtk::Box>>>,
     send: gtk::Button,
     stop: gtk::Button,
     running_actions: gtk::Box,
@@ -84,12 +92,33 @@ pub(crate) fn build() -> ComposerView {
         let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
         placeholder_for_change.set_visible(text.is_empty());
     });
+    let attachment_list = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    attachment_list.update_property(&[gtk::accessible::Property::Label("Attached images")]);
+    let attachment_strip = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_height(true)
+        .child(&attachment_list)
+        .build();
+    attachment_strip.set_margin_top(7);
+    attachment_strip.set_margin_start(10);
+    attachment_strip.set_margin_end(10);
+    attachment_strip.set_visible(false);
+    attachment_strip.add_css_class("attachment-strip");
+    let attachment_previews = Rc::new(RefCell::new(HashMap::new()));
+
 
     let controls = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     controls.set_margin_top(2);
     controls.set_margin_bottom(8);
     controls.set_margin_start(8);
     controls.set_margin_end(8);
+    let attach = icons::icon_button(icons::Icon::Paperclip, "Attach PNG or JPEG images");
+    attach.update_property(&[gtk::accessible::Property::Label("Attach images")]);
+    attach.set_sensitive(false);
+    attach.add_css_class("composer-affordance");
+    attach.add_css_class("attachment-button");
+
 
     let model_icon = icons::provider_icon("", 15);
     model_icon.root.add_css_class("provider-icon");
@@ -226,6 +255,7 @@ pub(crate) fn build() -> ComposerView {
     let extension_below = gtk::Box::new(gtk::Orientation::Vertical, 4);
     extension_below.set_visible(false);
     extension_below.add_css_class("extension-widgets");
+    controls.append(&attach);
     controls.append(&model_button);
     controls.append(&thinking_button);
     controls.append(&extension_status);
@@ -237,6 +267,7 @@ pub(crate) fn build() -> ComposerView {
     controls.append(&send);
     composer.append(&subagent_bar);
     composer.append(&extension_above);
+    composer.append(&attachment_strip);
     composer.append(&input_overlay);
     composer.append(&extension_below);
     composer.append(&controls);
@@ -274,6 +305,10 @@ pub(crate) fn build() -> ComposerView {
     ComposerView {
         root: composer,
         input,
+        attach,
+        attachment_strip,
+        attachment_list,
+        attachment_previews,
         send,
         stop,
         running_actions,
@@ -370,6 +405,10 @@ impl ComposerView {
     }
 
 
+    pub(crate) fn connect_attach_clicked(&self, callback: impl Fn() + 'static) {
+        self.attach.connect_clicked(move |_| callback());
+    }
+
     pub(crate) fn connect_model_clicked(&self, callback: impl Fn() + 'static) {
         self.model_button.connect_clicked(move |_| callback());
     }
@@ -420,8 +459,9 @@ impl ComposerView {
         self.send.set_tooltip_text(Some(action));
         self.send
             .update_property(&[gtk::accessible::Property::Label(action)]);
-        self.send
-            .set_sensitive(ready && !self.text().trim().is_empty());
+        self.send.set_sensitive(
+            ready && (!self.text().trim().is_empty() || self.has_attachments()),
+        );
     }
 
     pub(crate) fn set_running_turn_action(&self, steer_selected: bool) {
@@ -456,6 +496,70 @@ impl ComposerView {
         self.queue_count.set_visible(queued > 0);
         self.queue_count
             .set_tooltip_text(Some(&format!("{queued} queued messages")));
+    }
+
+    pub(crate) fn set_attachment_sensitive(&self, sensitive: bool) {
+        self.attach.set_sensitive(sensitive);
+    }
+
+    pub(crate) fn append_attachment_preview(
+        &self,
+        id: u64,
+        name: &str,
+        texture: &gtk::gdk::Texture,
+        callback: impl Fn(u64) + 'static,
+    ) {
+        let picture = gtk::Picture::for_paintable(texture);
+        picture.set_content_fit(gtk::ContentFit::Cover);
+        picture.set_size_request(76, 64);
+        picture.update_property(&[gtk::accessible::Property::Description(&format!(
+            "Preview of {name}"
+        ))]);
+
+        let remove = icons::icon_button(icons::Icon::X, &format!("Remove {name}"));
+        remove.update_property(&[gtk::accessible::Property::Label(&format!(
+            "Remove {name}"
+        ))]);
+        remove.set_halign(gtk::Align::End);
+        remove.set_valign(gtk::Align::Start);
+        remove.add_css_class("attachment-remove");
+        remove.connect_clicked(move |_| callback(id));
+
+        let overlay = gtk::Overlay::new();
+        overlay.set_child(Some(&picture));
+        overlay.add_overlay(&remove);
+        let label = gtk::Label::new(Some(name));
+        label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        label.set_max_width_chars(14);
+        label.set_tooltip_text(Some(name));
+        let preview = gtk::Box::new(gtk::Orientation::Vertical, 3);
+        preview.append(&overlay);
+        preview.append(&label);
+        preview.add_css_class("attachment-preview");
+
+        self.attachment_list.append(&preview);
+        self.attachment_previews.borrow_mut().insert(id, preview);
+        self.attachment_strip.set_visible(true);
+    }
+
+    pub(crate) fn remove_attachment_preview(&self, id: u64) {
+        if let Some(preview) = self.attachment_previews.borrow_mut().remove(&id) {
+            self.attachment_list.remove(&preview);
+        }
+        self.attachment_strip
+            .set_visible(!self.attachment_previews.borrow().is_empty());
+    }
+
+    pub(crate) fn clear_attachment_previews(&self) {
+        while let Some(child) = self.attachment_list.first_child() {
+            self.attachment_list.remove(&child);
+        }
+        self.attachment_previews.borrow_mut().clear();
+        self.attachment_strip.set_visible(false);
+    }
+
+    pub(crate) fn has_attachments(&self) -> bool {
+        !self.attachment_previews.borrow().is_empty()
     }
 
     pub(crate) fn set_model(&self, provider: &str, display_name: &str) {

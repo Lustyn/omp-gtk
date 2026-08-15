@@ -31,7 +31,7 @@ pub(crate) fn find(id: &str) -> Option<Story> {
     STORIES.iter().copied().find(|story| story.id == id)
 }
 
-const STORIES: [Story; 18] = [
+const STORIES: [Story; 19] = [
     Story {
         id: "header/ready",
         title: "Header · Ready",
@@ -108,6 +108,34 @@ const STORIES: [Story; 18] = [
         width: 900,
         height: 180,
         build: composer_disconnected,
+    },
+    Story {
+        id: "composer/attachments-empty",
+        title: "Composer attachments · Empty",
+        width: 900,
+        height: 180,
+        build: composer_attachments_empty,
+    },
+    Story {
+        id: "composer/attachments-populated",
+        title: "Composer attachments · Populated",
+        width: 900,
+        height: 280,
+        build: composer_attachments_populated,
+    },
+    Story {
+        id: "composer/attachments-multiple",
+        title: "Composer attachments · Multiple",
+        width: 900,
+        height: 280,
+        build: composer_attachments_multiple,
+    },
+    Story {
+        id: "composer/attachments-error",
+        title: "Composer attachments · Read error retained",
+        width: 900,
+        height: 360,
+        build: composer_attachments_error,
     },
     Story {
         id: "model-picker/default",
@@ -334,6 +362,67 @@ fn composer_disconnected() -> gtk::Widget {
     view.set_input_sensitive(false);
     view.set_primary_action(false, false);
     view.widget().clone()
+}
+
+fn attachment_story_composer() -> composer::ComposerView {
+    let view = composer::build();
+    view.set_input_sensitive(true);
+    view.set_attachment_sensitive(true);
+    view.set_model("openai-codex", "GPT-5.6-Sol");
+    view.set_thinking_sensitive(true);
+    view.set_thinking_label("High");
+    view
+}
+
+fn story_attachment_texture() -> gtk::gdk::Texture {
+    gtk::gdk::Texture::from_bytes(&gtk::glib::Bytes::from_static(include_bytes!(
+        "../assets/omp.svg"
+    )))
+    .expect("story attachment is a valid image")
+}
+
+fn append_story_attachment(view: &composer::ComposerView, id: u64, name: &str) {
+    view.append_attachment_preview(id, name, &story_attachment_texture(), |_| {});
+}
+
+fn composer_attachments_empty() -> gtk::Widget {
+    let view = attachment_story_composer();
+    view.set_primary_action(true, false);
+    view.widget().clone()
+}
+
+fn composer_attachments_populated() -> gtk::Widget {
+    let view = attachment_story_composer();
+    view.set_text("Describe what is shown");
+    append_story_attachment(&view, 1, "architecture.png");
+    view.set_primary_action(true, false);
+    view.widget().clone()
+}
+
+fn composer_attachments_multiple() -> gtk::Widget {
+    let view = attachment_story_composer();
+    view.set_text("Compare these in order");
+    append_story_attachment(&view, 1, "first.png");
+    append_story_attachment(&view, 2, "second.jpg");
+    append_story_attachment(&view, 3, "third.png");
+    view.set_primary_action(true, false);
+    view.widget().clone()
+}
+
+fn composer_attachments_error() -> gtk::Widget {
+    let conversation = ConversationView::transcript();
+    conversation.append_notice(
+        "Could not attach corrupt.jpg: Only PNG and JPEG images can be attached",
+        true,
+    );
+    let view = attachment_story_composer();
+    view.set_text("Keep this draft for retry");
+    append_story_attachment(&view, 1, "retained.png");
+    view.set_primary_action(true, false);
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    root.append(conversation.widget());
+    root.append(view.widget());
+    root.upcast()
 }
 
 fn model_picker_default() -> gtk::Widget {

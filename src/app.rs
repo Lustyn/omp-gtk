@@ -1,6 +1,7 @@
 use crate::alerts::{self, AlertKind, Alerts, SoundEvent, SoundPackChoice, WindowStatus};
 use crate::sound_registry::{self, RegistryPack};
 use crate::ui::{
+    attachments::{self, AttachmentId, ComposerAttachments},
     chat, composer, model_picker, sidebar, sound_settings, tool_components, workspace,
 };
 
@@ -22,7 +23,7 @@ use crate::bridge::protocol::{
     message_role, message_text, message_thinking, message_tool_calls, tool_result_parts,
 };
 use crate::bridge::{BridgeClient, OmpBridge};
-use crate::commands::{CommandCompletion, completions};
+use crate::commands::{CommandCompletion, completions, unsupported_native_mode_error};
 use crate::session_catalog::{self, SessionEntry};
 use chat::{MessageBody, MessageRole, ThinkingBlock};
 use sidebar::SessionRow;
@@ -69,7 +70,9 @@ pub(crate) fn build(app: &adw::Application) {
         completion_index: Cell::new(0),
         pending_user_messages: RefCell::new(VecDeque::new()),
         streaming_message: RefCell::new(None),
-        pending_submission: RefCell::new(None),
+        attachments: RefCell::new(ComposerAttachments::default()),
+        pending_submissions: RefCell::new(VecDeque::new()),
+        pasted_image_count: Cell::new(0),
         streaming_thinking: RefCell::new(None),
         tool_cards: RefCell::new(HashMap::new()),
         subagents: RefCell::new(HashMap::new()),
@@ -148,11 +151,6 @@ impl SubmissionAction {
     }
 }
 
-struct PendingSubmission {
-    request_id: String,
-    draft: String,
-    message: String,
-}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ReconciledComposerState {
     running_turn_action: RunningTurnAction,
@@ -177,6 +175,13 @@ fn reconcile_composer_state(
 
 
 
+struct PendingSubmission {
+    request_id: String,
+    draft_text: String,
+    message: String,
+    attachment_ids: Vec<AttachmentId>,
+}
+
 #[derive(Clone)]
 struct SubagentState {
     id: String,
@@ -198,8 +203,10 @@ struct AppController {
     completion_items: RefCell<Vec<CommandCompletion>>,
     completion_index: Cell<usize>,
     pending_user_messages: RefCell<VecDeque<String>>,
-    pending_submission: RefCell<Option<PendingSubmission>>,
     streaming_message: RefCell<Option<StreamingMessage>>,
+    attachments: RefCell<ComposerAttachments>,
+    pending_submissions: RefCell<VecDeque<PendingSubmission>>,
+    pasted_image_count: Cell<u64>,
     streaming_thinking: RefCell<Option<ThinkingBlock>>,
     tool_cards: RefCell<HashMap<String, ToolCard>>,
     subagents: RefCell<HashMap<String, SubagentState>>,
@@ -248,6 +255,13 @@ impl AppController {
             let Some(controller) = weak.upgrade() else {
                 return glib::Propagation::Proceed;
             };
+            if modifiers.contains(gdk::ModifierType::CONTROL_MASK)
+                && key == gdk::Key::v
+                && controller.clipboard_has_supported_image()
+            {
+                controller.paste_clipboard_image();
+                return glib::Propagation::Stop;
+            }
             if modifiers.contains(gdk::ModifierType::CONTROL_MASK) && key == gdk::Key::n {
                 controller.start_new_session();
                 return glib::Propagation::Stop;
@@ -304,6 +318,13 @@ impl AppController {
         self.ui.composer.connect_stop_clicked(move || {
             if let Some(controller) = weak.upgrade() {
                 controller.stop_current_turn();
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.ui.composer.connect_attach_clicked(move || {
+            if let Some(controller) = weak.upgrade() {
+                controller.present_image_picker();
             }
         });
 
@@ -580,7 +601,9 @@ impl AppController {
                 self.ui.chat_status.disconnected();
                 self.ui.composer.set_input_sensitive(false);
                 self.update_send_state();
-                self.pending_submission.borrow_mut().take();
+                while !self.pending_submissions.borrow().is_empty() {
+                    self.reject_submission_response(None);
+                }
                 self.show_error(&message);
             }
             RpcEvent::Other => {}
@@ -588,10 +611,10 @@ impl AppController {
     }
 
     fn handle_response(self: &Rc<Self>, response: RpcResponse) {
-        if matches!(response.command.as_str(), "prompt" | "steer" | "follow_up") {
-            self.finish_submission(&response);
-        }
         if !response.success {
+            if matches!(response.command.as_str(), "prompt" | "steer" | "follow_up") {
+                self.reject_submission_response(response.id.as_deref());
+            }
             if response.command == "new_session" {
                 self.pending_delete.borrow_mut().take();
             }
@@ -608,6 +631,9 @@ impl AppController {
                     .unwrap_or("omp rejected the request"),
             );
             return;
+        }
+        if matches!(response.command.as_str(), "prompt" | "steer" | "follow_up") {
+            self.accept_submission_response(response.id.as_deref());
         }
         if matches!(
             response.command.as_str(),
@@ -696,45 +722,70 @@ impl AppController {
             _ => {}
         }
     }
-    fn finish_submission(&self, response: &RpcResponse) {
-        let matches_pending = self
-            .pending_submission
-            .borrow()
-            .as_ref()
-            .is_some_and(|pending| {
-                response
-                    .id
-                    .as_deref()
-                    .map_or(true, |id| id == pending.request_id)
-            });
-        if !matches_pending {
-            return;
+
+    fn take_pending_submission(&self, request_id: Option<&str>) -> Option<PendingSubmission> {
+        let mut pending = self.pending_submissions.borrow_mut();
+        let index = match request_id {
+            Some(request_id) => pending
+                .iter()
+                .position(|submission| submission.request_id == request_id)?,
+            None => (!pending.is_empty()).then_some(0)?,
+        };
+        pending.remove(index)
+    }
+
+    fn remove_pending_user_message(&self, message: &str) {
+        let mut pending = self.pending_user_messages.borrow_mut();
+        if let Some(index) = pending.iter().position(|pending| pending == message) {
+            pending.remove(index);
         }
-        let pending = self
-            .pending_submission
+    }
+
+    fn reject_submission_response(&self, request_id: Option<&str>) {
+        let Some(submission) = self.take_pending_submission(request_id) else {
+            return;
+        };
+        self.remove_pending_user_message(&submission.message);
+        self.attachments
             .borrow_mut()
-            .take()
-            .expect("matched pending submission exists");
-        if response.success {
-            self.goal_completed_this_run.set(false);
-            self.goal_completion_calls.borrow_mut().clear();
-            self.record_prompt_sound();
-            self.set_window_status(WindowStatus::Working);
-            self.remove_empty_state();
+            .resolve_submission(&submission.attachment_ids, false);
+        if !self.running.get() {
+            self.ui.chat_status.idle();
+        }
+        self.update_send_state();
+    }
+
+    fn accept_submission_response(&self, request_id: Option<&str>) {
+        let Some(submission) = self.take_pending_submission(request_id) else {
+            return;
+        };
+        self.goal_completed_this_run.set(false);
+        self.goal_completion_calls.borrow_mut().clear();
+        self.record_prompt_sound();
+        self.set_window_status(WindowStatus::Working);
+        self.remove_empty_state();
+        if !submission.message.is_empty() {
             self.ui
                 .conversation
-                .append_message(MessageRole::User, &pending.message);
-            self.pending_user_messages
-                .borrow_mut()
-                .push_back(pending.message);
-            if self.ui.composer.text() == pending.draft {
-                self.ui.composer.set_text("");
+                .append_message(MessageRole::User, &submission.message);
+        }
+        if self.ui.composer.text() == submission.draft_text {
+            self.ui.composer.set_text("");
+        }
+        self.attachments
+            .borrow_mut()
+            .resolve_submission(&submission.attachment_ids, true);
+        if self.attachments.borrow().is_empty() {
+            self.ui.composer.clear_attachment_previews();
+        } else {
+            for id in submission.attachment_ids {
+                self.ui.composer.remove_attachment_preview(id);
             }
-            self.hide_completions();
-            self.scroll_to_bottom();
-            if let Some(client) = &self.client {
-                let _ = client.refresh_state();
-            }
+        }
+        self.hide_completions();
+        self.scroll_to_bottom();
+        if let Some(client) = &self.client {
+            let _ = client.refresh_state();
         }
         self.update_send_state();
     }
@@ -969,6 +1020,169 @@ impl AppController {
             self.session_rows.borrow_mut().push(session);
         }
         self.update_activity_counts();
+    }
+
+    fn present_image_picker(self: &Rc<Self>) {
+        if !self.ready.get() {
+            return;
+        }
+        let filter = gtk::FileFilter::new();
+        filter.set_name(Some("PNG and JPEG images"));
+        filter.add_mime_type("image/png");
+        filter.add_mime_type("image/jpeg");
+        let filters = gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&filter);
+        let dialog = gtk::FileDialog::builder()
+            .title("Attach images")
+            .modal(true)
+            .filters(&filters)
+            .default_filter(&filter)
+            .build();
+        let weak = Rc::downgrade(self);
+        dialog.open_multiple(
+            Some(&self.ui.window),
+            None::<&gio::Cancellable>,
+            move |result| {
+                let Ok(files) = result else {
+                    return;
+                };
+                let files = (0..files.n_items())
+                    .filter_map(|index| files.item(index))
+                    .filter_map(|item| item.downcast::<gio::File>().ok())
+                    .collect::<Vec<_>>();
+                if let Some(controller) = weak.upgrade() {
+                    controller.load_image_files(files);
+                }
+            },
+        );
+    }
+
+    fn load_image_files(self: &Rc<Self>, files: Vec<gio::File>) {
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            for file in files {
+                let name = file
+                    .basename()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Image".to_owned());
+                let bytes = match file.load_bytes_future().await {
+                    Ok((bytes, _)) => bytes.as_ref().to_vec(),
+                    Err(error) => {
+                        if let Some(controller) = weak.upgrade() {
+                            controller.show_error(&format!("Could not attach {name}: {error}"));
+                        }
+                        continue;
+                    }
+                };
+                let (image, bytes) = match encode_image_in_background(bytes).await {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        if let Some(controller) = weak.upgrade() {
+                            controller.show_error(&format!("Could not attach {name}: {error}"));
+                        }
+                        continue;
+                    }
+                };
+                let Some(controller) = weak.upgrade() else {
+                    break;
+                };
+                controller.append_loaded_attachment(name, image, bytes);
+            }
+        });
+    }
+
+    fn clipboard_has_supported_image(&self) -> bool {
+        let formats = self.ui.window.display().clipboard().formats();
+        formats.contain_mime_type("image/png") || formats.contain_mime_type("image/jpeg")
+    }
+
+    fn paste_clipboard_image(self: &Rc<Self>) {
+        if !self.ready.get() {
+            return;
+        }
+        let clipboard = self.ui.window.display().clipboard();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let bytes = match clipboard
+                .read_future(
+                    &["image/png", "image/jpeg"],
+                    glib::Priority::DEFAULT,
+                )
+                .await
+            {
+                Ok((stream, _)) => match read_stream_bytes(&stream).await {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        if let Some(controller) = weak.upgrade() {
+                            controller.show_error(&format!(
+                                "Could not read the clipboard image: {error}"
+                            ));
+                        }
+                        return;
+                    }
+                },
+                Err(error) => {
+                    if let Some(controller) = weak.upgrade() {
+                        controller
+                            .show_error(&format!("Could not read the clipboard image: {error}"));
+                    }
+                    return;
+                }
+            };
+            let (image, bytes) = match encode_image_in_background(bytes).await {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.show_error(&format!(
+                            "Could not attach the clipboard image: {error}"
+                        ));
+                    }
+                    return;
+                }
+            };
+            let Some(controller) = weak.upgrade() else {
+                return;
+            };
+            let number = controller.pasted_image_count.get() + 1;
+            controller.pasted_image_count.set(number);
+            controller.append_loaded_attachment(
+                format!("Pasted image {number}.png"),
+                image,
+                bytes,
+            );
+        });
+    }
+
+    fn append_loaded_attachment(
+        self: &Rc<Self>,
+        name: String,
+        image: crate::bridge::protocol::ImageContent,
+        bytes: Vec<u8>,
+    ) {
+        let texture = match gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)) {
+            Ok(texture) => texture,
+            Err(error) => {
+                self.show_error(&format!("Could not preview {name}: {error}"));
+                return;
+            }
+        };
+        let id = self.attachments.borrow_mut().add(&name, image);
+        let weak = Rc::downgrade(self);
+        self.ui
+            .composer
+            .append_attachment_preview(id, &name, &texture, move |id| {
+                if let Some(controller) = weak.upgrade() {
+                    controller.remove_attachment(id);
+                }
+            });
+        self.update_send_state();
+    }
+
+    fn remove_attachment(&self, id: AttachmentId) {
+        if self.attachments.borrow_mut().remove(id) {
+            self.ui.composer.remove_attachment_preview(id);
+            self.update_send_state();
+        }
     }
 
     fn present_workspace_picker(self: &Rc<Self>) {
@@ -1836,30 +2050,46 @@ impl AppController {
     }
 
     fn submit_current(&self) {
-        if !self.ready.get() || self.pending_submission.borrow().is_some() {
+        if !self.ready.get() || !self.pending_submissions.borrow().is_empty() {
             return;
         }
-        let draft = self.ui.composer.text();
-        let message = draft.trim().to_owned();
-        if message.is_empty() {
-            return;
-        }
+        let draft_text = self.ui.composer.text();
+        let message = draft_text.trim().to_owned();
         let Some(client) = &self.client else {
             return;
         };
-        let action = SubmissionAction::select(self.running.get(), self.running_turn_action.get());
-        let request = match action {
-            SubmissionAction::Prompt => client.prompt(&message),
-            SubmissionAction::Steer => client.steer(&message),
-            SubmissionAction::FollowUp => client.follow_up(&message),
+        if let Some(error) = unsupported_native_mode_error(&message) {
+            self.show_error(&error);
+            return;
+        }
+        let request = {
+            let attachments = self.attachments.borrow();
+            if message.is_empty() && attachments.is_empty() {
+                return;
+            }
+            let action = SubmissionAction::select(self.running.get(), self.running_turn_action.get());
+            match action {
+                SubmissionAction::Prompt => client.prompt(&message, attachments.images()),
+                SubmissionAction::Steer => client.steer(&message, attachments.images()),
+                SubmissionAction::FollowUp => client.follow_up(&message, attachments.images()),
+            }
         };
         match request {
             Ok(request_id) => {
-                self.pending_submission.replace(Some(PendingSubmission {
-                    request_id,
-                    draft,
-                    message,
-                }));
+                let attachment_ids = self.attachments.borrow().ids().collect::<Vec<_>>();
+                self.pending_user_messages
+                    .borrow_mut()
+                    .push_back(message.clone());
+                self.pending_submissions
+                    .borrow_mut()
+                    .push_back(PendingSubmission {
+                        request_id,
+                        draft_text,
+                        message,
+                        attachment_ids,
+                    });
+                self.ui.chat_status.activity("Sending");
+                self.hide_completions();
                 self.update_send_state();
             }
             Err(error) => self.show_error(&error.to_string()),
@@ -1929,10 +2159,14 @@ impl AppController {
             self.running_turn_action.get(),
             RunningTurnAction::Steer
         ));
-        self.ui.composer.set_primary_action(ready, running);
+        let primary_ready = ready && self.pending_submissions.borrow().is_empty();
         self.ui
             .composer
-            .set_submission_pending(self.pending_submission.borrow().is_some());
+            .set_primary_action(primary_ready, running);
+        self.ui.composer.set_attachment_sensitive(ready);
+        self.ui
+            .composer
+            .set_submission_pending(!self.pending_submissions.borrow().is_empty());
         self.ui
             .telemetry
             .cwd_button
@@ -2545,6 +2779,29 @@ fn compact_path(path: &Path) -> String {
         "…/{}",
         parts.into_iter().rev().collect::<Vec<_>>().join("/")
     )
+}
+
+async fn read_stream_bytes(stream: &gio::InputStream) -> Result<Vec<u8>, glib::Error> {
+    let mut output = Vec::new();
+    loop {
+        let bytes = stream
+            .read_bytes_future(64 * 1024, glib::Priority::DEFAULT)
+            .await?;
+        if bytes.is_empty() {
+            return Ok(output);
+        }
+        output.extend_from_slice(bytes.as_ref());
+    }
+}
+
+async fn encode_image_in_background(
+    bytes: Vec<u8>,
+) -> Result<(crate::bridge::protocol::ImageContent, Vec<u8>), String> {
+    gio::spawn_blocking(move || {
+        let image = attachments::encode_image(&bytes)?;
+        Ok((image, bytes))
+    })
+    .await
 }
 
 fn enter_inserts_newline(modifiers: gdk::ModifierType) -> bool {

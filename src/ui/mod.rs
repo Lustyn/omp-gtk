@@ -1,3 +1,4 @@
+pub(crate) mod attachments;
 pub(crate) mod chat;
 pub(crate) mod composer;
 pub(crate) mod conversation;

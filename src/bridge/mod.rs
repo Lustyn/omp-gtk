@@ -12,9 +12,12 @@ use std::thread;
 use std::time::Duration;
 
 use async_channel::{Receiver, Sender};
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 
-use self::protocol::{InterruptMode, QueueMode, RpcEvent, RpcFrameDecoder, decode_event};
+use self::protocol::{
+    ImageContent, InterruptMode, QueueMode, RpcEvent, RpcFrameDecoder, decode_event,
+};
 use crate::commands::unsupported_native_mode_error;
 
 #[derive(Clone)]
@@ -22,6 +25,17 @@ pub struct BridgeClient {
     writer: mpsc::Sender<WriterMessage>,
     next_request_id: Arc<AtomicU64>,
 }
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MessageRequest<'a> {
+    message: &'a str,
+    #[serde(skip_serializing_if = "image_slice_is_empty")]
+    images: &'a [ImageContent],
+}
+fn image_slice_is_empty(images: &&[ImageContent]) -> bool {
+    images.is_empty()
+}
+
 
 impl BridgeClient {
     pub fn initialize(&self) -> Result<(), BridgeError> {
@@ -35,19 +49,24 @@ impl BridgeClient {
         Ok(())
     }
 
-    pub fn prompt(&self, message: &str) -> Result<String, BridgeError> {
-        if let Some(error) = unsupported_native_mode_error(message) {
-            return Err(BridgeError(error));
-        }
-        self.request("prompt", json!({ "message": message }))
+    pub fn prompt(
+        &self,
+        message: &str,
+        images: &[ImageContent],
+    ) -> Result<String, BridgeError> {
+        self.message_request("prompt", message, images)
     }
 
-    pub fn steer(&self, message: &str) -> Result<String, BridgeError> {
-        self.request("steer", json!({ "message": message }))
+    pub fn steer(&self, message: &str, images: &[ImageContent]) -> Result<String, BridgeError> {
+        self.message_request("steer", message, images)
     }
 
-    pub fn follow_up(&self, message: &str) -> Result<String, BridgeError> {
-        self.request("follow_up", json!({ "message": message }))
+    pub fn follow_up(
+        &self,
+        message: &str,
+        images: &[ImageContent],
+    ) -> Result<String, BridgeError> {
+        self.message_request("follow_up", message, images)
     }
 
     pub fn set_steering_mode(&self, mode: QueueMode) -> Result<(), BridgeError> {
@@ -110,7 +129,7 @@ impl BridgeClient {
                 "workspace path cannot contain a line break".to_owned(),
             ));
         }
-        self.prompt(&format!("/move {path}")).map(|_| ())
+        self.prompt(&format!("/move {path}"), &[]).map(|_| ())
     }
 
     pub fn get_subagent_messages(&self, subagent_id: &str) -> Result<(), BridgeError> {
@@ -138,6 +157,20 @@ impl BridgeClient {
 
     pub fn respond_to_extension(&self, payload: Value) -> Result<(), BridgeError> {
         self.send_frame(payload)
+    }
+
+    fn message_request(
+        &self,
+        command: &str,
+        message: &str,
+        images: &[ImageContent],
+    ) -> Result<String, BridgeError> {
+        if let Some(error) = unsupported_native_mode_error(message) {
+            return Err(BridgeError(error));
+        }
+        let fields = serde_json::to_value(MessageRequest { message, images })
+            .map_err(|error| BridgeError(format!("failed to encode RPC request: {error}")))?;
+        self.request(command, fields)
     }
 
     fn request(&self, command: &str, fields: Value) -> Result<String, BridgeError> {
@@ -425,7 +458,7 @@ impl std::error::Error for BridgeError {}
 #[cfg(test)]
 mod tests {
     use super::{BridgeClient, WriterMessage, resolve_omp_executable};
-    use crate::bridge::protocol::{InterruptMode, QueueMode};
+    use crate::bridge::protocol::{ImageContent, InterruptMode, QueueMode};
     use crate::commands::unsupported_native_mode_error;
     use serde_json::Value;
     use std::ffi::OsStr;
@@ -565,7 +598,7 @@ mod tests {
                 next_request_id: Arc::new(AtomicU64::new(1)),
             };
 
-            let error = client.prompt(message).expect_err("reject mode command");
+            let error = client.prompt(message, &[]).expect_err("reject mode command");
 
             assert_eq!(
                 error.to_string(),
@@ -576,5 +609,55 @@ mod tests {
                 "{message} reached RPC"
             );
         }
+    }
+
+    #[test]
+    fn serializes_ordered_images_for_message_requests() {
+        let (writer, receiver) = mpsc::channel();
+        let client = BridgeClient {
+            writer,
+            next_request_id: Arc::new(AtomicU64::new(1)),
+        };
+        let images = [
+            ImageContent::new("Zmlyc3Q=".to_owned(), "image/png"),
+            ImageContent::new("c2Vjb25k".to_owned(), "image/jpeg"),
+        ];
+
+        let id = client
+            .prompt("compare these", &images)
+            .expect("queue prompt request");
+        assert_eq!(id, "native_1");
+        let WriterMessage::Frame(frame) = receiver.recv().expect("receive prompt request") else {
+            panic!("expected RPC frame");
+        };
+        let frame = serde_json::from_str::<Value>(&frame).expect("decode prompt request");
+        assert_eq!(frame["type"], "prompt");
+        assert_eq!(frame["images"][0]["type"], "image");
+        assert_eq!(frame["images"][0]["data"], "Zmlyc3Q=");
+        assert_eq!(frame["images"][0]["mimeType"], "image/png");
+        assert_eq!(frame["images"][1]["data"], "c2Vjb25k");
+        assert_eq!(frame["images"][1]["mimeType"], "image/jpeg");
+
+        client
+            .steer("use the second image", &images)
+            .expect("queue steer request");
+        let WriterMessage::Frame(frame) = receiver.recv().expect("receive steer request") else {
+            panic!("expected RPC frame");
+        };
+        let frame = serde_json::from_str::<Value>(&frame).expect("decode steer request");
+        assert_eq!(frame["type"], "steer");
+        assert_eq!(frame["images"][0]["data"], "Zmlyc3Q=");
+        assert_eq!(frame["images"][1]["data"], "c2Vjb25k");
+
+        client
+            .follow_up("then summarize both", &images)
+            .expect("queue follow-up request");
+        let WriterMessage::Frame(frame) = receiver.recv().expect("receive follow-up request") else {
+            panic!("expected RPC frame");
+        };
+        let frame = serde_json::from_str::<Value>(&frame).expect("decode follow-up request");
+        assert_eq!(frame["type"], "follow_up");
+        assert_eq!(frame["images"][0]["mimeType"], "image/png");
+        assert_eq!(frame["images"][1]["mimeType"], "image/jpeg");
     }
 }
