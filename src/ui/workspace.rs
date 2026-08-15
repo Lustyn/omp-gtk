@@ -19,6 +19,8 @@ pub(crate) struct WorkspaceView {
     pub(crate) preferences_button: gtk::Button,
     pub(crate) agent_hub_button: gtk::Button,
     pub(crate) back_button: gtk::Button,
+    pub(crate) branch_button: gtk::Button,
+    pub(crate) handoff_button: gtk::Button,
     pub(crate) content_stack: gtk::Stack,
     pub(crate) agent_hub: AgentHubView,
     pub(crate) subagent_conversation: ConversationView,
@@ -63,12 +65,33 @@ pub(crate) fn build(app: &adw::Application) -> WorkspaceView {
         "Open runtime agent hub, 0 active agents",
     )]);
     agent_hub_button.add_css_class("agent-hub-button");
+    let session_actions = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    session_actions.add_css_class("session-actions");
+    let branch_button =
+        icons::icon_button(icons::Icon::GitBranchPlus, "Branch from a message");
+    branch_button.update_property(&[gtk::accessible::Property::Label(
+        "Branch from a message",
+    )]);
+    branch_button.set_sensitive(false);
+    branch_button.add_css_class("session-action");
+    let handoff_button = icons::icon_button(
+        icons::Icon::MessageSquareShare,
+        "Hand off to a new conversation",
+    );
+    handoff_button.update_property(&[gtk::accessible::Property::Label(
+        "Hand off to a new conversation",
+    )]);
+    handoff_button.set_sensitive(false);
+    handoff_button.add_css_class("session-action");
+    session_actions.append(&branch_button);
+    session_actions.append(&handoff_button);
     header.append(&show_sidebar_button);
     header.append(&back_button);
     header.append(&assistant_mark);
     header.append(&title);
     header.append(&agent_hub_button);
     header.append(&chat_status.root);
+    header.append(&session_actions);
     header.append(&window_controls());
 
     let telemetry = TelemetryWidgets::new("No workspace");
@@ -147,6 +170,8 @@ pub(crate) fn build(app: &adw::Application) -> WorkspaceView {
         content_stack,
         agent_hub,
         subagent_conversation,
+        branch_button,
+        handoff_button,
         composer_clamp,
         chat_status,
         telemetry,

@@ -16,7 +16,8 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use self::protocol::{
-    ImageContent, InterruptMode, QueueMode, RpcEvent, RpcFrameDecoder, TodoPhase, decode_event,
+    BranchRequest, HandoffRequest, ImageContent, InterruptMode, QueueMode, RpcEvent,
+    RpcFrameDecoder, TodoPhase, decode_event,
 };
 use crate::commands::unsupported_native_mode_error;
 
@@ -107,6 +108,27 @@ impl BridgeClient {
         Ok(())
     }
 
+
+    pub fn get_branch_messages(&self) -> Result<(), BridgeError> {
+        self.request("get_branch_messages", Value::Null)?;
+        Ok(())
+    }
+
+    pub fn branch(&self, entry_id: &str) -> Result<(), BridgeError> {
+        let request = serde_json::to_value(BranchRequest { entry_id })
+            .map_err(|error| BridgeError(format!("failed to encode branch request: {error}")))?;
+        self.request("branch", request)?;
+        Ok(())
+    }
+
+    pub fn handoff(&self, custom_instructions: Option<&str>) -> Result<(), BridgeError> {
+        let request = serde_json::to_value(HandoffRequest {
+            custom_instructions,
+        })
+        .map_err(|error| BridgeError(format!("failed to encode handoff request: {error}")))?;
+        self.request("handoff", request)?;
+        Ok(())
+    }
     pub fn switch_session(&self, path: &Path) -> Result<(), BridgeError> {
         self.request(
             "switch_session",
@@ -701,6 +723,82 @@ mod tests {
         assert_eq!(
             frame["phases"][0]["tasks"][0]["blocker"],
             "Needs protocol state"
+        );
+    }
+
+    #[test]
+    fn serializes_branch_requests_with_stable_entry_ids() {
+        let (writer, receiver) = mpsc::channel();
+        let client = BridgeClient {
+            writer,
+            next_request_id: Arc::new(AtomicU64::new(1)),
+        };
+
+        client
+            .get_branch_messages()
+            .expect("queue branch message request");
+        client
+            .branch("entry-7f2b")
+            .expect("queue branch selection");
+
+        let WriterMessage::Frame(messages) =
+            receiver.recv().expect("receive branch message request")
+        else {
+            panic!("expected RPC frame");
+        };
+        let WriterMessage::Frame(branch) = receiver.recv().expect("receive branch request") else {
+            panic!("expected RPC frame");
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&messages).expect("decode branch message request"),
+            serde_json::json!({
+                "id": "native_1",
+                "type": "get_branch_messages",
+            })
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&branch).expect("decode branch request"),
+            serde_json::json!({
+                "id": "native_2",
+                "type": "branch",
+                "entryId": "entry-7f2b",
+            })
+        );
+    }
+
+    #[test]
+    fn serializes_optional_handoff_instructions_exactly() {
+        let (writer, receiver) = mpsc::channel();
+        let client = BridgeClient {
+            writer,
+            next_request_id: Arc::new(AtomicU64::new(1)),
+        };
+
+        client
+            .handoff(Some("Focus on the migration boundary"))
+            .expect("queue focused handoff");
+        client.handoff(None).expect("queue default handoff");
+
+        let WriterMessage::Frame(focused) = receiver.recv().expect("receive focused handoff") else {
+            panic!("expected RPC frame");
+        };
+        let WriterMessage::Frame(default) = receiver.recv().expect("receive default handoff") else {
+            panic!("expected RPC frame");
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&focused).expect("decode focused handoff"),
+            serde_json::json!({
+                "id": "native_1",
+                "type": "handoff",
+                "customInstructions": "Focus on the migration boundary",
+            })
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&default).expect("decode default handoff"),
+            serde_json::json!({
+                "id": "native_2",
+                "type": "handoff",
+            })
         );
     }
 }

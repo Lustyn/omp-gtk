@@ -1225,6 +1225,157 @@ popover.model-picker-popover > contents {
     color: #7d8794;
 }
 
+.session-actions {
+    margin-left: 4px;
+}
+
+.session-action {
+    min-width: 30px;
+    min-height: 30px;
+    padding: 0;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: #8d96a3;
+    box-shadow: none;
+}
+
+.session-action:hover {
+    background: #252a33;
+    color: #eef1f5;
+}
+
+.branch-picker {
+    background: #101319;
+}
+
+.branch-picker-header {
+    padding: 14px 14px 13px 18px;
+    border-bottom: 1px solid #292f39;
+}
+
+.branch-picker-heading,
+.handoff-heading {
+    color: #f0f2f6;
+    font-size: 17px;
+    font-weight: 750;
+}
+
+.branch-picker-subtitle,
+.handoff-detail {
+    color: #828c99;
+    font-size: 11px;
+}
+
+.branch-picker-close {
+    min-width: 34px;
+    min-height: 34px;
+    padding: 0;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: #929ba7;
+    box-shadow: none;
+}
+
+.branch-picker-close:hover {
+    background: #252a33;
+    color: #eef1f5;
+}
+
+.branch-picker-scroll {
+    background: #101319;
+}
+
+.branch-picker-list,
+.branch-picker-list row {
+    background: transparent;
+}
+
+.branch-picker-list {
+    padding: 8px;
+}
+
+.branch-picker-row {
+    margin: 2px 3px;
+}
+
+.branch-picker-row-action {
+    padding: 0;
+    border: 0;
+    border-radius: 10px;
+    background: transparent;
+    box-shadow: none;
+}
+
+.branch-picker-row-action:hover {
+    background: #202630;
+}
+
+.branch-picker-marker {
+    border-radius: 15px;
+    background: #29263a;
+    color: #c8bbff;
+    font-size: 11px;
+    font-weight: 750;
+}
+
+.branch-picker-message-label {
+    color: #eef1f5;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.branch-picker-preview {
+    color: #858f9d;
+    font-size: 11px;
+}
+
+.branch-picker-state {
+    padding: 48px 24px;
+}
+
+.branch-picker-state spinner,
+.branch-picker-state-icon {
+    color: #a996f0;
+}
+
+.branch-picker-state-icon.error {
+    color: #ef7f8d;
+}
+
+.branch-picker-state-title {
+    color: #d4d9e1;
+    font-size: 13px;
+    font-weight: 700;
+}
+
+.branch-picker-state-detail {
+    color: #7b8592;
+    font-size: 11px;
+}
+
+.handoff-dialog {
+    background: #101319;
+}
+
+.handoff-instructions-label {
+    color: #cbd1d9;
+    font-size: 11px;
+    font-weight: 650;
+}
+
+.handoff-instructions-scroll {
+    border: 1px solid #353c47;
+    border-radius: 9px;
+    background: #191d24;
+}
+
+.handoff-instructions {
+    background: #191d24;
+    color: #edf0f5;
+}
+
 .story-browser,
 .story-canvas {
     background: #0b0d10;

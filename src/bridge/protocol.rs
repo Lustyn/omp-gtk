@@ -182,6 +182,45 @@ pub struct SessionState {
     pub todo_phases: Vec<TodoPhase>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchMessage {
+    pub entry_id: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchMessagesResponse {
+    pub messages: Vec<BranchMessage>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchRequest<'a> {
+    pub entry_id: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchResponse {
+    pub text: String,
+    pub cancelled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandoffRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_instructions: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HandoffResponse {
+    pub saved_path: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RpcResponse {
     pub id: Option<String>,
@@ -730,8 +769,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        RpcEvent, RpcFrameDecoder, SessionState, SetTodosResponse, SubagentMessages,
-        SubagentSnapshot, TodoPhase, TodoStatus, decode_event,
+        BranchMessagesResponse, BranchResponse, HandoffResponse, RpcEvent, RpcFrameDecoder,
+        SessionState, SetTodosResponse, SubagentMessages, SubagentSnapshot, TodoPhase, TodoStatus,
+        decode_event,
     };
 
     #[test]
@@ -970,5 +1010,31 @@ mod tests {
         let response: SetTodosResponse =
             serde_json::from_value(json!({"todoPhases": phases})).unwrap();
         assert_eq!(response.todo_phases, state.todo_phases);
+}
+
+#[test]
+    fn decodes_branch_and_handoff_response_shapes() {
+        let messages: BranchMessagesResponse = serde_json::from_value(json!({
+            "messages": [
+                {"entryId": "entry-a", "text": "Start here"},
+                {"entryId": "entry-b", "text": "Or here"}
+            ]
+        }))
+        .expect("decode branch messages");
+        assert_eq!(messages.messages[1].entry_id, "entry-b");
+
+        let branch: BranchResponse = serde_json::from_value(json!({
+            "text": "Or here",
+            "cancelled": false
+        }))
+        .expect("decode branch response");
+        assert_eq!(branch.text, "Or here");
+        assert!(!branch.cancelled);
+
+        let handoff: HandoffResponse = serde_json::from_value(json!({
+            "savedPath": "/tmp/handoff.txt"
+        }))
+        .expect("decode handoff response");
+        assert_eq!(handoff.saved_path.as_deref(), Some("/tmp/handoff.txt"));
     }
 }

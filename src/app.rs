@@ -3,7 +3,8 @@ use crate::sound_registry::{self, RegistryPack};
 use crate::ui::{
     agent_hub as agent_hub_ui,
     attachments::{self, AttachmentId, ComposerAttachments},
-    chat, composer, model_picker, sidebar, sound_settings, todos, tool_components, workspace,
+    chat, composer, model_picker, session_actions, sidebar, sound_settings, todos, tool_components,
+    workspace,
 };
 
 use std::cell::{Cell, RefCell};
@@ -20,10 +21,11 @@ use serde_json::{Value, json};
 
 use crate::agent_hub::AgentHubState;
 use crate::bridge::protocol::{
-    InterruptMode, ModelSummary, QueueMode, RpcEvent, RpcResponse, SessionState, SetTodosResponse,
-    SlashCommand, SubagentMessages, SubagentSnapshot, SubagentUpdate, SubagentUpdateKind, TodoItem,
-    TodoPhase, TodoStatus, ToolEnd, ToolStart, ToolUpdate, message_cost, message_role, message_text,
-    message_thinking, message_tool_calls, tool_result_parts,
+    BranchMessagesResponse, BranchResponse, HandoffResponse, InterruptMode, ModelSummary, QueueMode,
+    RpcEvent, RpcResponse, SessionState, SetTodosResponse, SlashCommand, SubagentMessages,
+    SubagentSnapshot, SubagentUpdate, SubagentUpdateKind, TodoItem, TodoPhase, TodoStatus, ToolEnd,
+    ToolStart, ToolUpdate, message_cost, message_role, message_text, message_thinking,
+    message_tool_calls, tool_result_parts,
 };
 use crate::bridge::{BridgeClient, OmpBridge};
 use crate::commands::{CommandCompletion, completions, unsupported_native_mode_error};
@@ -89,6 +91,10 @@ pub(crate) fn build(app: &adw::Application) {
         pending_delete: RefCell::new(None),
         current_session_file: RefCell::new(None),
         current_session_title: RefCell::new("New conversation".to_owned()),
+        pending_session_notice: RefCell::new(None),
+        branch_picker: RefCell::new(None),
+        branch_busy: Cell::new(false),
+        handoff_busy: Cell::new(false),
         active_subagent: RefCell::new(None),
         session_cost: Cell::new(0.0),
         extension_widgets: RefCell::new(HashMap::new()),
@@ -225,6 +231,10 @@ struct AppController {
     pending_delete: RefCell<Option<PathBuf>>,
     current_session_file: RefCell<Option<PathBuf>>,
     current_session_title: RefCell<String>,
+    pending_session_notice: RefCell<Option<String>>,
+    branch_picker: RefCell<Option<session_actions::BranchPickerDialog>>,
+    branch_busy: Cell<bool>,
+    handoff_busy: Cell<bool>,
     active_subagent: RefCell<Option<String>>,
     session_cost: Cell<f64>,
     extension_widgets: RefCell<HashMap<String, gtk::Label>>,
@@ -406,6 +416,19 @@ impl AppController {
         self.ui.preferences_button.connect_clicked(move |_| {
             if let Some(controller) = weak.upgrade() {
                 controller.present_alert_preferences();
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.ui.branch_button.connect_clicked(move |_| {
+            if let Some(controller) = weak.upgrade() {
+                controller.present_branch_picker();
+            }
+        });
+        let weak = Rc::downgrade(self);
+        self.ui.handoff_button.connect_clicked(move |_| {
+            if let Some(controller) = weak.upgrade() {
+                controller.present_handoff();
             }
         });
 
@@ -666,7 +689,21 @@ impl AppController {
                 self.ui.todos.set_pending(false);
                 self.ui.todos.set_error(Some(error));
             }
-            self.show_error(error);
+            match response.command.as_str() {
+                "get_branch_messages" | "branch" => {
+                    self.branch_busy.set(false);
+                    if let Some(picker) = self.branch_picker.borrow().as_ref() {
+                        picker.show_error(error);
+                    }
+                    self.finish_session_action();
+                }
+                "handoff" => {
+                    self.handoff_busy.set(false);
+                    self.finish_session_action();
+                    self.show_error(error);
+                }
+                _ => self.show_error(error),
+            }
             return;
         }
         if matches!(response.command.as_str(), "prompt" | "steer" | "follow_up") {
@@ -688,18 +725,102 @@ impl AppController {
             return;
         }
         let Some(data) = response.data else {
-            if response.command == "new_session" {
-                self.refresh_after_new_session();
-            } else if response.command == "set_todos" {
-                self.reject_todo_reconciliation("omp returned no todo state.");
+            match response.command.as_str() {
+                "new_session" => self.refresh_after_new_session(),
+                "set_todos" => self.reject_todo_reconciliation("omp returned no todo state."),
+                "get_branch_messages" | "branch" => {
+                    self.branch_busy.set(false);
+                    if let Some(picker) = self.branch_picker.borrow().as_ref() {
+                        picker.show_error("omp returned an incomplete branch response.");
+                    }
+                    self.finish_session_action();
+                }
+                "handoff" => {
+                    self.handoff_busy.set(false);
+                    self.finish_session_action();
+                    self.show_error("omp returned an incomplete handoff response.");
+                }
+                _ => {}
             }
             return;
         };
 
         match response.command.as_str() {
+            "get_branch_messages" => {
+                self.branch_busy.set(false);
+                match serde_json::from_value::<BranchMessagesResponse>(data) {
+                    Ok(response) => {
+                        if let Some(picker) = self.branch_picker.borrow().as_ref() {
+                            picker.set_candidates(response.messages);
+                        }
+                    }
+                    Err(_) => {
+                        if let Some(picker) = self.branch_picker.borrow().as_ref() {
+                            picker.show_error("omp returned invalid branch message data.");
+                        }
+                    }
+                }
+                self.finish_session_action();
+            }
+            "branch" => {
+                self.branch_busy.set(false);
+                match serde_json::from_value::<BranchResponse>(data) {
+                    Ok(result) if !result.cancelled => {
+                        if let Some(picker) = self.branch_picker.borrow().as_ref() {
+                            picker.close();
+                        }
+                        self.refresh_after_confirmed_session_change(
+                            "Opening branched conversation",
+                            "Loading branched conversation…",
+                        );
+                    }
+                    Ok(_) => {
+                        if let Some(picker) = self.branch_picker.borrow().as_ref() {
+                            picker.show_error(
+                                "omp cancelled the branch. The current conversation is unchanged.",
+                            );
+                        }
+                        self.finish_session_action();
+                    }
+                    Err(_) => {
+                        if let Some(picker) = self.branch_picker.borrow().as_ref() {
+                            picker.show_error("omp returned invalid branch result data.");
+                        }
+                        self.finish_session_action();
+                    }
+                }
+            }
+            "handoff" => {
+                self.handoff_busy.set(false);
+                match serde_json::from_value::<Option<HandoffResponse>>(data) {
+                    Ok(Some(result)) => {
+                        self.pending_session_notice.replace(
+                            result
+                                .saved_path
+                                .map(|path| format!("Handoff document saved to: {path}")),
+                        );
+                        self.refresh_after_confirmed_session_change(
+                            "Opening handoff conversation",
+                            "Loading handoff conversation…",
+                        );
+                    }
+                    Ok(None) => {
+                        self.finish_session_action();
+                        self.show_error(
+                            "omp cancelled the handoff. The current conversation is unchanged.",
+                        );
+                    }
+                    Err(_) => {
+                        self.finish_session_action();
+                        self.show_error("omp returned invalid handoff result data.");
+                    }
+                }
+            }
             "get_state" => match serde_json::from_value::<SessionState>(data) {
                 Ok(state) => self.apply_state(state),
-                Err(error) => self.show_error(&format!("omp returned invalid session state: {error}")),
+                Err(error) => {
+                    self.show_error(&format!("omp returned invalid session state: {error}"))
+                }
             },
             "get_available_models" => {
                 if let Some(models) = data.get("models").cloned()
@@ -722,6 +843,10 @@ impl AppController {
                     .cloned()
                     .unwrap_or_default();
                 self.hydrate_messages(&messages);
+                if let Some(notice) = self.pending_session_notice.borrow_mut().take() {
+                    self.ui.conversation.append_notice(&notice, false);
+                    self.scroll_to_bottom();
+                }
             }
             "get_subagents" => {
                 if let Some(agents) = data.get("subagents").cloned()
@@ -753,7 +878,11 @@ impl AppController {
                 )),
             },
             "new_session" => self.refresh_after_new_session(),
-            "switch_session" | "set_session_name" => self.refresh_after_session_change(),
+            "switch_session" => self.refresh_after_confirmed_session_change(
+                "Opening conversation",
+                "Loading conversation…",
+            ),
+            "set_session_name" => self.refresh_after_session_change(),
             _ => {}
         }
     }
@@ -785,6 +914,27 @@ impl AppController {
             .borrow_mut()
             .resolve_submission(&submission.attachment_ids, false);
         if !self.running.get() {
+            self.ui.chat_status.idle();
+        }
+        self.update_send_state();
+    }
+
+    fn refresh_after_confirmed_session_change(&self, activity: &str, notice: &str) {
+        self.branch_busy.set(false);
+        self.handoff_busy.set(false);
+        self.close_subagent_view();
+        self.clear_messages();
+        self.clear_subagents();
+        self.ui.chat_status.activity(activity);
+        self.ui.conversation.append_notice(notice, false);
+        self.update_send_state();
+        self.refresh_after_session_change();
+    }
+
+    fn finish_session_action(&self) {
+        if self.running.get() {
+            self.ui.chat_status.activity("Working");
+        } else {
             self.ui.chat_status.idle();
         }
         self.update_send_state();
@@ -824,7 +974,6 @@ impl AppController {
         }
         self.update_send_state();
     }
-
     fn refresh_after_new_session(self: &Rc<Self>) {
         if let Some(path) = self.pending_delete.borrow_mut().take() {
             if let Err(error) = session_catalog::delete_session_files(&path) {
@@ -1495,6 +1644,91 @@ impl AppController {
         );
     }
 
+    fn present_branch_picker(self: &Rc<Self>) {
+        if !self.session_actions_available() {
+            return;
+        }
+        if self.branch_picker.borrow().is_none() {
+            let weak = Rc::downgrade(self);
+            let picker = session_actions::BranchPickerDialog::new(move |entry_id| {
+                if let Some(controller) = weak.upgrade() {
+                    controller.branch_from_message(&entry_id);
+                }
+            });
+            self.branch_picker.replace(Some(picker));
+        }
+        let picker = self.branch_picker.borrow().as_ref().cloned();
+        let Some(picker) = picker else {
+            return;
+        };
+        picker.show_loading();
+        picker.present(&self.ui.window);
+
+        let Some(client) = &self.client else {
+            picker.show_error("The omp bridge is not available.");
+            return;
+        };
+        self.branch_busy.set(true);
+        self.update_send_state();
+        if let Err(error) = client.get_branch_messages() {
+            self.branch_busy.set(false);
+            picker.show_error(&error.to_string());
+            self.finish_session_action();
+        }
+    }
+
+    fn branch_from_message(&self, entry_id: &str) {
+        if !self.session_actions_available() {
+            return;
+        }
+        let Some(client) = &self.client else {
+            return;
+        };
+        self.branch_busy.set(true);
+        if let Some(picker) = self.branch_picker.borrow().as_ref() {
+            picker.show_branching();
+        }
+        self.ui.chat_status.activity("Creating branch");
+        self.update_send_state();
+        if let Err(error) = client.branch(entry_id) {
+            self.branch_busy.set(false);
+            if let Some(picker) = self.branch_picker.borrow().as_ref() {
+                picker.show_error(&error.to_string());
+            }
+            self.finish_session_action();
+        }
+    }
+
+    fn present_handoff(self: &Rc<Self>) {
+        if !self.session_actions_available() {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        session_actions::present_handoff(&self.ui.window, move |instructions| {
+            if let Some(controller) = weak.upgrade() {
+                controller.start_handoff(&instructions);
+            }
+        });
+    }
+
+    fn start_handoff(&self, instructions: &str) {
+        if !self.session_actions_available() {
+            return;
+        }
+        let Some(client) = &self.client else {
+            return;
+        };
+        let instructions = instructions.trim();
+        self.handoff_busy.set(true);
+        self.ui.chat_status.activity("Generating handoff");
+        self.update_send_state();
+        if let Err(error) = client.handoff((!instructions.is_empty()).then_some(instructions)) {
+            self.handoff_busy.set(false);
+            self.finish_session_action();
+            self.show_error(&error.to_string());
+        }
+    }
+
     fn present_history(self: &Rc<Self>) {
         let sessions =
             session_catalog::discover_all_sessions(self.current_session_file.borrow().as_deref());
@@ -1513,7 +1747,7 @@ impl AppController {
     }
 
     fn open_session(self: &Rc<Self>, entry: &SessionEntry) {
-        if entry.current {
+        if entry.current || self.branch_busy.get() || self.handoff_busy.get() {
             return;
         }
         let Some(path) = entry.path.as_deref() else {
@@ -2166,6 +2400,8 @@ impl AppController {
         self.refresh_agent_surfaces();
         self.ui.title.set_text("Agent Hub");
         self.ui.back_button.set_visible(true);
+        self.ui.branch_button.set_visible(false);
+        self.ui.handoff_button.set_visible(false);
         self.ui.composer_clamp.set_visible(false);
         self.ui.content_stack.set_visible_child_name("agent-hub");
     }
@@ -2297,6 +2533,17 @@ impl AppController {
         if request_again {
             self.request_subagent_transcript();
         }
+    }
+
+    fn close_subagent_view(&self) {
+        self.active_subagent.borrow_mut().take();
+        self.ui.content_stack.set_visible_child_name("chat");
+        self.ui.back_button.set_visible(false);
+        self.ui.branch_button.set_visible(true);
+        self.ui.handoff_button.set_visible(true);
+        self.ui.composer_clamp.set_visible(true);
+        self.ui.title.set_text(&self.current_session_title.borrow());
+        self.update_send_state();
     }
 
     fn subagent_transcript_failed(&self, response_id: Option<&str>, error: &str) {
@@ -2438,6 +2685,9 @@ impl AppController {
     }
 
     fn start_new_session(&self) {
+        if self.branch_busy.get() || self.handoff_busy.get() {
+            return;
+        }
         let Some(client) = &self.client else {
             return;
         };
@@ -2460,7 +2710,11 @@ impl AppController {
     }
 
     fn submit_current(&self) {
-        if !self.ready.get() || !self.pending_submissions.borrow().is_empty() {
+        if self.branch_busy.get()
+            || self.handoff_busy.get()
+            || !self.ready.get()
+            || !self.pending_submissions.borrow().is_empty()
+        {
             return;
         }
         let draft_text = self.ui.composer.text();
@@ -2560,27 +2814,45 @@ impl AppController {
             self.queued_message_count.get(),
         );
         self.reconciling_queue_state.set(false);
+
+    fn session_actions_available(&self) -> bool {
+        self.ready.get()
+            && !self.running.get()
+            && !self.branch_busy.get()
+            && !self.handoff_busy.get()
+            && self.active_subagent.borrow().is_none()
     }
 
     fn update_send_state(&self) {
         let ready = self.ready.get();
         let running = self.running.get();
+        let session_busy = self.branch_busy.get() || self.handoff_busy.get();
         self.ui.composer.set_running_turn_action(matches!(
             self.running_turn_action.get(),
             RunningTurnAction::Steer
         ));
-        let primary_ready = ready && self.pending_submissions.borrow().is_empty();
+        let primary_ready =
+            ready && !session_busy && self.pending_submissions.borrow().is_empty();
         self.ui
             .composer
             .set_primary_action(primary_ready, running);
-        self.ui.composer.set_attachment_sensitive(ready);
+        self.ui
+            .composer
+            .set_attachment_sensitive(ready && !session_busy);
         self.ui
             .composer
             .set_submission_pending(!self.pending_submissions.borrow().is_empty());
         self.ui
             .telemetry
             .cwd_button
-            .set_sensitive(ready && !running);
+            .set_sensitive(ready && !running && !session_busy);
+        let session_actions_available = self.session_actions_available();
+        self.ui
+            .branch_button
+            .set_sensitive(session_actions_available);
+        self.ui
+            .handoff_button
+            .set_sensitive(session_actions_available);
     }
 
     fn update_completions(&self) {

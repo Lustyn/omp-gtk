@@ -10,11 +10,11 @@ use super::chat::{ChatStatus, MessageRole, TelemetryWidgets};
 use super::conversation::ConversationView;
 use super::model_picker::ModelPickerView;
 use super::tool_components::ToolCard;
-use super::{agent_hub, composer, sidebar, todos};
+use super::{agent_hub, composer, session_actions, sidebar, todos};
 use crate::agent_hub::AgentHubState;
 use crate::bridge::protocol::{
-    InterruptMode, ModelSummary, ModelThinking, QueueMode, SubagentSnapshot, TodoItem, TodoPhase,
-    TodoStatus,
+    BranchMessage, InterruptMode, ModelSummary, ModelThinking, QueueMode, SubagentSnapshot, TodoItem,
+    TodoPhase, TodoStatus,
 };
 use crate::session_catalog::SessionEntry;
 
@@ -35,7 +35,7 @@ pub(crate) fn find(id: &str) -> Option<Story> {
     STORIES.iter().copied().find(|story| story.id == id)
 }
 
-const STORIES: [Story; 36] = [
+const STORIES: [Story; 42] = [
     Story {
         id: "header/ready",
         title: "Header · Ready",
@@ -252,6 +252,48 @@ const STORIES: [Story; 36] = [
         width: 760,
         height: 680,
         build: thinking_picker_default,
+    },
+    Story {
+        id: "branch-picker/linear",
+        title: "Branch picker · Linear candidates",
+        width: 720,
+        height: 640,
+        build: branch_picker_linear,
+    },
+    Story {
+        id: "branch-picker/multiple",
+        title: "Branch picker · Multiple candidates",
+        width: 720,
+        height: 640,
+        build: branch_picker_multiple,
+    },
+    Story {
+        id: "branch-picker/long-content",
+        title: "Branch picker · Long labels and previews",
+        width: 720,
+        height: 640,
+        build: branch_picker_long_content,
+    },
+    Story {
+        id: "branch-picker/empty",
+        title: "Branch picker · Empty",
+        width: 720,
+        height: 640,
+        build: branch_picker_empty,
+    },
+    Story {
+        id: "branch-picker/error",
+        title: "Branch picker · Error",
+        width: 720,
+        height: 640,
+        build: branch_picker_error,
+    },
+    Story {
+        id: "handoff/default",
+        title: "Handoff · Default",
+        width: 620,
+        height: 440,
+        build: handoff_default,
     },
     Story {
         id: "tool-card/running",
@@ -942,6 +984,83 @@ fn thinking_picker_default() -> gtk::Widget {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.append(composer.widget());
     root.upcast()
+}
+
+fn branch_picker_linear() -> gtk::Widget {
+    branch_picker(vec![
+        branch_message(
+            "entry-001",
+            "Map the current session lifecycle before changing the native UI.",
+        ),
+        branch_message(
+            "entry-014",
+            "Add typed RPC structures for the supported session transitions.",
+        ),
+        branch_message(
+            "entry-029",
+            "Build the branch picker around stable transcript entry IDs.",
+        ),
+    ])
+}
+
+fn branch_picker_multiple() -> gtk::Widget {
+    branch_picker(
+        [
+            "Inspect the current native session switch flow.",
+            "Compare the bridge payloads with omp’s RPC types.",
+            "Keep the conversation draft intact when the dialog closes.",
+            "Show each user message as a distinct branch point.",
+            "Refresh authoritative state only after omp confirms the branch.",
+            "Reconcile messages, title, todos, modes, and subagents together.",
+            "Add component stories for every picker state.",
+            "Cover stable entry ID selection in focused tests.",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| branch_message(&format!("entry-{index:03}"), text))
+        .collect(),
+    )
+}
+
+fn branch_picker_long_content() -> gtk::Widget {
+    branch_picker(vec![
+        branch_message(
+            "entry-long-label",
+            "Investigate the complete authoritative session transition lifecycle across the native bridge, current conversation rendering, workspace title, todo panel, interaction modes, and every running subagent before choosing the narrowest maintainable integration point.",
+        ),
+        branch_message(
+            "entry-long-preview",
+            "Implement a deliberately long branch candidate preview that spans several visual lines so the picker proves it can wrap useful context, clamp excess content, preserve a readable action target, and still send the opaque transcript entry ID rather than any display text or visible list position.",
+        ),
+    ])
+}
+
+fn branch_picker_empty() -> gtk::Widget {
+    branch_picker(Vec::new())
+}
+
+fn branch_picker_error() -> gtk::Widget {
+    let view = session_actions::BranchPickerView::new(|_| {});
+    view.show_error("omp could not load branch points for the current conversation.");
+    view.widget().clone()
+}
+
+fn branch_picker(messages: Vec<BranchMessage>) -> gtk::Widget {
+    let view = session_actions::BranchPickerView::new(|_| {});
+    view.set_candidates(messages);
+    view.widget().clone()
+}
+
+fn branch_message(entry_id: &str, text: &str) -> BranchMessage {
+    BranchMessage {
+        entry_id: entry_id.to_owned(),
+        text: text.to_owned(),
+    }
+}
+
+fn handoff_default() -> gtk::Widget {
+    let view = session_actions::HandoffView::new();
+    view.widget().clone()
 }
 
 fn picker_models() -> Vec<ModelSummary> {

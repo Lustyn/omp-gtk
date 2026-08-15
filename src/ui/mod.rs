@@ -9,6 +9,7 @@ pub(crate) mod icons;
 pub(crate) mod model_picker;
 pub(crate) mod sidebar;
 pub(crate) mod sound_settings;
+pub(crate) mod session_actions;
 #[cfg(feature = "ui-stories")]
 pub(crate) mod stories;
 pub(crate) mod tool_components;
