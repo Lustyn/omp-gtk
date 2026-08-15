@@ -286,7 +286,7 @@ fn session_indicator(row: &gtk::ListBoxRow, current: bool) -> gtk::DrawingArea {
 }
 
 pub fn present_history(
-    parent: &adw::ApplicationWindow,
+    parent: &gtk::ApplicationWindow,
     sessions: Vec<SessionEntry>,
     active_paths: &HashSet<PathBuf>,
     on_open: impl Fn(SessionEntry) + 'static,

@@ -1,6 +1,18 @@
 window.app-window {
     background: #0b0d10;
     color: #e7eaf0;
+    border: none;
+    border-radius: 12px;
+    outline: none;
+    box-shadow: none;
+}
+
+window.app-window decoration {
+    margin: 0;
+    border: none;
+    border-radius: 12px;
+    outline: none;
+    box-shadow: none;
 }
 
 paned > separator {

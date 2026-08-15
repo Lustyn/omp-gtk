@@ -190,7 +190,7 @@ impl ModelPickerView {
 }
 
 pub(crate) fn present(
-    parent: &adw::ApplicationWindow,
+    parent: &gtk::ApplicationWindow,
     models: Vec<ModelSummary>,
     selected: Option<(String, String)>,
     on_select: impl Fn(ModelSummary) + 'static,

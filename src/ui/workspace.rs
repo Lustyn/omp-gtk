@@ -7,7 +7,7 @@ use super::conversation::ConversationView;
 use super::{composer, icons, sidebar};
 
 pub(crate) struct WorkspaceView {
-    pub(crate) window: adw::ApplicationWindow,
+    pub(crate) window: gtk::ApplicationWindow,
     pub(crate) title: gtk::Label,
     pub(crate) session_list: gtk::ListBox,
     pub(crate) sidebar_activity_count: gtk::Label,
@@ -95,13 +95,17 @@ pub(crate) fn build(app: &adw::Application) -> WorkspaceView {
     split.set_resize_start_child(false);
     split.set_shrink_start_child(false);
 
-    let window = adw::ApplicationWindow::builder()
+    let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title("omp native")
         .default_width(1260)
         .default_height(800)
-        .content(&split)
+        .child(&split)
         .build();
+    window.add_css_class("app-window");
+    let titlebar = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    titlebar.set_size_request(-1, 0);
+    window.set_titlebar(Some(&titlebar));
     window.set_decorated(false);
 
     WorkspaceView {
