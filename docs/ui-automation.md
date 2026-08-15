@@ -1,18 +1,20 @@
 # UI automation and screenshots
 
-This project can be smoke-tested through Linux AT-SPI. GTK exposes the live widget tree over AT-SPI; Python can inspect that tree, invoke accessible actions, edit text, and assert visible state without depending on screen coordinates. Spectacle captures the active application window on the KDE development workstation.
+This project can be smoke-tested through Linux AT-SPI. GTK exposes the live widget tree over AT-SPI; Python can inspect that tree, invoke accessible actions, edit text, and assert visible state without depending on screen coordinates. Component stories run in isolated headless sessions; production-app checks use the graphical desktop only when bridge integration is required.
 
-This workflow is intended for interactive verification and screenshot capture. Keep permanent tests in Rust when the behavior does not require a live desktop.
+Keep permanent tests in Rust when the behavior does not require a live desktop.
 
 ## Prerequisites
 
-Run the automation from a graphical Linux session with the accessibility bus available.
+For headless story inspection and interaction, install the AT-SPI Python bindings, Spectacle, and KWin's virtual Wayland compositor:
 
 ```bash
-sudo apt install python3-gi gir1.2-atspi-2.0 spectacle python3-pil
+sudo apt install python3-gi gir1.2-atspi-2.0 spectacle python3-pil kwin-wayland dbus
 /usr/bin/python3 -c 'import pyatspi; print("AT-SPI ready")'
 cargo build
 ```
+
+Only production-app automation requires an existing graphical Linux session with its accessibility bus available.
 
 Launch the application from the repository root:
 
@@ -20,7 +22,7 @@ Launch the application from the repository root:
 target/debug/omp-native
 ```
 
-`omp-native` starts `omp --mode rpc-ui`. Set `OMP_BIN` only when a specific installed OMP executable must be exercised:
+`omp-native` starts `omp --mode rpc-ui`. Set `OMP_BIN` only when a specific installed `omp` executable must be exercised:
 
 ```bash
 OMP_BIN=/path/to/omp target/debug/omp-native
@@ -30,7 +32,7 @@ Close any existing `omp-native` windows before launching a separate test process
 
 ## Component gallery
 
-Use the native component gallery when work does not require a live OMP session. Stories render the production GTK components, icons, and stylesheet with deterministic fixture data.
+Use the native component gallery when work does not require a live `omp` session. Stories render the production GTK components, icons, and stylesheet with deterministic fixture data.
 
 ```bash
 cargo build --features ui-stories --bin ui-gallery
@@ -40,21 +42,35 @@ target/debug/ui-gallery --story composer/running
 
 The gallery uses the separate `dev.omp.Native.UiGallery` application ID and does not start `omp --mode rpc-ui`. Direct stories print `UI_STORY_READY <story-id>` after their window is mapped. `--snapshot <path>` renders the component itself through GSK and exits; the story canvas chrome is not included.
 
-The automation wrapper builds the gallery and can inspect a visible story through AT-SPI:
+The automation wrapper builds the gallery. `inspect` and `exercise` create an isolated D-Bus session and virtual KWin framebuffer, so semantic AT-SPI checks never open, move, or focus a desktop window:
 
 ```bash
 /usr/bin/python3 tools/ui_story.py list
 /usr/bin/python3 tools/ui_story.py inspect tool-card/error
+/usr/bin/python3 tools/ui_story.py exercise thinking-picker/default --steps \
+  '[{"action":"expect","role":"label","name":"Reasoning depth"},\
+    {"action":"click","role":"button","name":"OpenAI GPT-5.6-Sol"},\
+    {"action":"expect_absent","role":"label","name":"Reasoning depth"}]'
 ```
 
-Capture is headless by default. The wrapper starts an isolated GTK Broadway display in the background, renders the requested component to a PNG, and terminates both processes. It does not open or focus a desktop window and does not use Spectacle:
+Exercise steps support `click`, `replace`, `expect`, and `expect_absent`. Select nodes with `role` plus either `name` or `contains`; `replace` also requires `text`.
+
+Component capture is also headless. It renders only the story component through GSK onto an opaque `#0b0d10` background:
 
 ```bash
 /usr/bin/python3 tools/ui_story.py capture composer/running \
   --output artifacts/screenshots/composer-running.png
 ```
 
-Pass `--visible` only when the compositor-rendered window itself is under review. Visible capture uses the existing AT-SPI readiness check and Spectacle workflow:
+Use `--window` when popovers, shadows, or compositor placement matter. This captures the full virtual framebuffer and can wait for accessible content before taking the screenshot:
+
+```bash
+/usr/bin/python3 tools/ui_story.py capture thinking-picker/default \
+  --window --expect "Reasoning depth" \
+  --output artifacts/screenshots/thinking-picker.png
+```
+
+Pass `--visible` only for an intentional desktop-compositor review. It is never required for component inspection, semantic interaction, or screenshots:
 
 ```bash
 /usr/bin/python3 tools/ui_story.py capture composer/running \
@@ -103,7 +119,7 @@ Prefer semantic selectors such as role plus accessible name. Do not select by ch
 
 ## Example: open and filter the model picker
 
-The model button's accessible name contains its provider and current model. The picker dialog and filter chips expose stable semantic names.
+The model button's accessible name contains its provider and current model. The picker dialog, search field, result count, and result rows expose stable semantic names.
 
 ```python
 app = application()
@@ -123,17 +139,6 @@ path = screenshot("model-picker-claude.png")
 print(path)
 ```
 
-To exercise provider or context-size filters:
-
-```python
-click(find_node(root=dialog, role="toggle button", name="Anthropic"))
-assert any("Claude Opus" in value for value in visible_names(dialog, role="button"))
-
-click(find_node(root=dialog, role="toggle button", name="All providers"))
-click(find_node(root=dialog, role="toggle button", name="257K+"))
-large_models = visible_names(dialog, role="button")
-assert any("Gemini" in value for value in large_models)
-```
 
 Model result rows are buttons. Select one through its accessible action rather than synthesizing a pointer click:
 
@@ -164,7 +169,7 @@ wait_for(
 )
 ```
 
-Only submit prompts when exercising the real OMP session is intentional. Text entry by itself is safe for layout screenshots; clear it with `replace_text(composer, "")` afterward.
+Only submit prompts when exercising the real `omp` session is intentional. Text entry by itself is safe for layout screenshots; clear it with `replace_text(composer, "")` afterward.
 
 ## Example: verify titles loaded from disk
 

@@ -1,19 +1,22 @@
 #!/usr/bin/python3
-"""Build, inspect, and capture native GTK component stories."""
+"""Build, inspect, exercise, and capture native GTK component stories."""
 
 import argparse
+import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import time
 
-from ui_automation import accessible_tree, application, find_node, screenshot_active
+from ui_automation import application, find_node, screenshot_active
 
 
 ROOT = Path(__file__).resolve().parents[1]
 GALLERY = ROOT / "target/debug/ui-gallery"
 APP_NAME = "ui-gallery"
+VIRTUAL_SESSION = ROOT / "tools/ui_story_inspect_session.py"
 
 
 def build_gallery():
@@ -66,17 +69,74 @@ def stop(process):
         process.wait(timeout=5.0)
 
 
+def run_virtual_story(story_id, mode, steps=None, output=None, expect=None):
+    build_gallery()
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "OMP_UI_STORY_ID": story_id,
+            "OMP_UI_STORY_MODE": mode,
+        }
+    )
+    if steps is not None:
+        environment["OMP_UI_STORY_STEPS"] = json.dumps(steps)
+    if output is not None:
+        environment["OMP_UI_STORY_OUTPUT"] = str(Path(output).resolve())
+    if expect is not None:
+        environment["OMP_UI_STORY_EXPECT"] = expect
+    with tempfile.TemporaryDirectory(prefix="omp-ui-story-") as runtime_dir:
+        os.chmod(runtime_dir, 0o700)
+        environment["XDG_RUNTIME_DIR"] = runtime_dir
+        result = subprocess.run(
+            [
+                "dbus-run-session",
+                "--",
+                "kwin_wayland",
+                "--virtual",
+                "--width",
+                "1200",
+                "--height",
+                "900",
+                "--no-lockscreen",
+                "--no-global-shortcuts",
+                "--no-kactivities",
+                "--exit-with-session",
+                str(VIRTUAL_SESSION),
+            ],
+            cwd=ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+        )
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.returncode:
+        if result.stderr:
+            print(result.stderr, file=sys.stderr, end="")
+        raise subprocess.CalledProcessError(result.returncode, result.args)
+
+
 def inspect_story(story_id):
-    process, app = launch_story(story_id)
-    try:
-        for role, name, actions in accessible_tree(app):
-            print(f"{role}: {name!r} {actions}")
-    finally:
-        stop(process)
+    run_virtual_story(story_id, "inspect")
 
 
-def capture_story(story_id, output, visible=False):
+def exercise_story(story_id, serialized_steps):
+    steps = json.loads(serialized_steps)
+    if not isinstance(steps, list) or not steps:
+        raise ValueError("--steps must be a non-empty JSON array")
+    run_virtual_story(story_id, "exercise", steps)
+
+
+def capture_story(story_id, output, visible=False, window=False, expect=None):
     output = Path(output).resolve()
+    if expect is not None and not window:
+        raise ValueError("--expect requires --window")
+    if window:
+        run_virtual_story(story_id, "capture", output=output, expect=expect)
+        if not output.is_file():
+            raise RuntimeError(f"Virtual compositor did not create {output}")
+        print(output)
+        return
     if visible:
         process, _app = launch_story(story_id)
         try:
@@ -136,13 +196,32 @@ def parser():
     subcommands.add_parser("list", help="List available story ids")
     inspect = subcommands.add_parser("inspect", help="Print the accessible tree for a story")
     inspect.add_argument("story_id")
+    exercise = subcommands.add_parser(
+        "exercise", help="Run semantic interaction steps in an isolated virtual session"
+    )
+    exercise.add_argument("story_id")
+    exercise.add_argument(
+        "--steps",
+        required=True,
+        help="JSON array of click, replace, expect, and expect_absent steps",
+    )
     capture = subcommands.add_parser("capture", help="Capture one story window")
     capture.add_argument("story_id")
     capture.add_argument("--output", required=True)
-    capture.add_argument(
+    surface = capture.add_mutually_exclusive_group()
+    surface.add_argument(
+        "--window",
+        action="store_true",
+        help="Capture the full window in an isolated virtual Wayland session",
+    )
+    surface.add_argument(
         "--visible",
         action="store_true",
-        help="Capture the active desktop window instead of using headless Broadway rendering",
+        help="Capture the active desktop window instead of running headlessly",
+    )
+    capture.add_argument(
+        "--expect",
+        help="Wait for accessible text before taking a virtual window capture",
     )
     return result
 
@@ -153,8 +232,16 @@ def main():
         list_stories()
     elif arguments.command == "inspect":
         inspect_story(arguments.story_id)
+    elif arguments.command == "exercise":
+        exercise_story(arguments.story_id, arguments.steps)
     elif arguments.command == "capture":
-        capture_story(arguments.story_id, arguments.output, visible=arguments.visible)
+        capture_story(
+            arguments.story_id,
+            arguments.output,
+            visible=arguments.visible,
+            window=arguments.window,
+            expect=arguments.expect,
+        )
 
 
 if __name__ == "__main__":
