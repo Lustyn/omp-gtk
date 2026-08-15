@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/dev/omp/Native/icons/scalable/apps">
+    <file alias="dev.omp.Native.svg">omp.svg</file>
+  </gresource>
+</gresources>
