@@ -1,9 +1,10 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
-use gtk::{gdk, gio};
+use gtk::{gdk, gio, glib};
 use gtk4 as gtk;
 use libadwaita as adw;
 
@@ -124,8 +125,7 @@ pub fn session_row(entry: SessionEntry) -> SessionRow {
     content.set_margin_bottom(8);
     content.set_margin_start(9);
     content.set_margin_end(4);
-    let indicator = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    indicator.add_css_class("session-indicator");
+    let indicator = session_indicator(&row, entry.current);
     let text = gtk::Box::new(gtk::Orientation::Vertical, 3);
     text.set_hexpand(true);
     let title = gtk::Label::new(Some(&entry.title));
@@ -218,6 +218,71 @@ pub fn session_row(entry: SessionEntry) -> SessionRow {
         delete_action,
         entry,
     }
+}
+
+fn session_indicator(row: &gtk::ListBoxRow, current: bool) -> gtk::DrawingArea {
+    const CYCLE_SECONDS: f64 = 2.4;
+    const PINK: (f64, f64, f64) = (
+        0xed as f64 / 255.0,
+        0x4a as f64 / 255.0,
+        0xbf as f64 / 255.0,
+    );
+    const PURPLE: (f64, f64, f64) = (0x9b as f64 / 255.0, 0x4d as f64 / 255.0, 1.0);
+    const CYAN: (f64, f64, f64) = (
+        0x5a as f64 / 255.0,
+        0xd8 as f64 / 255.0,
+        0xe6 as f64 / 255.0,
+    );
+    const BLUE: (f64, f64, f64) = (
+        0x79 as f64 / 255.0,
+        0xa5 as f64 / 255.0,
+        0xe3 as f64 / 255.0,
+    );
+
+    let indicator = gtk::DrawingArea::new();
+    indicator.set_content_width(3);
+    indicator.add_css_class("session-indicator");
+    let row = row.downgrade();
+    let started = Instant::now();
+    indicator.set_draw_func(move |_, context, width, height| {
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        let width = f64::from(width);
+        let height = f64::from(height);
+        let stroke_width = width.min(height);
+        context.set_line_width(stroke_width);
+        context.set_line_cap(gtk::cairo::LineCap::Round);
+        context.move_to(width / 2.0, stroke_width / 2.0);
+        context.line_to(width / 2.0, height - stroke_width / 2.0);
+
+        if current || row.upgrade().is_some_and(|row| row.is_selected()) {
+            context.set_source_rgb(BLUE.0, BLUE.1, BLUE.2);
+        } else {
+            let phase = (started.elapsed().as_secs_f64() / CYCLE_SECONDS) % 1.0;
+            let start = -phase * height;
+            let gradient = gtk::cairo::LinearGradient::new(0.0, start, 0.0, start + height);
+            gradient.add_color_stop_rgb(0.0, PINK.0, PINK.1, PINK.2);
+            gradient.add_color_stop_rgb(1.0 / 3.0, PURPLE.0, PURPLE.1, PURPLE.2);
+            gradient.add_color_stop_rgb(2.0 / 3.0, CYAN.0, CYAN.1, CYAN.2);
+            gradient.add_color_stop_rgb(1.0, PINK.0, PINK.1, PINK.2);
+            gradient.set_extend(gtk::cairo::Extend::Repeat);
+            let _ = context.set_source(&gradient);
+        }
+        let _ = context.stroke();
+    });
+
+    if !current {
+        let indicator_weak = indicator.downgrade();
+        glib::timeout_add_local(Duration::from_millis(33), move || {
+            let Some(indicator) = indicator_weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            indicator.queue_draw();
+            glib::ControlFlow::Continue
+        });
+    }
+    indicator
 }
 
 pub fn present_history(
