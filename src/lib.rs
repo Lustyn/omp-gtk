@@ -1,4 +1,5 @@
 mod alerts;
+mod agent_hub;
 mod app;
 mod bridge;
 mod commands;

@@ -1,3 +1,4 @@
+pub(crate) mod agent_hub;
 pub(crate) mod attachments;
 pub(crate) mod chat;
 pub(crate) mod composer;

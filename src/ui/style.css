@@ -700,6 +700,155 @@ popover.command-popover > contents {
     font-size: 10px;
 }
 
+.agent-hub-button {
+    min-height: 30px;
+    padding: 3px 9px;
+    border: 1px solid #343b47;
+    border-radius: 8px;
+    background: #1d222a;
+    color: #cbd2dc;
+    box-shadow: none;
+}
+
+.agent-hub-button:hover {
+    background: #292f3a;
+}
+
+.agent-hub {
+    background: #0f1217;
+}
+
+.agent-hub-summary {
+    min-height: 50px;
+    padding: 0 16px;
+    border-bottom: 1px solid #292f38;
+    background: #15191f;
+}
+
+.agent-hub-summary-title {
+    color: #e0e4eb;
+    font-size: 15px;
+    font-weight: 700;
+}
+
+.agent-hub-active-count,
+.agent-hub-total-count {
+    padding: 3px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 700;
+}
+
+.agent-hub-active-count {
+    background: #203128;
+    color: #91c6a0;
+}
+
+.agent-hub-total-count {
+    background: #252a33;
+    color: #aab2bf;
+}
+
+.agent-hub-roster-scroll {
+    border-right: 1px solid #292f38;
+    background: #13171c;
+}
+
+.agent-hub-roster {
+    background: transparent;
+}
+
+.agent-hub-row {
+    border-bottom: 1px solid #252a31;
+    background: transparent;
+}
+
+.agent-hub-row:hover {
+    background: #1b2027;
+}
+
+.agent-hub-row:selected {
+    background: #202938;
+}
+
+.agent-hub-tree-branch {
+    color: #596473;
+}
+
+.agent-hub-status-dot {
+    font-size: 9px;
+}
+
+.agent-hub-agent-name,
+.agent-hub-detail-name {
+    color: #e2e6ec;
+    font-weight: 700;
+}
+
+.agent-hub-agent-status,
+.agent-hub-detail-status {
+    font-size: 10px;
+    font-weight: 700;
+}
+
+.agent-hub-agent-task {
+    color: #adb5c1;
+    font-size: 12px;
+}
+
+.agent-hub-agent-metadata,
+.agent-hub-detail-activity,
+.agent-hub-detail-metrics {
+    color: #7f8997;
+    font-size: 11px;
+}
+
+.agent-hub-detail-header {
+    padding: 13px 18px;
+    border-bottom: 1px solid #292f38;
+    background: #15191f;
+}
+
+.agent-hub-detail-name {
+    font-size: 16px;
+}
+
+.agent-hub-detail-task {
+    color: #c2c9d2;
+    font-size: 12px;
+}
+
+.agent-hub-empty-title {
+    color: #d4d9e1;
+    font-weight: 700;
+}
+
+.agent-hub-empty-help {
+    color: #7f8997;
+    font-size: 12px;
+}
+
+.agent-status-running {
+    color: #76c893;
+}
+
+.agent-status-pending {
+    color: #d1b56f;
+}
+
+.agent-status-completed {
+    color: #84909f;
+}
+
+.agent-status-failed {
+    color: #e07b88;
+}
+
+.agent-status-aborted,
+.agent-status-unknown {
+    color: #a38f9a;
+}
+
 
 .provider-icon {
     color: #b8c0cc;

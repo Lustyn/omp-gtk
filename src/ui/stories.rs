@@ -10,9 +10,11 @@ use super::chat::{ChatStatus, MessageRole, TelemetryWidgets};
 use super::conversation::ConversationView;
 use super::model_picker::ModelPickerView;
 use super::tool_components::ToolCard;
-use super::{composer, sidebar, todos};
+use super::{agent_hub, composer, sidebar, todos};
+use crate::agent_hub::AgentHubState;
 use crate::bridge::protocol::{
-    InterruptMode, ModelSummary, ModelThinking, QueueMode, TodoItem, TodoPhase, TodoStatus,
+    InterruptMode, ModelSummary, ModelThinking, QueueMode, SubagentSnapshot, TodoItem, TodoPhase,
+    TodoStatus,
 };
 use crate::session_catalog::SessionEntry;
 
@@ -33,7 +35,7 @@ pub(crate) fn find(id: &str) -> Option<Story> {
     STORIES.iter().copied().find(|story| story.id == id)
 }
 
-const STORIES: [Story; 28] = [
+const STORIES: [Story; 36] = [
     Story {
         id: "header/ready",
         title: "Header · Ready",
@@ -187,6 +189,55 @@ const STORIES: [Story; 28] = [
         width: 900,
         height: 360,
         build: todos_long_text,
+    },
+    Story {
+        id: "agent-hub/empty",
+        title: "Agent Hub · Empty",
+        width: 1100,
+        height: 700,
+        build: agent_hub_empty,
+    },
+    Story {
+        id: "agent-hub/running",
+        title: "Agent Hub · Running",
+        width: 1100,
+        height: 700,
+        build: agent_hub_running,
+    },
+    Story {
+        id: "agent-hub/tree",
+        title: "Agent Hub · Parent and child",
+        width: 1100,
+        height: 700,
+        build: agent_hub_tree,
+    },
+    Story {
+        id: "agent-hub/terminal",
+        title: "Agent Hub · Terminal",
+        width: 1100,
+        height: 700,
+        build: agent_hub_terminal,
+    },
+    Story {
+        id: "agent-hub/failure",
+        title: "Agent Hub · Failure",
+        width: 1100,
+        height: 700,
+        build: agent_hub_failure,
+    },
+    Story {
+        id: "agent-hub/long-task",
+        title: "Agent Hub · Long task",
+        width: 1100,
+        height: 700,
+        build: agent_hub_long_task,
+    },
+    Story {
+        id: "agent-hub/transcript",
+        title: "Agent Hub · Live transcript",
+        width: 1100,
+        height: 700,
+        build: agent_hub_transcript,
     },
     Story {
         id: "model-picker/default",
@@ -569,6 +620,292 @@ fn todo_item(content: &str, status: TodoStatus) -> TodoItem {
         status,
         blocker: None,
     }
+}
+
+fn agent_hub_empty() -> gtk::Widget {
+    agent_hub_story(Vec::new(), None, false)
+}
+
+fn agent_hub_running() -> gtk::Widget {
+    agent_hub_story(
+        vec![hub_snapshot(
+            "RuntimeBuilder",
+            0,
+            "task",
+            "running",
+            "Implement the runtime agent roster",
+            Some(json!({
+                "id": "RuntimeBuilder",
+                "index": 0,
+                "agent": "task",
+                "agentSource": "project",
+                "status": "running",
+                "task": "Implement the runtime agent roster",
+                "lastIntent": "Building accessible agent rows",
+                "currentTool": "edit",
+                "recentTools": [],
+                "recentOutput": [],
+                "toolCount": 7,
+                "requests": 4,
+                "tokens": 18400,
+                "contextTokens": 22300,
+                "contextWindow": 272000,
+                "cost": 0.061,
+                "durationMs": 96000,
+                "resolvedModel": "openai-codex/gpt-5.6-sol"
+            })),
+        )],
+        Some("RuntimeBuilder"),
+        false,
+    )
+}
+
+fn agent_hub_tree() -> gtk::Widget {
+    let child_progress = json!({
+        "id": "MetadataScout",
+        "index": 0,
+        "agent": "scout",
+        "agentSource": "bundled",
+        "status": "running",
+        "task": "Inspect RPC metadata",
+        "lastIntent": "Reading snapshot types",
+        "currentTool": "read",
+        "recentTools": [],
+        "recentOutput": [],
+        "toolCount": 3,
+        "requests": 2,
+        "tokens": 7600,
+        "cost": 0.012,
+        "durationMs": 44000
+    });
+    agent_hub_story(
+        vec![
+            hub_snapshot(
+                "HubCoordinator",
+                0,
+                "task",
+                "running",
+                "Coordinate the agent hub milestone",
+                Some(json!({
+                    "id": "HubCoordinator",
+                    "index": 0,
+                    "agent": "task",
+                    "agentSource": "project",
+                    "status": "running",
+                    "task": "Coordinate the agent hub milestone",
+                    "lastIntent": "Delegating RPC research",
+                    "currentTool": "task",
+                    "recentTools": [],
+                    "recentOutput": [],
+                    "toolCount": 5,
+                    "requests": 3,
+                    "tokens": 13100,
+                    "cost": 0.035,
+                    "durationMs": 72000,
+                    "inflightTaskDetails": { "progress": [child_progress.clone()] }
+                })),
+            ),
+            hub_snapshot(
+                "MetadataScout",
+                0,
+                "scout",
+                "running",
+                "Inspect RPC metadata",
+                Some(child_progress),
+            ),
+        ],
+        Some("MetadataScout"),
+        false,
+    )
+}
+
+fn agent_hub_terminal() -> gtk::Widget {
+    agent_hub_story(
+        vec![
+            hub_snapshot(
+                "CompletedReviewer",
+                0,
+                "reviewer",
+                "completed",
+                "Review the projection",
+                None,
+            ),
+            hub_snapshot(
+                "StoppedWorker",
+                1,
+                "task",
+                "aborted",
+                "Explore an obsolete approach",
+                None,
+            ),
+        ],
+        Some("CompletedReviewer"),
+        false,
+    )
+}
+
+fn agent_hub_failure() -> gtk::Widget {
+    agent_hub_story(
+        vec![hub_snapshot(
+            "ProviderResearcher",
+            0,
+            "librarian",
+            "failed",
+            "Verify provider behavior",
+            Some(json!({
+                "id": "ProviderResearcher",
+                "index": 0,
+                "agent": "librarian",
+                "agentSource": "bundled",
+                "status": "failed",
+                "task": "Verify provider behavior",
+                "recentTools": [],
+                "recentOutput": [],
+                "toolCount": 2,
+                "requests": 3,
+                "tokens": 9100,
+                "cost": 0.021,
+                "durationMs": 81000,
+                "retryFailure": {
+                    "attempt": 3,
+                    "errorMessage": "Provider retry budget exhausted"
+                }
+            })),
+        )],
+        Some("ProviderResearcher"),
+        false,
+    )
+}
+
+fn agent_hub_long_task() -> gtk::Widget {
+    agent_hub_story(
+        vec![hub_snapshot(
+            "LongRunningMigration",
+            0,
+            "task",
+            "running",
+            "Migrate every runtime projection caller without compatibility shims",
+            Some(json!({
+                "id": "LongRunningMigration",
+                "index": 0,
+                "agent": "task",
+                "agentSource": "project",
+                "status": "running",
+                "task": "Migrate every runtime projection caller without compatibility shims",
+                "lastIntent": "Updating the final application controller callsites",
+                "currentTool": "edit",
+                "recentTools": [],
+                "recentOutput": [],
+                "toolCount": 146,
+                "requests": 38,
+                "tokens": 487200,
+                "contextTokens": 196400,
+                "contextWindow": 272000,
+                "cost": 2.418,
+                "durationMs": 14673000,
+                "resolvedModel": "anthropic/claude-opus-4-6"
+            })),
+        )],
+        Some("LongRunningMigration"),
+        false,
+    )
+}
+
+fn agent_hub_transcript() -> gtk::Widget {
+    agent_hub_story(
+        vec![hub_snapshot(
+            "TranscriptWorker",
+            0,
+            "task",
+            "running",
+            "Keep the selected transcript current",
+            Some(json!({
+                "id": "TranscriptWorker",
+                "index": 0,
+                "agent": "task",
+                "agentSource": "bundled",
+                "status": "running",
+                "task": "Keep the selected transcript current",
+                "lastIntent": "Applying an incremental transcript read",
+                "currentTool": "read",
+                "recentTools": [],
+                "recentOutput": [],
+                "toolCount": 4,
+                "requests": 3,
+                "tokens": 14200,
+                "cost": 0.048,
+                "durationMs": 68000
+            })),
+        )],
+        Some("TranscriptWorker"),
+        true,
+    )
+}
+
+fn agent_hub_story(
+    snapshots: Vec<SubagentSnapshot>,
+    selected: Option<&str>,
+    transcript: bool,
+) -> gtk::Widget {
+    let mut state = AgentHubState::default();
+    state.apply_snapshot(snapshots);
+    let view = agent_hub::build();
+    view.set_counts(state.active_count(), state.len());
+    let mut rendered = Vec::new();
+    for row in state.rows() {
+        let row = agent_hub::agent_row(&row);
+        view.append_row(&row);
+        rendered.push(row);
+    }
+    if let Some(id) = selected
+        && let Some(agent) = state.get(id)
+    {
+        view.show_agent(agent);
+        view.select_id(id, &rendered);
+        if transcript {
+            view.transcript.append_message(
+                MessageRole::User,
+                "Load the selected agent transcript and keep it current.",
+            );
+            view.transcript.append_thinking(
+                "I’ll read the authoritative transcript cursor, then request another slice when an event arrives.",
+                false,
+            );
+            view.transcript.append_message(
+                MessageRole::Assistant,
+                "The initial transcript is loaded. New completed messages will append without duplicating earlier entries.",
+            );
+        } else {
+            view.transcript
+                .append_notice("Transcript messages have not been loaded in this story.", false);
+        }
+    }
+    view.widget().clone()
+}
+
+fn hub_snapshot(
+    id: &str,
+    index: usize,
+    agent: &str,
+    status: &str,
+    task: &str,
+    progress: Option<serde_json::Value>,
+) -> SubagentSnapshot {
+    let mut value = json!({
+        "id": id,
+        "index": index,
+        "agent": agent,
+        "agentSource": "bundled",
+        "status": status,
+        "task": task,
+        "description": task,
+        "sessionFile": format!("/tmp/{id}.jsonl"),
+        "lastUpdate": 1_786_835_700_000_u64
+    });
+    if let Some(progress) = progress {
+        value["progress"] = progress;
+    }
+    serde_json::from_value(value).expect("valid agent hub story snapshot")
 }
 
 fn model_picker_default() -> gtk::Widget {

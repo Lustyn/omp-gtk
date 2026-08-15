@@ -214,20 +214,122 @@ pub struct ToolEnd {
     pub is_error: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubagentUpdateKind {
     Lifecycle,
     Progress,
     Event,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentSnapshot {
+    pub id: String,
+    pub index: usize,
+    pub agent: String,
+    pub agent_source: Option<String>,
+    pub description: Option<String>,
+    pub status: String,
+    pub task: Option<String>,
+    pub assignment: Option<String>,
+    pub session_file: Option<String>,
+    #[serde(default)]
+    pub last_update: u64,
+    pub progress: Option<SubagentProgress>,
+    pub parent_tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentProgress {
+    pub id: String,
+    #[serde(default)]
+    pub index: usize,
+    #[serde(default)]
+    pub agent: String,
+    pub agent_source: Option<String>,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub task: String,
+    pub assignment: Option<String>,
+    pub description: Option<String>,
+    pub last_intent: Option<String>,
+    pub current_tool: Option<String>,
+    pub current_tool_args: Option<String>,
+    pub current_tool_start_ms: Option<u64>,
+    #[serde(default)]
+    pub tool_count: u64,
+    #[serde(default)]
+    pub requests: u64,
+    #[serde(default)]
+    pub tokens: u64,
+    pub context_tokens: Option<u64>,
+    pub context_window: Option<u64>,
+    #[serde(default)]
+    pub cost: f64,
+    #[serde(default)]
+    pub duration_ms: u64,
+    pub model_role: Option<String>,
+    pub resolved_model: Option<String>,
+    #[serde(default)]
+    pub resolved_model_is_fallback: bool,
+    pub retry_state: Option<SubagentRetryState>,
+    pub retry_failure: Option<SubagentRetryFailure>,
+    pub inflight_task_details: Option<SubagentTaskDetails>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentRetryState {
+    pub attempt: u64,
+    pub max_attempts: u64,
+    pub delay_ms: u64,
+    pub error_message: String,
+    pub started_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentRetryFailure {
+    pub attempt: u64,
+    pub error_message: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentTaskDetails {
+    #[serde(default)]
+    pub progress: Vec<SubagentProgress>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SubagentUpdate {
     pub kind: SubagentUpdateKind,
     pub id: Option<String>,
+    pub index: Option<usize>,
     pub agent: Option<String>,
+    pub agent_source: Option<String>,
     pub status: Option<String>,
+    pub description: Option<String>,
     pub task: Option<String>,
+    pub assignment: Option<String>,
+    pub session_file: Option<String>,
+    pub parent_tool_call_id: Option<String>,
+    pub progress: Option<SubagentProgress>,
+    pub activity_event: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentMessages {
+    pub session_file: String,
+    pub from_byte: u64,
+    pub next_byte: u64,
+    #[serde(default)]
+    pub reset: bool,
+    #[serde(default)]
+    pub messages: Vec<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -372,19 +474,36 @@ pub fn decode_event(value: Value) -> RpcEvent {
 
 fn decode_subagent(kind: SubagentUpdateKind, value: Value) -> SubagentUpdate {
     let payload = value.get("payload").cloned().unwrap_or(Value::Null);
-    let progress = payload.get("progress").unwrap_or(&payload);
-    let event_payload = payload.get("event").unwrap_or(&payload);
+    let progress_value = payload.get("progress").cloned().unwrap_or(Value::Null);
+    let activity_event = payload
+        .get("event")
+        .and_then(|event| string_field(event, "type"));
+    let progress = serde_json::from_value::<SubagentProgress>(progress_value).ok();
     SubagentUpdate {
         kind,
-        id: string_field(&payload, "id").or_else(|| string_field(progress, "id")),
-        agent: string_field(&payload, "agent"),
+        id: string_field(&payload, "id")
+            .or_else(|| progress.as_ref().map(|progress| progress.id.clone())),
+        index: payload
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|index| usize::try_from(index).ok())
+            .or_else(|| progress.as_ref().map(|progress| progress.index)),
+        agent: string_field(&payload, "agent")
+            .or_else(|| progress.as_ref().map(|progress| progress.agent.clone())),
+        agent_source: string_field(&payload, "agentSource")
+            .or_else(|| progress.as_ref().and_then(|progress| progress.agent_source.clone())),
         status: string_field(&payload, "status")
-            .or_else(|| string_field(progress, "status"))
-            .or_else(|| string_field(event_payload, "type")),
+            .or_else(|| progress.as_ref().map(|progress| progress.status.clone())),
+        description: string_field(&payload, "description")
+            .or_else(|| progress.as_ref().and_then(|progress| progress.description.clone())),
         task: string_field(&payload, "task")
-            .or_else(|| string_field(&payload, "description"))
-            .or_else(|| string_field(&payload, "assignment"))
-            .or_else(|| string_field(progress, "description")),
+            .or_else(|| progress.as_ref().map(|progress| progress.task.clone())),
+        assignment: string_field(&payload, "assignment")
+            .or_else(|| progress.as_ref().and_then(|progress| progress.assignment.clone())),
+        session_file: string_field(&payload, "sessionFile"),
+        parent_tool_call_id: string_field(&payload, "parentToolCallId"),
+        progress,
+        activity_event,
     }
 }
 
@@ -611,8 +730,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        RpcEvent, RpcFrameDecoder, SessionState, SetTodosResponse, TodoPhase, TodoStatus,
-        decode_event,
+        RpcEvent, RpcFrameDecoder, SessionState, SetTodosResponse, SubagentMessages,
+        SubagentSnapshot, TodoPhase, TodoStatus, decode_event,
     };
 
     #[test]
@@ -703,6 +822,103 @@ mod tests {
         assert_eq!(response.id.as_deref(), Some("native_42"));
         assert_eq!(response.command, "prompt");
         assert!(!response.success);
+}
+
+#[test]
+    fn preserves_full_snapshot_activity_metrics_and_nested_agent_ids() {
+        let snapshot = serde_json::from_value::<SubagentSnapshot>(json!({
+            "id": "Parent",
+            "index": 0,
+            "agent": "task",
+            "agentSource": "project",
+            "description": "Coordinate work",
+            "status": "running",
+            "task": "Build the hub",
+            "assignment": "Implement the runtime surface",
+            "sessionFile": "/tmp/parent.jsonl",
+            "parentToolCallId": "tool-parent",
+            "lastUpdate": 100,
+            "progress": {
+                "id": "Parent",
+                "index": 0,
+                "agent": "task",
+                "agentSource": "project",
+                "status": "running",
+                "task": "Build the hub",
+                "lastIntent": "Inspecting metadata",
+                "currentTool": "read",
+                "recentTools": [],
+                "recentOutput": [],
+                "toolCount": 4,
+                "requests": 3,
+                "tokens": 12000,
+                "contextTokens": 6000,
+                "contextWindow": 272000,
+                "cost": 0.04,
+                "durationMs": 90000,
+                "inflightTaskDetails": {
+                    "progress": [{
+                        "id": "Child",
+                        "index": 0,
+                        "agent": "scout",
+                        "status": "running",
+                        "task": "Read RPC",
+                        "recentTools": [],
+                        "recentOutput": [],
+                        "toolCount": 1,
+                        "requests": 1,
+                        "tokens": 2000,
+                        "cost": 0.005,
+                        "durationMs": 10000
+                    }]
+                }
+            }
+        }))
+        .unwrap();
+
+        let progress = snapshot.progress.unwrap();
+        assert_eq!(progress.current_tool.as_deref(), Some("read"));
+        assert_eq!(progress.context_window, Some(272_000));
+        assert_eq!(
+            progress.inflight_task_details.unwrap().progress[0].id,
+            "Child"
+        );
+    }
+
+    #[test]
+    fn keeps_raw_agent_activity_separate_from_lifecycle_status() {
+        let event = decode_event(json!({
+            "type": "subagent_event",
+            "payload": {
+                "id": "Worker",
+                "event": { "type": "tool_execution_start" }
+            }
+        }));
+        let RpcEvent::Subagent(update) = event else {
+            panic!("expected subagent event");
+        };
+        assert!(update.status.is_none());
+        assert_eq!(
+            update.activity_event.as_deref(),
+            Some("tool_execution_start")
+        );
+    }
+
+    #[test]
+    fn decodes_incremental_subagent_transcript_cursor() {
+        let transcript = serde_json::from_value::<SubagentMessages>(json!({
+            "sessionFile": "/tmp/worker.jsonl",
+            "fromByte": 128,
+            "nextByte": 512,
+            "reset": false,
+            "entries": [],
+            "messages": [{ "role": "assistant", "content": "Done" }]
+        }))
+        .unwrap();
+        assert_eq!(transcript.session_file, "/tmp/worker.jsonl");
+        assert_eq!(transcript.from_byte, 128);
+        assert_eq!(transcript.next_byte, 512);
+        assert_eq!(transcript.messages.len(), 1);
     }
 
     #[test]

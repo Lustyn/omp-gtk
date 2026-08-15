@@ -137,12 +137,16 @@ impl BridgeClient {
         self.prompt(&format!("/move {path}"), &[]).map(|_| ())
     }
 
-    pub fn get_subagent_messages(&self, subagent_id: &str) -> Result<(), BridgeError> {
-        self.request(
-            "get_subagent_messages",
-            json!({ "subagentId": subagent_id }),
-        )?;
-        Ok(())
+    pub fn get_subagent_messages(
+        &self,
+        subagent_id: &str,
+        from_byte: Option<u64>,
+    ) -> Result<String, BridgeError> {
+        let fields = match from_byte {
+            Some(from_byte) => json!({ "subagentId": subagent_id, "fromByte": from_byte }),
+            None => json!({ "subagentId": subagent_id }),
+        };
+        self.request("get_subagent_messages", fields)
     }
 
     pub fn refresh_state(&self) -> Result<(), BridgeError> {

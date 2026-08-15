@@ -1,6 +1,7 @@
 use crate::alerts::{self, AlertKind, Alerts, SoundEvent, SoundPackChoice, WindowStatus};
 use crate::sound_registry::{self, RegistryPack};
 use crate::ui::{
+    agent_hub as agent_hub_ui,
     attachments::{self, AttachmentId, ComposerAttachments},
     chat, composer, model_picker, sidebar, sound_settings, todos, tool_components, workspace,
 };
@@ -17,11 +18,12 @@ use gtk4 as gtk;
 use libadwaita as adw;
 use serde_json::{Value, json};
 
+use crate::agent_hub::AgentHubState;
 use crate::bridge::protocol::{
     InterruptMode, ModelSummary, QueueMode, RpcEvent, RpcResponse, SessionState, SetTodosResponse,
-    SlashCommand, SubagentUpdate, SubagentUpdateKind, TodoItem, TodoPhase, TodoStatus, ToolEnd,
-    ToolStart, ToolUpdate, message_cost, message_role, message_text, message_thinking,
-    message_tool_calls, tool_result_parts,
+    SlashCommand, SubagentMessages, SubagentSnapshot, SubagentUpdate, SubagentUpdateKind, TodoItem,
+    TodoPhase, TodoStatus, ToolEnd, ToolStart, ToolUpdate, message_cost, message_role, message_text,
+    message_thinking, message_tool_calls, tool_result_parts,
 };
 use crate::bridge::{BridgeClient, OmpBridge};
 use crate::commands::{CommandCompletion, completions, unsupported_native_mode_error};
@@ -77,8 +79,10 @@ pub(crate) fn build(app: &adw::Application) {
         pasted_image_count: Cell::new(0),
         streaming_thinking: RefCell::new(None),
         tool_cards: RefCell::new(HashMap::new()),
-        subagents: RefCell::new(HashMap::new()),
-        subagent_buttons: RefCell::new(HashMap::new()),
+        agent_hub: RefCell::new(AgentHubState::default()),
+        agent_hub_rows: RefCell::new(Vec::new()),
+        subagent_transcript: RefCell::new(None),
+        subagent_tool_cards: RefCell::new(HashMap::new()),
         session_rows: RefCell::new(Vec::new()),
         todo_phases: RefCell::new(Vec::new()),
         active_sessions: RefCell::new(Vec::new()),
@@ -185,13 +189,12 @@ struct PendingSubmission {
     attachment_ids: Vec<AttachmentId>,
 }
 
-#[derive(Clone)]
-struct SubagentState {
+struct SubagentTranscriptState {
     id: String,
-    display_name: String,
-    status: String,
-    task: String,
-    active: bool,
+    next_byte: u64,
+    request_id: Option<String>,
+    pending_refresh: bool,
+    has_content: bool,
 }
 
 struct AppController {
@@ -212,8 +215,10 @@ struct AppController {
     pasted_image_count: Cell<u64>,
     streaming_thinking: RefCell<Option<ThinkingBlock>>,
     tool_cards: RefCell<HashMap<String, ToolCard>>,
-    subagents: RefCell<HashMap<String, SubagentState>>,
-    subagent_buttons: RefCell<HashMap<String, gtk::Button>>,
+    agent_hub: RefCell<AgentHubState>,
+    agent_hub_rows: RefCell<Vec<agent_hub_ui::AgentHubRow>>,
+    subagent_transcript: RefCell<Option<SubagentTranscriptState>>,
+    subagent_tool_cards: RefCell<HashMap<String, ToolCard>>,
     session_rows: RefCell<Vec<SessionRow>>,
     todo_phases: RefCell<Vec<TodoPhase>>,
     active_sessions: RefCell<Vec<SessionEntry>>,
@@ -435,6 +440,13 @@ impl AppController {
         });
 
         let weak = Rc::downgrade(self);
+        self.ui.agent_hub_button.connect_clicked(move |_| {
+            if let Some(controller) = weak.upgrade() {
+                controller.open_agent_hub();
+            }
+        });
+
+        let weak = Rc::downgrade(self);
         self.ui.back_button.connect_clicked(move |_| {
             if let Some(controller) = weak.upgrade() {
                 controller.close_subagent_view();
@@ -623,6 +635,16 @@ impl AppController {
     }
 
     fn handle_response(self: &Rc<Self>, response: RpcResponse) {
+        if response.command == "get_subagent_messages" && !response.success {
+            self.subagent_transcript_failed(
+                response.id.as_deref(),
+                response
+                    .error
+                    .as_deref()
+                    .unwrap_or("omp could not read the agent transcript"),
+            );
+            return;
+        }
         if !response.success {
             if matches!(response.command.as_str(), "prompt" | "steer" | "follow_up") {
                 self.reject_submission_response(response.id.as_deref());
@@ -656,6 +678,14 @@ impl AppController {
         ) && let Some(client) = &self.client
         {
             let _ = client.refresh_state();
+        }
+        let response_id = response.id.clone();
+        if response.command == "get_subagent_messages" && response.data.is_none() {
+            self.subagent_transcript_failed(
+                response_id.as_deref(),
+                "omp returned no agent transcript data",
+            );
+            return;
         }
         let Some(data) = response.data else {
             if response.command == "new_session" {
@@ -694,39 +724,22 @@ impl AppController {
                 self.hydrate_messages(&messages);
             }
             "get_subagents" => {
-                if let Some(agents) = data.get("subagents").and_then(Value::as_array) {
-                    for agent in agents {
-                        self.subagent_updated(SubagentUpdate {
-                            kind: SubagentUpdateKind::Lifecycle,
-                            id: agent
-                                .get("id")
-                                .and_then(Value::as_str)
-                                .map(ToOwned::to_owned),
-                            agent: agent
-                                .get("agent")
-                                .or_else(|| agent.get("name"))
-                                .and_then(Value::as_str)
-                                .map(ToOwned::to_owned),
-                            status: agent
-                                .get("status")
-                                .and_then(Value::as_str)
-                                .map(ToOwned::to_owned),
-                            task: agent
-                                .get("task")
-                                .or_else(|| agent.get("activity"))
-                                .and_then(Value::as_str)
-                                .map(ToOwned::to_owned),
-                        });
-                    }
+                if let Some(agents) = data.get("subagents").cloned()
+                    && let Ok(agents) = serde_json::from_value::<Vec<SubagentSnapshot>>(agents)
+                {
+                    self.agent_hub.borrow_mut().apply_snapshot(agents);
+                    self.refresh_agent_surfaces();
                 }
             }
             "get_subagent_messages" => {
-                let messages = data
-                    .get("messages")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                self.hydrate_subagent_messages(&messages);
+                if let Ok(transcript) = serde_json::from_value::<SubagentMessages>(data) {
+                    self.apply_subagent_transcript(response_id.as_deref(), transcript);
+                } else {
+                    self.subagent_transcript_failed(
+                        response_id.as_deref(),
+                        "omp returned invalid agent transcript metadata",
+                    );
+                }
             }
             "prompt" => {
                 if data.get("agentInvoked").and_then(Value::as_bool) == Some(false) {
@@ -2061,73 +2074,67 @@ impl AppController {
     }
 
     fn subagent_updated(self: &Rc<Self>, update: SubagentUpdate) {
-        let key = update
-            .id
-            .clone()
-            .or_else(|| update.agent.clone())
-            .unwrap_or_else(|| "subagent".to_owned());
-        let display_name = update
-            .id
-            .as_deref()
-            .filter(|id| !looks_like_uuid(id))
-            .or(update.agent.as_deref())
-            .map(friendly_agent_name)
-            .unwrap_or_else(|| "Subagent".to_owned());
-        let status = update
-            .status
-            .as_deref()
-            .unwrap_or(match update.kind {
-                SubagentUpdateKind::Lifecycle => "active",
-                SubagentUpdateKind::Progress => "working",
-                SubagentUpdateKind::Event => "active",
-            })
-            .to_ascii_lowercase();
-        let terminal = matches!(
-            status.as_str(),
-            "completed" | "complete" | "done" | "failed" | "aborted" | "removed"
-        );
-        let task = update
-            .task
-            .clone()
-            .filter(|task| !task.trim().is_empty())
-            .unwrap_or_else(|| "Working on delegated task".to_owned());
-        self.subagents.borrow_mut().insert(
-            key.clone(),
-            SubagentState {
-                id: key.clone(),
-                display_name,
-                status: title_case(&status),
-                task,
-                active: !terminal,
-            },
-        );
-        self.refresh_subagent_chips();
-        self.update_activity_counts();
-        if self.active_subagent.borrow().as_deref() == Some(&key)
-            && let Some(client) = &self.client
-        {
-            let _ = client.get_subagent_messages(&key);
+        let updated_id = self.agent_hub.borrow_mut().apply_update(update);
+        if updated_id.is_none() {
+            return;
+        }
+        self.refresh_agent_surfaces();
+        if self.active_subagent.borrow().as_deref() == updated_id.as_deref() {
+            self.request_subagent_transcript();
         }
     }
 
-    fn refresh_subagent_chips(self: &Rc<Self>) {
+    fn refresh_agent_surfaces(self: &Rc<Self>) {
+        let (tree_rows, active_count, total_count, selected) = {
+            let hub = self.agent_hub.borrow();
+            let selected = self
+                .active_subagent
+                .borrow()
+                .as_deref()
+                .and_then(|id| hub.get(id))
+                .cloned();
+            (hub.rows(), hub.active_count(), hub.len(), selected)
+        };
+
+        self.ui.agent_hub.clear_rows();
+        let mut rendered_rows = Vec::with_capacity(tree_rows.len());
+        for row in &tree_rows {
+            let rendered = agent_hub_ui::agent_row(row);
+            let id = rendered.id.clone();
+            let weak = Rc::downgrade(self);
+            rendered.root.connect_activate(move |_| {
+                if let Some(controller) = weak.upgrade() {
+                    controller.open_subagent_view(&id);
+                }
+            });
+            self.ui.agent_hub.append_row(&rendered);
+            rendered_rows.push(rendered);
+        }
+        self.agent_hub_rows.replace(rendered_rows);
+        self.ui.agent_hub.set_counts(active_count, total_count);
+
         self.ui.composer.clear_subagent_chips();
-        self.subagent_buttons.borrow_mut().clear();
-        let mut agents = self
-            .subagents
-            .borrow()
-            .values()
-            .cloned()
+        let mut chip_agents = tree_rows
+            .iter()
+            .map(|row| row.agent.clone())
             .collect::<Vec<_>>();
-        agents.sort_by(|left, right| {
+        chip_agents.sort_by(|left, right| {
             right
-                .active
-                .cmp(&left.active)
-                .then_with(|| left.display_name.cmp(&right.display_name))
+                .is_active()
+                .cmp(&left.is_active())
+                .then_with(|| left.index.cmp(&right.index))
         });
-        for agent in agents {
-            let chip = composer::subagent_chip(&agent.display_name, &agent.status, agent.active);
-            chip.set_tooltip_text(Some(&agent.task));
+        for agent in chip_agents {
+            let status = title_case(&agent.status);
+            let chip =
+                composer::subagent_chip(&agent.display_name(), &status, agent.is_active());
+            let tooltip = match (agent.current_task(), agent.current_activity()) {
+                (Some(task), Some(activity)) => format!("{task}\n{activity}"),
+                (Some(task), None) => task.to_owned(),
+                (None, Some(activity)) => activity,
+                (None, None) => "No task or activity metadata reported".to_owned(),
+            };
+            chip.set_tooltip_text(Some(&tooltip));
             let id = agent.id.clone();
             let weak = Rc::downgrade(self);
             chip.connect_clicked(move |_| {
@@ -2136,49 +2143,180 @@ impl AppController {
                 }
             });
             self.ui.composer.append_subagent_chip(&chip);
-            self.subagent_buttons.borrow_mut().insert(agent.id, chip);
         }
         self.ui
             .composer
-            .set_subagents_visible(!self.subagents.borrow().is_empty());
+            .set_subagents_visible(!self.agent_hub.borrow().is_empty());
+
+        if let Some(agent) = selected {
+            self.ui.agent_hub.show_agent(&agent);
+            self.ui
+                .agent_hub
+                .select_id(&agent.id, &self.agent_hub_rows.borrow());
+        } else {
+            self.active_subagent.borrow_mut().take();
+            self.subagent_transcript.borrow_mut().take();
+            self.subagent_tool_cards.borrow_mut().clear();
+            self.ui.agent_hub.show_placeholder();
+        }
+        self.update_activity_counts();
     }
 
-    fn open_subagent_view(&self, id: &str) {
-        let Some(agent) = self.subagents.borrow().get(id).cloned() else {
-            return;
-        };
-        self.active_subagent.replace(Some(id.to_owned()));
-        self.ui.subagent_conversation.clear();
-        self.ui.subagent_conversation.append_notice(
-            &format!("Loading {}’s transcript…", agent.display_name),
-            false,
-        );
-        self.ui
-            .title
-            .set_text(&format!("Agent · {}", agent.display_name));
+    fn open_agent_hub(self: &Rc<Self>) {
+        self.refresh_agent_surfaces();
+        self.ui.title.set_text("Agent Hub");
         self.ui.back_button.set_visible(true);
         self.ui.composer_clamp.set_visible(false);
-        self.ui.content_stack.set_visible_child_name("subagent");
-        if let Some(client) = &self.client
-            && let Err(error) = client.get_subagent_messages(id)
-        {
+        self.ui.content_stack.set_visible_child_name("agent-hub");
+    }
+
+    fn open_subagent_view(self: &Rc<Self>, id: &str) {
+        let Some(agent) = self.agent_hub.borrow().get(id).cloned() else {
+            return;
+        };
+        self.open_agent_hub();
+        if self.active_subagent.borrow().as_deref() == Some(id) {
+            self.ui.agent_hub.show_agent(&agent);
+            self.ui
+                .agent_hub
+                .select_id(id, &self.agent_hub_rows.borrow());
+            self.request_subagent_transcript();
+            return;
+        }
+
+        self.active_subagent.replace(Some(id.to_owned()));
+        self.subagent_tool_cards.borrow_mut().clear();
+        self.ui.subagent_conversation.clear();
+        self.ui.subagent_conversation.append_notice(
+            &format!("Loading {}’s transcript…", agent.display_name()),
+            false,
+        );
+        self.ui.agent_hub.show_agent(&agent);
+        self.ui
+            .agent_hub
+            .select_id(id, &self.agent_hub_rows.borrow());
+        self.ui
+            .title
+            .set_text(&format!("Agent Hub · {}", agent.display_name()));
+        self.subagent_transcript
+            .replace(Some(SubagentTranscriptState {
+                id: id.to_owned(),
+                next_byte: 0,
+                request_id: None,
+                pending_refresh: false,
+                has_content: false,
+            }));
+        self.request_subagent_transcript();
+    }
+
+    fn request_subagent_transcript(&self) {
+        let Some(client) = &self.client else {
             self.ui
                 .subagent_conversation
-                .append_notice(&error.to_string(), true);
+                .append_notice("omp is not connected", true);
+            return;
+        };
+        let (id, from_byte) = {
+            let mut transcript = self.subagent_transcript.borrow_mut();
+            let Some(transcript) = transcript.as_mut() else {
+                return;
+            };
+            if transcript.request_id.is_some() {
+                transcript.pending_refresh = true;
+                return;
+            }
+            let from_byte = (transcript.next_byte > 0).then_some(transcript.next_byte);
+            (transcript.id.clone(), from_byte)
+        };
+
+        match client.get_subagent_messages(&id, from_byte) {
+            Ok(request_id) => {
+                if let Some(transcript) = self.subagent_transcript.borrow_mut().as_mut()
+                    && transcript.id == id
+                {
+                    transcript.request_id = Some(request_id);
+                }
+            }
+            Err(error) => self.subagent_transcript_failed(None, &error.to_string()),
         }
     }
 
-    fn close_subagent_view(&self) {
-        self.active_subagent.borrow_mut().take();
-        self.ui.content_stack.set_visible_child_name("chat");
-        self.ui.back_button.set_visible(false);
-        self.ui.composer_clamp.set_visible(true);
-        self.ui.title.set_text(&self.current_session_title.borrow());
+    fn apply_subagent_transcript(
+        &self,
+        response_id: Option<&str>,
+        transcript_response: SubagentMessages,
+    ) {
+        let expected_session = self
+            .active_subagent
+            .borrow()
+            .as_deref()
+            .and_then(|id| self.agent_hub.borrow().get(id).and_then(|agent| agent.session_file.clone()));
+        if expected_session.as_deref().is_some_and(|session| session != transcript_response.session_file) {
+            return;
+        }
+
+        let (clear_first, replace, messages, request_again) = {
+            let mut transcript = self.subagent_transcript.borrow_mut();
+            let Some(transcript) = transcript.as_mut() else {
+                return;
+            };
+            if response_id.is_some() && transcript.request_id.as_deref() != response_id {
+                return;
+            }
+            transcript.request_id = None;
+            let replace = transcript_response.reset || transcript_response.from_byte == 0;
+            transcript.next_byte = transcript_response.next_byte;
+            let messages = transcript_response.messages;
+            let clear_first = replace || (!transcript.has_content && !messages.is_empty());
+            if replace {
+                transcript.has_content = false;
+            }
+            if !messages.is_empty() {
+                transcript.has_content = true;
+            }
+            let request_again = transcript.pending_refresh;
+            transcript.pending_refresh = false;
+            (clear_first, replace, messages, request_again)
+        };
+
+        if clear_first {
+            self.ui.subagent_conversation.clear();
+            if replace {
+                self.subagent_tool_cards.borrow_mut().clear();
+            }
+        }
+        if !messages.is_empty() {
+            self.append_subagent_messages(&messages);
+        } else if replace {
+            self.ui.subagent_conversation.append_notice(
+                "This agent has not produced transcript messages yet.",
+                false,
+            );
+        }
+        self.ui.subagent_conversation.scroll_to_bottom();
+        if request_again {
+            self.request_subagent_transcript();
+        }
     }
 
-    fn hydrate_subagent_messages(&self, messages: &[Value]) {
+    fn subagent_transcript_failed(&self, response_id: Option<&str>, error: &str) {
+        {
+            let mut transcript = self.subagent_transcript.borrow_mut();
+            let Some(transcript) = transcript.as_mut() else {
+                return;
+            };
+            if response_id.is_some() && transcript.request_id.as_deref() != response_id {
+                return;
+            }
+            transcript.request_id = None;
+            transcript.pending_refresh = false;
+        }
         self.ui.subagent_conversation.clear();
-        let mut cards = HashMap::<String, ToolCard>::new();
+        self.ui.subagent_conversation.append_notice(error, true);
+    }
+
+    fn append_subagent_messages(&self, messages: &[Value]) {
+        let mut cards = self.subagent_tool_cards.borrow_mut();
         for message in messages {
             match message_role(message) {
                 Some("user") => {
@@ -2221,34 +2359,51 @@ impl AppController {
                 _ => {}
             }
         }
-        if self.ui.subagent_conversation.is_empty() {
-            self.ui.subagent_conversation.append_notice(
-                "This subagent has not produced transcript messages yet.",
-                false,
-            );
-        }
-        self.ui.subagent_conversation.scroll_to_bottom();
+    }
+
+    fn close_subagent_view(&self) {
+        self.active_subagent.borrow_mut().take();
+        self.subagent_transcript.borrow_mut().take();
+        self.subagent_tool_cards.borrow_mut().clear();
+        self.ui.content_stack.set_visible_child_name("chat");
+        self.ui.back_button.set_visible(false);
+        self.ui.composer_clamp.set_visible(true);
+        self.ui.title.set_text(&self.current_session_title.borrow());
     }
 
     fn clear_subagents(&self) {
-        self.subagents.borrow_mut().clear();
-        self.subagent_buttons.borrow_mut().clear();
+        self.agent_hub.borrow_mut().clear();
+        self.agent_hub_rows.borrow_mut().clear();
+        self.active_subagent.borrow_mut().take();
+        self.subagent_transcript.borrow_mut().take();
+        self.subagent_tool_cards.borrow_mut().clear();
+        self.ui.agent_hub.clear_rows();
+        self.ui.agent_hub.set_counts(0, 0);
+        self.ui.agent_hub.show_placeholder();
         self.ui.composer.clear_subagent_chips();
         self.ui.composer.set_subagents_visible(false);
+        if self.ui.content_stack.visible_child_name().as_deref() == Some("agent-hub") {
+            self.ui.content_stack.set_visible_child_name("chat");
+            self.ui.back_button.set_visible(false);
+            self.ui.composer_clamp.set_visible(true);
+        }
         self.update_activity_counts();
     }
 
     fn update_activity_counts(&self) {
-        let active_agents = self
-            .subagents
-            .borrow()
-            .values()
-            .filter(|agent| agent.active)
-            .count();
-        let total_agents = self.subagents.borrow().len();
+        let (active_agents, total_agents) = {
+            let hub = self.agent_hub.borrow();
+            (hub.active_count(), hub.len())
+        };
         self.ui
             .composer
             .set_subagent_count(&format!("{active_agents} active · {total_agents} total"));
+        self.ui.agent_hub.set_counts(active_agents, total_agents);
+        self.ui.agent_hub_button.update_property(&[
+            gtk::accessible::Property::Label(&format!(
+                "Open runtime agent hub, {active_agents} active agents, {total_agents} total"
+            )),
+        ]);
         let active_items = active_agents + usize::from(self.running.get());
         self.ui.sidebar_activity_count.set_visible(active_items > 0);
         self.ui
@@ -3013,25 +3168,6 @@ fn title_case(value: &str) -> String {
     }
 }
 
-fn looks_like_uuid(value: &str) -> bool {
-    value.len() >= 32
-        && value
-            .chars()
-            .all(|character| character.is_ascii_hexdigit() || character == '-')
-}
-
-fn friendly_agent_name(value: &str) -> String {
-    let mut output = String::new();
-    let mut previous_lowercase = false;
-    for character in value.replace(['_', '-'], " ").chars() {
-        if character.is_uppercase() && previous_lowercase {
-            output.push(' ');
-        }
-        previous_lowercase = character.is_lowercase();
-        output.push(character);
-    }
-    title_case(output.trim())
-}
 
 fn compact_path(path: &Path) -> String {
     let mut text = path.to_string_lossy().into_owned();

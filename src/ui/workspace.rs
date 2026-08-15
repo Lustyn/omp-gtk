@@ -2,9 +2,10 @@ use adw::prelude::*;
 use gtk4 as gtk;
 use libadwaita as adw;
 
+use super::agent_hub::AgentHubView;
 use super::chat::{ChatStatus, TelemetryWidgets};
 use super::conversation::ConversationView;
-use super::{composer, icons, sidebar, todos};
+use super::{agent_hub, composer, icons, sidebar, todos};
 
 pub(crate) struct WorkspaceView {
     pub(crate) window: gtk::ApplicationWindow,
@@ -16,8 +17,10 @@ pub(crate) struct WorkspaceView {
     pub(crate) hide_sidebar_button: gtk::Button,
     pub(crate) history_button: gtk::Button,
     pub(crate) preferences_button: gtk::Button,
+    pub(crate) agent_hub_button: gtk::Button,
     pub(crate) back_button: gtk::Button,
     pub(crate) content_stack: gtk::Stack,
+    pub(crate) agent_hub: AgentHubView,
     pub(crate) subagent_conversation: ConversationView,
     pub(crate) composer_clamp: adw::Clamp,
     pub(crate) chat_status: ChatStatus,
@@ -54,10 +57,17 @@ pub(crate) fn build(app: &adw::Application) -> WorkspaceView {
     title.set_ellipsize(gtk::pango::EllipsizeMode::End);
     title.add_css_class("chat-title");
     let chat_status = ChatStatus::new();
+    let agent_hub_button = icons::labeled_button(icons::Icon::Users, "Agents");
+    agent_hub_button.set_tooltip_text(Some("Open runtime agent hub"));
+    agent_hub_button.update_property(&[gtk::accessible::Property::Label(
+        "Open runtime agent hub, 0 active agents",
+    )]);
+    agent_hub_button.add_css_class("agent-hub-button");
     header.append(&show_sidebar_button);
     header.append(&back_button);
     header.append(&assistant_mark);
     header.append(&title);
+    header.append(&agent_hub_button);
     header.append(&chat_status.root);
     header.append(&window_controls());
 
@@ -69,12 +79,13 @@ pub(crate) fn build(app: &adw::Application) -> WorkspaceView {
 
     let conversation = ConversationView::main();
     conversation.append_notice("Connecting to the omp runtime…", false);
-    let subagent_conversation = ConversationView::transcript();
+    let agent_hub = agent_hub::build();
+    let subagent_conversation = agent_hub.transcript.clone();
     let content_stack = gtk::Stack::new();
     content_stack.set_transition_type(gtk::StackTransitionType::Crossfade);
     content_stack.set_transition_duration(180);
     content_stack.add_named(conversation.widget(), Some("chat"));
-    content_stack.add_named(subagent_conversation.widget(), Some("subagent"));
+    content_stack.add_named(agent_hub.widget(), Some("agent-hub"));
     content_stack.set_visible_child_name("chat");
 
     let todos = todos::TodoPanel::new();
@@ -131,8 +142,10 @@ pub(crate) fn build(app: &adw::Application) -> WorkspaceView {
         hide_sidebar_button: sidebar.collapse,
         history_button: sidebar.history,
         preferences_button: sidebar.preferences,
+        agent_hub_button,
         back_button,
         content_stack,
+        agent_hub,
         subagent_conversation,
         composer_clamp,
         chat_status,
