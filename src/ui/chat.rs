@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use gtk::prelude::*;
 use gtk::{gdk, glib};
 use gtk4 as gtk;
+use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use super::icons;
 
@@ -39,6 +40,7 @@ pub struct ChatStatus {
 pub struct TelemetryWidgets {
     pub root: gtk::Box,
     pub cwd: gtk::Label,
+    pub cwd_button: gtk::Button,
     pub context: gtk::Label,
     pub context_progress: gtk::ProgressBar,
     pub cost: gtk::Label,
@@ -234,6 +236,12 @@ impl TelemetryWidgets {
         cwd.set_hexpand(true);
         cwd.set_xalign(0.0);
         cwd.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        let cwd_button = gtk::Button::builder().child(&cwd_box).build();
+        cwd_button.set_hexpand(true);
+        cwd_button.update_property(&[gtk::accessible::Property::Label("Change workspace")]);
+        cwd_button.set_tooltip_text(Some("Change workspace"));
+        cwd_button.add_css_class("flat");
+        cwd_button.add_css_class("telemetry-workspace-button");
         let (context_box, context) = telemetry_item(
             icons::Icon::Gauge,
             "Context unavailable",
@@ -247,7 +255,7 @@ impl TelemetryWidgets {
         let (cost_box, cost) = telemetry_item(icons::Icon::Coins, "$0.000", "Session cost");
         let (throughput_box, throughput) =
             telemetry_item(icons::Icon::Zap, "Idle", "Generation throughput");
-        root.append(&cwd_box);
+        root.append(&cwd_button);
         root.append(&context_box);
         root.append(&context_progress);
         root.append(&cost_box);
@@ -255,6 +263,7 @@ impl TelemetryWidgets {
         Self {
             root,
             cwd,
+            cwd_button,
             context,
             context_progress,
             cost,
@@ -293,8 +302,310 @@ impl TelemetryWidgets {
         );
     }
 }
+struct ListState {
+    next_number: Option<u64>,
+    first_item: bool,
+}
 
-pub fn append_message(messages: &gtk::Box, role: MessageRole, text: &str) -> gtk::Label {
+struct MarkdownRenderer {
+    markup: String,
+    lists: Vec<ListState>,
+    links: Vec<bool>,
+    line_breaks: usize,
+    after_block_marker: bool,
+    quote_depth: usize,
+    table_cell: usize,
+    table_rows: usize,
+}
+
+impl MarkdownRenderer {
+    fn new() -> Self {
+        Self {
+            markup: String::new(),
+            lists: Vec::new(),
+            links: Vec::new(),
+            line_breaks: 0,
+            after_block_marker: false,
+            quote_depth: 0,
+            table_cell: 0,
+            table_rows: 0,
+        }
+    }
+
+    fn render(mut self, event: Event<'_>) -> Self {
+        match event {
+            Event::Start(tag) => self.start(tag),
+            Event::End(tag) => self.end(tag),
+            Event::Text(text) => self.text(&text),
+            Event::Code(code) => {
+                self.tag("<span font_family=\"monospace\" background=\"#20242c\">");
+                self.text(&code);
+                self.tag("</span>");
+            }
+            Event::InlineMath(math) => {
+                self.tag("<span font_family=\"monospace\">");
+                self.text(&math);
+                self.tag("</span>");
+            }
+            Event::DisplayMath(math) => {
+                self.block();
+                self.tag("<span font_family=\"monospace\">");
+                self.text(&math);
+                self.tag("</span>");
+            }
+            Event::Html(html) | Event::InlineHtml(html) => self.text(&html),
+            Event::FootnoteReference(name) => {
+                self.text("[");
+                self.text(&name);
+                self.text("]");
+            }
+            Event::SoftBreak => self.text(" "),
+            Event::HardBreak => self.breaks(1),
+            Event::Rule => {
+                self.block();
+                self.tag("<span foreground=\"#565d69\">────────────────────────</span>");
+            }
+            Event::TaskListMarker(checked) => self.text(if checked { "☑ " } else { "☐ " }),
+        }
+        self
+    }
+
+    fn start(&mut self, tag: Tag<'_>) {
+        match tag {
+            Tag::Paragraph => {
+                if self.after_block_marker {
+                    self.after_block_marker = false;
+                } else {
+                    self.block();
+                    self.quote_prefix();
+                }
+            }
+            Tag::Heading { level, .. } => {
+                self.block();
+                self.quote_prefix();
+                let size = match level {
+                    HeadingLevel::H1 => "xx-large",
+                    HeadingLevel::H2 => "x-large",
+                    HeadingLevel::H3 => "large",
+                    HeadingLevel::H4 | HeadingLevel::H5 | HeadingLevel::H6 => "medium",
+                };
+                self.tag(&format!("<span weight=\"bold\" size=\"{size}\">"));
+            }
+            Tag::BlockQuote(_) => {
+                self.block();
+                self.quote_depth += 1;
+                self.tag("<span foreground=\"#aeb4bf\">");
+                self.quote_prefix();
+                self.after_block_marker = true;
+            }
+            Tag::CodeBlock(_) => {
+                self.block();
+                self.quote_prefix();
+                self.tag(
+                    "<span font_family=\"monospace\" foreground=\"#e4e8ef\" background=\"#171a20\">",
+                );
+            }
+            Tag::HtmlBlock => self.block(),
+            Tag::List(start) => {
+                if self.lists.is_empty() {
+                    self.block();
+                } else {
+                    self.breaks(1);
+                }
+                self.lists.push(ListState {
+                    next_number: start,
+                    first_item: true,
+                });
+            }
+            Tag::Item => {
+                let depth = self.lists.len();
+                let (needs_break, marker) = {
+                    let state = self.lists.last_mut().expect("list item belongs to a list");
+                    let needs_break = !state.first_item;
+                    state.first_item = false;
+                    let marker = match &mut state.next_number {
+                        Some(number) => {
+                            let marker = format!("{number}. ");
+                            *number += 1;
+                            marker
+                        }
+                        None => "• ".to_owned(),
+                    };
+                    (needs_break, marker)
+                };
+                if needs_break {
+                    self.breaks(1);
+                }
+                self.quote_prefix();
+                self.text(&"  ".repeat(depth.saturating_sub(1)));
+                self.text(&marker);
+                self.after_block_marker = true;
+            }
+            Tag::FootnoteDefinition(name) => {
+                self.block();
+                self.text("[");
+                self.text(&name);
+                self.text("] ");
+                self.after_block_marker = true;
+            }
+            Tag::DefinitionList => self.block(),
+            Tag::DefinitionListTitle => self.tag("<b>"),
+            Tag::DefinitionListDefinition => self.text(" — "),
+            Tag::Table(_) => {
+                self.block();
+                self.table_rows = 0;
+                self.tag("<span font_family=\"monospace\">");
+            }
+            Tag::TableHead => self.tag("<b>"),
+            Tag::TableRow => {
+                if self.table_rows > 0 {
+                    self.breaks(1);
+                }
+                self.table_rows += 1;
+                self.table_cell = 0;
+                self.quote_prefix();
+            }
+            Tag::TableCell => {
+                if self.table_cell > 0 {
+                    self.text("  │  ");
+                }
+                self.table_cell += 1;
+            }
+            Tag::Emphasis => self.tag("<i>"),
+            Tag::Strong => self.tag("<b>"),
+            Tag::Strikethrough => self.tag("<span strikethrough=\"true\">"),
+            Tag::Superscript => self.tag("<sup>"),
+            Tag::Subscript => self.tag("<sub>"),
+            Tag::Link { dest_url, .. } => {
+                let active = safe_link(&dest_url);
+                self.links.push(active);
+                if active {
+                    let destination = glib::markup_escape_text(&dest_url);
+                    self.tag(&format!(
+                        "<a href=\"{destination}\"><span foreground=\"#8ab4f8\" underline=\"single\">"
+                    ));
+                } else {
+                    self.tag("<span foreground=\"#8ab4f8\" underline=\"single\">");
+                }
+            }
+            Tag::Image { .. } => {
+                self.tag("<span foreground=\"#9299a6\"><i>Image: ");
+            }
+            Tag::MetadataBlock(_) => {}
+        }
+    }
+
+    fn end(&mut self, tag: TagEnd) {
+        match tag {
+            TagEnd::Paragraph | TagEnd::Item | TagEnd::HtmlBlock => {}
+            TagEnd::Heading(_) => self.tag("</span>"),
+            TagEnd::BlockQuote(_) => {
+                self.tag("</span>");
+                self.quote_depth = self.quote_depth.saturating_sub(1);
+            }
+            TagEnd::CodeBlock => self.tag("</span>"),
+            TagEnd::List(_) => {
+                self.lists.pop();
+            }
+            TagEnd::FootnoteDefinition => {}
+            TagEnd::DefinitionList => {}
+            TagEnd::DefinitionListTitle => self.tag("</b>"),
+            TagEnd::DefinitionListDefinition => {}
+            TagEnd::Table => self.tag("</span>"),
+            TagEnd::TableHead => self.tag("</b>"),
+            TagEnd::TableRow | TagEnd::TableCell => {}
+            TagEnd::Emphasis => self.tag("</i>"),
+            TagEnd::Strong => self.tag("</b>"),
+            TagEnd::Strikethrough => self.tag("</span>"),
+            TagEnd::Superscript => self.tag("</sup>"),
+            TagEnd::Subscript => self.tag("</sub>"),
+            TagEnd::Link => {
+                if self.links.pop().unwrap_or(false) {
+                    self.tag("</span></a>");
+                } else {
+                    self.tag("</span>");
+                }
+            }
+            TagEnd::Image => self.tag("</i></span>"),
+            TagEnd::MetadataBlock(_) => {}
+        }
+    }
+
+    fn block(&mut self) {
+        if !self.markup.is_empty() {
+            self.breaks(2);
+        }
+    }
+
+    fn quote_prefix(&mut self) {
+        if self.quote_depth > 0 {
+            self.text(&"│ ".repeat(self.quote_depth));
+        }
+    }
+
+    fn breaks(&mut self, count: usize) {
+        while self.line_breaks < count {
+            self.markup.push('\n');
+            self.line_breaks += 1;
+        }
+    }
+
+    fn tag(&mut self, markup: &str) {
+        self.markup.push_str(markup);
+    }
+
+    fn text(&mut self, text: &str) {
+        self.markup.push_str(&glib::markup_escape_text(text));
+        self.line_breaks = text
+            .chars()
+            .rev()
+            .take_while(|character| *character == '\n')
+            .count();
+    }
+}
+
+fn markdown_markup(markdown: &str) -> String {
+    let options = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_SMART_PUNCTUATION;
+    Parser::new_ext(markdown, options)
+        .fold(MarkdownRenderer::new(), MarkdownRenderer::render)
+        .markup
+}
+
+fn safe_link(destination: &str) -> bool {
+    url::Url::parse(destination)
+        .map(|url| matches!(url.scheme(), "http" | "https" | "mailto"))
+        .unwrap_or(false)
+}
+
+#[derive(Clone)]
+pub(crate) struct MessageBody {
+    label: gtk::Label,
+    source: Rc<RefCell<String>>,
+}
+
+impl MessageBody {
+    fn new(text: &str) -> Self {
+        let body = Self {
+            label: read_only_label("", "message-body"),
+            source: Rc::new(RefCell::new(String::new())),
+        };
+        body.set_text(text);
+        body
+    }
+
+    pub(crate) fn set_text(&self, text: &str) {
+        let mut source = self.source.borrow_mut();
+        source.clear();
+        source.push_str(text);
+        drop(source);
+        self.label.set_markup(&markdown_markup(text));
+    }
+}
+
+pub fn append_message(messages: &gtk::Box, role: MessageRole, text: &str) -> MessageBody {
     let row = gtk::Box::new(gtk::Orientation::Vertical, 7);
     row.add_css_class("message-row");
     row.add_css_class(match role {
@@ -315,9 +626,9 @@ pub fn append_message(messages: &gtk::Box, role: MessageRole, text: &str) -> gtk
         }
     }
 
-    let body = read_only_label(text, "message-body");
+    let body = MessageBody::new(text);
     row.append(&author);
-    row.append(&body);
+    row.append(&body.label);
     messages.append(&row);
     wire_message_menu(&row, &body, role);
     body
@@ -363,7 +674,7 @@ pub fn read_only_label(text: &str, css_class: &str) -> gtk::Label {
     label
 }
 
-fn wire_message_menu(row: &gtk::Box, body: &gtk::Label, role: MessageRole) {
+fn wire_message_menu(row: &gtk::Box, body: &MessageBody, role: MessageRole) {
     let popover = gtk::Popover::builder()
         .has_arrow(true)
         .autohide(true)
@@ -377,21 +688,21 @@ fn wire_message_menu(row: &gtk::Box, body: &gtk::Label, role: MessageRole) {
     popover.set_child(Some(&actions));
     popover.set_parent(row);
 
-    let body_for_copy = body.clone();
+    let source_for_copy = body.source.clone();
     let popover_for_copy = popover.clone();
     copy.connect_clicked(move |_| {
-        set_clipboard(&body_for_copy.text());
+        set_clipboard(&source_for_copy.borrow());
         popover_for_copy.popdown();
     });
-    let body_for_quote = body.clone();
+    let source_for_quote = body.source.clone();
     let popover_for_quote = popover.clone();
     quote.connect_clicked(move |_| {
         let prefix = match role {
             MessageRole::User => "> You: ",
             MessageRole::Assistant => "> Assistant: ",
         };
-        let quoted = body_for_quote
-            .text()
+        let quoted = source_for_quote
+            .borrow()
             .lines()
             .map(|line| format!("> {line}"))
             .collect::<Vec<_>>()
@@ -576,8 +887,36 @@ fn format_tokens(value: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{shimmer_markup, thinking_summary};
+    use super::{markdown_markup, shimmer_markup, thinking_summary};
+    use gtk4::pango;
     use std::time::Duration;
+
+    #[test]
+    fn markdown_renders_common_chat_content_as_valid_pango_markup() {
+        let markup = markdown_markup(
+            "# Result\n\nUse **bold**, *italic*, and `code`.\n\n- first\n- [x] done\n\n> quoted",
+        );
+        let (_, plain_text, _) =
+            pango::parse_markup(&markup, '\0').expect("renderer must produce valid Pango markup");
+
+        assert_eq!(
+            plain_text,
+            "Result\n\nUse bold, italic, and code.\n\n• first\n• ☑ done\n\n│ quoted"
+        );
+        assert!(markup.contains("weight=\"bold\""));
+        assert!(markup.contains("<b>bold</b>"));
+        assert!(markup.contains("font_family=\"monospace\""));
+    }
+
+    #[test]
+    fn markdown_escapes_html_and_only_activates_safe_links() {
+        let markup = markdown_markup(
+            "[docs](https://example.com/docs) [unsafe](javascript:alert(1)) <button>",
+        );
+        assert!(markup.contains("href=\"https://example.com/docs\""));
+        assert!(!markup.contains("href=\"javascript:"));
+        assert!(markup.contains("&lt;button&gt;"));
+    }
 
     #[test]
     fn shimmer_moves_color_without_changing_status_copy() {

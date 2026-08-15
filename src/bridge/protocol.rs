@@ -41,7 +41,6 @@ pub struct ModelSummary {
     pub name: Option<String>,
     pub thinking: Option<ModelThinking>,
     pub context_window: Option<u64>,
-    pub max_tokens: Option<u64>,
 }
 
 impl ModelSummary {

@@ -11,7 +11,7 @@ use super::conversation::ConversationView;
 use super::model_picker::ModelPickerView;
 use super::tool_components::ToolCard;
 use super::{composer, sidebar};
-use crate::bridge::protocol::ModelSummary;
+use crate::bridge::protocol::{ModelSummary, ModelThinking};
 use crate::session_catalog::SessionEntry;
 
 #[derive(Clone, Copy)]
@@ -31,7 +31,7 @@ pub(crate) fn find(id: &str) -> Option<Story> {
     STORIES.iter().copied().find(|story| story.id == id)
 }
 
-const STORIES: [Story; 13] = [
+const STORIES: [Story; 15] = [
     Story {
         id: "header/ready",
         title: "Header · Ready",
@@ -68,6 +68,13 @@ const STORIES: [Story; 13] = [
         build: conversation_tool_use,
     },
     Story {
+        id: "conversation/markdown",
+        title: "Conversation · Markdown",
+        width: 900,
+        height: 720,
+        build: conversation_markdown,
+    },
+    Story {
         id: "composer/ready",
         title: "Composer · Ready",
         width: 900,
@@ -87,6 +94,13 @@ const STORIES: [Story; 13] = [
         width: 760,
         height: 660,
         build: model_picker_default,
+    },
+    Story {
+        id: "thinking-picker/default",
+        title: "Thinking picker · Default",
+        width: 760,
+        height: 680,
+        build: thinking_picker_default,
     },
     Story {
         id: "tool-card/running",
@@ -218,6 +232,18 @@ fn conversation_tool_use() -> gtk::Widget {
     );
     view.widget().clone()
 }
+fn conversation_markdown() -> gtk::Widget {
+    let view = ConversationView::main();
+    view.append_message(
+        MessageRole::Assistant,
+        "# Markdown history\n\nMessages now support **strong emphasis**, *italics*, \
+         ~~strikethrough~~, and `inline code`.\n\n## Structured content\n\n\
+         1. Ordered and unordered lists\n2. [Safe links](https://example.com)\n\
+         3. Escaped HTML such as <button>\n\n> Block quotes preserve their visual hierarchy.\n\n\
+         ```rust\nfn render(markdown: &str) {\n    println!(\"{markdown}\");\n}\n```",
+    );
+    view.widget().clone()
+}
 
 fn composer_ready() -> gtk::Widget {
     let view = composer::build();
@@ -246,7 +272,43 @@ fn composer_running() -> gtk::Widget {
 }
 
 fn model_picker_default() -> gtk::Widget {
-    let models = vec![
+    let view = ModelPickerView::new(
+        picker_models(),
+        Some(("openai-codex".to_owned(), "gpt-5.6-sol".to_owned())),
+        |_| {},
+        || {},
+    );
+    view.widget().clone()
+}
+
+fn thinking_picker_default() -> gtk::Widget {
+    let composer = composer::build();
+    composer.set_input_sensitive(true);
+    composer.set_model("openai-codex", "GPT-5.6-Sol");
+    composer.set_model_sensitive(true);
+    for level in ["off", "minimal", "low", "medium", "high", "xhigh"] {
+        let option = composer::thinking_option(level);
+        if level == "medium" {
+            option.add_css_class("thinking-option-selected");
+        }
+        composer.append_thinking_option(&option);
+    }
+    composer.set_thinking_label("medium");
+    composer.set_thinking_sensitive(true);
+    let composer_for_model = composer.clone();
+    composer.connect_model_clicked(move || composer_for_model.close_thinking_popover());
+    let composer_for_popup = composer.clone();
+    gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || {
+        composer_for_popup.show_thinking_popover();
+    });
+    composer.widget().set_vexpand(false);
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.append(composer.widget());
+    root.upcast()
+}
+
+fn picker_models() -> Vec<ModelSummary> {
+    vec![
         model("anthropic", "claude-opus-4-6", "Claude Opus 4.6", 1_000_000),
         model(
             "anthropic",
@@ -256,14 +318,17 @@ fn model_picker_default() -> gtk::Widget {
         ),
         model("openai-codex", "gpt-5.6-sol", "GPT-5.6-Sol", 272_000),
         model("openai-codex", "gpt-5.4-mini", "GPT-5.4-Mini", 128_000),
-    ];
-    let view = ModelPickerView::new(
-        models,
-        Some(("openai-codex".to_owned(), "gpt-5.6-sol".to_owned())),
-        |_| {},
-        || {},
-    );
-    view.widget().clone()
+        model("google", "gemini-3-pro", "Gemini 3 Pro", 1_000_000),
+        model(
+            "github-copilot",
+            "claude-sonnet-4.6",
+            "Claude Sonnet 4.6",
+            200_000,
+        ),
+        model("mistral", "devstral-2", "Devstral 2", 256_000),
+        model("openrouter", "deepseek/deepseek-v4", "DeepSeek V4", 164_000),
+        model("ollama-cloud", "qwen3-coder", "Qwen3 Coder", 128_000),
+    ]
 }
 
 fn model(provider: &str, id: &str, name: &str, context_window: u64) -> ModelSummary {
@@ -271,9 +336,10 @@ fn model(provider: &str, id: &str, name: &str, context_window: u64) -> ModelSumm
         provider: provider.to_owned(),
         id: id.to_owned(),
         name: Some(name.to_owned()),
-        thinking: None,
+        thinking: Some(ModelThinking {
+            efforts: vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()],
+        }),
         context_window: Some(context_window),
-        max_tokens: Some(128_000),
     }
 }
 

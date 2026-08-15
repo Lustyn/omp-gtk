@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 
@@ -7,6 +9,22 @@ use gtk::glib;
 use gtk::prelude::*;
 use gtk4 as gtk;
 pub use lucide_icons::Icon;
+use simple_icons_pack::{
+    Icon as BrandIcon, SI_ALIBABACLOUD, SI_ANTHROPIC, SI_CLOUDFLARE, SI_CURSOR, SI_DEEPSEEK,
+    SI_GITHUBCOPILOT, SI_GITLAB, SI_GOOGLECLOUD, SI_GOOGLEGEMINI, SI_HUGGINGFACE, SI_KIMI,
+    SI_METAAI, SI_MINIMAX, SI_MISTRALAI, SI_MOONSHOTAI, SI_NVIDIA, SI_OLLAMA, SI_OPENCODE,
+    SI_OPENROUTER, SI_QWEN, SI_VERCEL, SI_VLLM, SI_X, SI_XIAOMI,
+};
+
+const OPENAI_ICON: BrandIcon = BrandIcon {
+    svg: include_str!("../assets/openai.svg"),
+    slug: "openai",
+    title: "OpenAI",
+    hex: "EEF0F4",
+    source: "https://openai.com/brand",
+    guidelines: None,
+    license: None,
+};
 
 #[derive(Clone)]
 pub struct ProviderIcon {
@@ -95,7 +113,8 @@ pub fn provider_icon(provider: &str, size: i32) -> ProviderIcon {
     root.set_size_request(size, size);
     let brand = gtk::Image::new();
     brand.set_pixel_size(size);
-    let generic = icon(Icon::Cpu, size);
+    let generic = gtk::Label::new(None);
+    generic.add_css_class("provider-monogram");
     root.add_named(&brand, Some("brand"));
     root.add_named(&generic, Some("generic"));
     let provider_icon = ProviderIcon {
@@ -108,70 +127,154 @@ pub fn provider_icon(provider: &str, size: i32) -> ProviderIcon {
 }
 
 pub fn set_provider_icon(icon: &ProviderIcon, provider: &str) {
-    let normalized = provider.to_ascii_lowercase();
-    let bytes = if normalized.contains("anthropic") || normalized.contains("claude") {
-        Some((
-            include_bytes!("../assets/anthropic.svg").as_slice(),
-            "Anthropic logo",
-        ))
-    } else if normalized.contains("openai") || normalized.contains("codex") {
-        Some((
-            include_bytes!("../assets/openai.svg").as_slice(),
-            "OpenAI logo",
-        ))
-    } else {
-        None
-    };
-
-    if let Some((bytes, description)) = bytes {
-        icon.brand.set_paintable(Some(&texture(bytes, description)));
+    if let Some(texture) = provider_texture(provider) {
+        icon.brand.set_paintable(Some(&texture));
         icon.root.set_visible_child(&icon.brand);
     } else {
+        icon.generic
+            .set_text(&provider_monogram(&provider_label(provider)));
         icon.root.set_visible_child(&icon.generic);
     }
     icon.root.set_tooltip_text(Some(&provider_label(provider)));
 }
 
+thread_local! {
+    static PROVIDER_TEXTURES: RefCell<HashMap<&'static str, gdk::Texture>> =
+        RefCell::new(HashMap::new());
+}
+
+fn provider_texture(provider: &str) -> Option<gdk::Texture> {
+    let asset = provider_brand_asset(provider)?;
+    PROVIDER_TEXTURES.with(|cache| {
+        if let Some(texture) = cache.borrow().get(asset.slug) {
+            return Some(texture.clone());
+        }
+        let svg = asset.svg.replacen("<svg ", r##"<svg fill="#eef0f4" "##, 1);
+        let texture = gdk::Texture::from_bytes(&glib::Bytes::from_owned(svg.into_bytes()))
+            .unwrap_or_else(|error| panic!("{} logo is not a valid SVG: {error}", asset.title));
+        cache.borrow_mut().insert(asset.slug, texture.clone());
+        Some(texture)
+    })
+}
+
+fn provider_brand_asset(key: &str) -> Option<&'static BrandIcon> {
+    let normalized = key.to_ascii_lowercase();
+    let icon = match normalized.as_str() {
+        value if value.contains("anthropic") || value.contains("claude") => &SI_ANTHROPIC,
+        value if value.contains("openai") || value.contains("codex") => &OPENAI_ICON,
+        "alibabacloud" | "alibaba-coding-plan" | "alibaba-token-plan" => &SI_ALIBABACLOUD,
+        "cloudflare" | "cloudflare-ai-gateway" => &SI_CLOUDFLARE,
+        "cursor" => &SI_CURSOR,
+        "deepseek" => &SI_DEEPSEEK,
+        "githubcopilot" | "github-copilot" => &SI_GITHUBCOPILOT,
+        "gitlab" | "gitlab-duo" | "gitlab-duo-agent" => &SI_GITLAB,
+        "googlecloud" | "google-vertex" => &SI_GOOGLECLOUD,
+        "google" | "googlegemini" | "google-antigravity" | "google-gemini-cli" => &SI_GOOGLEGEMINI,
+        "huggingface" => &SI_HUGGINGFACE,
+        "kimi-code" => &SI_KIMI,
+        "meta" | "metaai" => &SI_METAAI,
+        "minimax" | "minimax-code" | "minimax-code-cn" => &SI_MINIMAX,
+        "mistral" | "mistralai" => &SI_MISTRALAI,
+        "nvidia" => &SI_NVIDIA,
+        "moonshot" => &SI_MOONSHOTAI,
+        "ollama" | "ollama-cloud" => &SI_OLLAMA,
+        "opencode" | "opencode-go" | "opencode-zen" => &SI_OPENCODE,
+        "openrouter" => &SI_OPENROUTER,
+        "qwen-portal" => &SI_QWEN,
+        "vercel" | "vercel-ai-gateway" => &SI_VERCEL,
+        "vllm" => &SI_VLLM,
+        "x" | "xai" | "xai-oauth" => &SI_X,
+        "xiaomi" | "xiaomi-token-plan-ams" | "xiaomi-token-plan-cn" | "xiaomi-token-plan-sgp" => {
+            &SI_XIAOMI
+        }
+        _ => return None,
+    };
+    Some(icon)
+}
+
+fn provider_monogram(label: &str) -> String {
+    label
+        .chars()
+        .find(|character| character.is_alphanumeric())
+        .map(|character| character.to_uppercase().collect())
+        .unwrap_or_else(|| "AI".to_owned())
+}
+
 pub fn provider_label(provider: &str) -> String {
     let normalized = provider.to_ascii_lowercase();
-    if normalized.contains("anthropic") || normalized.contains("claude") {
-        "Anthropic".to_owned()
-    } else if normalized.contains("openai") || normalized.contains("codex") {
-        "OpenAI".to_owned()
-    } else if normalized.contains("google") || normalized.contains("gemini") {
-        "Google".to_owned()
-    } else if normalized.contains("mistral") {
-        "Mistral".to_owned()
-    } else if normalized.contains("xai") || normalized.contains("grok") {
-        "xAI".to_owned()
-    } else if normalized.contains("bedrock") || normalized == "aws" {
-        "Amazon Bedrock".to_owned()
-    } else if normalized.contains("openrouter") {
-        "OpenRouter".to_owned()
-    } else if normalized.contains("github") || normalized.contains("copilot") {
-        "GitHub Copilot".to_owned()
-    } else if normalized.contains("ollama") {
-        "Ollama".to_owned()
-    } else if normalized.contains("llama") {
-        "llama.cpp".to_owned()
-    } else {
-        provider
-            .split(['-', '_'])
-            .filter(|part| !part.is_empty())
-            .map(|part| {
-                let mut characters = part.chars();
-                characters.next().map_or_else(String::new, |first| {
-                    first.to_uppercase().collect::<String>() + characters.as_str()
+    let label = match normalized.as_str() {
+        "aiand" => "ai&",
+        "aimlapi" => "AIML API",
+        "alibaba-coding-plan" | "alibaba-token-plan" => "Alibaba Cloud",
+        "amazon-bedrock" | "bedrock-mantle" | "aws" => "Amazon Bedrock",
+        value if value.contains("anthropic") || value.contains("claude") => "Anthropic",
+        "azure" => "Microsoft Azure",
+        "baseten" => "Baseten",
+        "cerebras" => "Cerebras",
+        "cloudflare-ai-gateway" => "Cloudflare",
+        "coreweave" => "CoreWeave",
+        "cursor" => "Cursor",
+        "deepseek" => "DeepSeek",
+        "devin" => "Devin",
+        "firepass" | "fireworks" => "Fireworks",
+        "github-copilot" => "GitHub Copilot",
+        "gitlab-duo" | "gitlab-duo-agent" => "GitLab",
+        "gmi-cloud" => "GMI Cloud",
+        "google" | "google-gemini-cli" => "Google",
+        "google-antigravity" => "Google Antigravity",
+        "google-vertex" => "Google Cloud",
+        "groq" => "Groq",
+        "huggingface" => "Hugging Face",
+        "kilo" => "Kilo",
+        "kimi-code" => "Kimi",
+        "meta" => "Meta",
+        "minimax" | "minimax-cn" | "minimax-code" | "minimax-code-cn" => "MiniMax",
+        "mistral" => "Mistral",
+        "moonshot" => "Moonshot AI",
+        "nanogpt" => "NanoGPT",
+        "novita" => "Novita",
+        "nvidia" => "NVIDIA",
+        "ollama" | "ollama-cloud" => "Ollama",
+        value if value.contains("openai") || value.contains("codex") => "OpenAI",
+        "opencode" | "opencode-go" | "opencode-zen" => "OpenCode",
+        "openrouter" => "OpenRouter",
+        "qianfan" => "Qianfan",
+        "qwen-portal" => "Qwen",
+        "sakana" => "Sakana AI",
+        "synthetic" => "Synthetic",
+        "together" => "Together AI",
+        "umans" => "Umans AI",
+        "venice" => "Venice",
+        "vercel-ai-gateway" => "Vercel",
+        "vllm" => "vLLM",
+        "wafer-serverless" => "Wafer",
+        "xai" | "xai-oauth" => "xAI",
+        "xiaomi" | "xiaomi-token-plan-ams" | "xiaomi-token-plan-cn" | "xiaomi-token-plan-sgp" => {
+            "Xiaomi"
+        }
+        "zai" => "Z.AI",
+        "zenmux" => "ZenMux",
+        "zhipu-coding-plan" => "Zhipu AI",
+        _ => {
+            return provider
+                .split(['-', '_'])
+                .filter(|part| !part.is_empty())
+                .map(|part| {
+                    let mut characters = part.chars();
+                    characters.next().map_or_else(String::new, |first| {
+                        first.to_uppercase().collect::<String>() + characters.as_str()
+                    })
                 })
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
+    };
+    label.to_owned()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::provider_label;
+    use super::{provider_brand_asset, provider_label};
 
     #[test]
     fn provider_labels_hide_internal_adapter_names() {
@@ -179,5 +282,16 @@ mod tests {
         assert_eq!(provider_label("anthropic-oauth"), "Anthropic");
         assert_eq!(provider_label("amazon-bedrock"), "Amazon Bedrock");
         assert_eq!(provider_label("acme-local"), "Acme Local");
+    }
+
+    #[test]
+    fn provider_icons_cover_available_ai_brands() {
+        assert_eq!(provider_brand_asset("kimi-code").unwrap().title, "Kimi");
+        assert_eq!(
+            provider_brand_asset("moonshot").unwrap().title,
+            "Moonshot AI"
+        );
+        assert_eq!(provider_brand_asset("qwen-portal").unwrap().title, "QWen");
+        assert_eq!(provider_brand_asset("vllm").unwrap().title, "vLLM");
     }
 }

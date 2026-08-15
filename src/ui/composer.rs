@@ -11,6 +11,7 @@ pub(crate) struct ComposerView {
     model_button: gtk::Button,
     model_label: gtk::Label,
     model_icon: icons::ProviderIcon,
+    model_popover: gtk::Popover,
     thinking_button: gtk::Button,
     thinking_label: gtk::Label,
     thinking_popover: gtk::Popover,
@@ -94,6 +95,13 @@ pub(crate) fn build() -> ComposerView {
     model_button.set_sensitive(false);
     model_button.set_tooltip_text(Some("Choose a model"));
     model_button.add_css_class("composer-affordance");
+    let model_popover = gtk::Popover::builder()
+        .has_arrow(false)
+        .autohide(true)
+        .position(gtk::PositionType::Top)
+        .build();
+    model_popover.add_css_class("model-picker-popover");
+    model_popover.set_parent(&model_button);
 
     let thinking_label = gtk::Label::new(Some("Off"));
     let thinking_content = gtk::Box::new(gtk::Orientation::Horizontal, 5);
@@ -105,19 +113,26 @@ pub(crate) fn build() -> ComposerView {
     let thinking_button = gtk::Button::new();
     thinking_button.set_child(Some(&thinking_content));
     thinking_button.set_sensitive(false);
-    thinking_button.set_tooltip_text(Some("Set reasoning effort"));
+    thinking_button.set_tooltip_text(Some("Choose reasoning depth"));
     thinking_button.add_css_class("composer-affordance");
 
     let thinking_list = gtk::Box::new(gtk::Orientation::Vertical, 2);
     let thinking_content = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    thinking_content.set_margin_top(8);
-    thinking_content.set_margin_bottom(8);
-    thinking_content.set_margin_start(8);
-    thinking_content.set_margin_end(8);
-    let thinking_heading = gtk::Label::new(Some("Reasoning effort"));
+    thinking_content.set_margin_top(10);
+    thinking_content.set_margin_bottom(10);
+    thinking_content.set_margin_start(10);
+    thinking_content.set_margin_end(10);
+    let thinking_heading = gtk::Label::new(Some("Reasoning depth"));
     thinking_heading.set_xalign(0.0);
     thinking_heading.add_css_class("thinking-popover-heading");
+    let thinking_help = gtk::Label::new(Some(
+        "More depth can improve complex work, but may take longer.",
+    ));
+    thinking_help.set_xalign(0.0);
+    thinking_help.set_wrap(true);
+    thinking_help.add_css_class("thinking-popover-help");
     thinking_content.append(&thinking_heading);
+    thinking_content.append(&thinking_help);
     thinking_content.append(&thinking_list);
     let thinking_popover = gtk::Popover::builder()
         .has_arrow(false)
@@ -178,9 +193,11 @@ pub(crate) fn build() -> ComposerView {
     completion.set_hexpand(true);
     completion.set_parent(&composer);
     let completion_for_unrealize = completion.clone();
+    let model_for_unrealize = model_popover.clone();
     let thinking_for_unrealize = thinking_popover.clone();
     composer.connect_unrealize(move |_| {
         completion_for_unrealize.unparent();
+        model_for_unrealize.unparent();
         thinking_for_unrealize.unparent();
     });
 
@@ -191,6 +208,7 @@ pub(crate) fn build() -> ComposerView {
         model_button,
         model_label,
         model_icon,
+        model_popover,
         thinking_button,
         thinking_label,
         thinking_popover,
@@ -290,7 +308,22 @@ impl ComposerView {
         self.model_button.set_sensitive(sensitive);
     }
 
+    pub(crate) fn model_picker_visible(&self) -> bool {
+        self.model_popover.is_visible()
+    }
+
+    pub(crate) fn show_model_picker(&self, child: &gtk::Widget) {
+        self.thinking_popover.popdown();
+        self.model_popover.set_child(Some(child));
+        self.model_popover.popup();
+    }
+
+    pub(crate) fn close_model_picker(&self) {
+        self.model_popover.popdown();
+    }
+
     pub(crate) fn show_thinking_popover(&self) {
+        self.model_popover.popdown();
         self.thinking_popover.popup();
     }
 
@@ -308,8 +341,8 @@ impl ComposerView {
         self.thinking_button.set_sensitive(sensitive);
     }
 
-    pub(crate) fn set_thinking_label(&self, label: &str) {
-        self.thinking_label.set_text(label);
+    pub(crate) fn set_thinking_label(&self, level: &str) {
+        self.thinking_label.set_text(&thinking_title(level));
     }
 
     pub(crate) fn close_thinking_popover(&self) {
@@ -390,40 +423,59 @@ impl ComposerView {
 }
 
 pub fn thinking_option(level: &str) -> gtk::Button {
+    let title_text = thinking_title(level);
+    let detail_text = thinking_description(level);
     let button = gtk::Button::new();
     button.add_css_class("thinking-option");
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    let title = gtk::Label::new(Some(&thinking_title(level)));
+    button.set_tooltip_text(Some(detail_text));
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    let labels = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    labels.set_hexpand(true);
+    let title = gtk::Label::new(Some(&title_text));
     title.set_xalign(0.0);
     title.add_css_class("thinking-option-title");
-    let detail = gtk::Label::new(Some(thinking_description(level)));
+    let detail = gtk::Label::new(Some(detail_text));
     detail.set_xalign(0.0);
     detail.add_css_class("thinking-option-detail");
-    content.append(&title);
-    content.append(&detail);
+    labels.append(&title);
+    labels.append(&detail);
+    content.append(&labels);
+    let check = icons::icon(icons::Icon::Check, 15);
+    check.add_css_class("thinking-option-check");
+    content.append(&check);
     button.set_child(Some(&content));
     button
 }
 
 fn thinking_title(level: &str) -> String {
-    let normalized = level.replace(['-', '_'], " ");
-    let normalized = normalized.trim();
-    let mut characters = normalized.chars();
-    characters.next().map_or_else(
-        || "Off".to_owned(),
-        |first| first.to_uppercase().collect::<String>() + characters.as_str(),
-    )
+    match level.to_ascii_lowercase().as_str() {
+        "" | "off" | "inherit" | "none" => "Off".to_owned(),
+        "minimal" => "Minimal".to_owned(),
+        "low" => "Light".to_owned(),
+        "medium" => "Balanced".to_owned(),
+        "high" => "Deep".to_owned(),
+        "xhigh" | "max" => "Maximum".to_owned(),
+        _ => {
+            let normalized = level.replace(['-', '_'], " ");
+            let normalized = normalized.trim();
+            let mut characters = normalized.chars();
+            characters.next().map_or_else(
+                || "Off".to_owned(),
+                |first| first.to_uppercase().collect::<String>() + characters.as_str(),
+            )
+        }
+    }
 }
 
 fn thinking_description(level: &str) -> &'static str {
     match level {
-        "off" | "inherit" => "Respond without extended reasoning",
-        "minimal" => "Fastest pass for straightforward work",
-        "low" => "Light reasoning with low latency",
-        "medium" => "Balanced depth and response time",
-        "high" => "Thorough reasoning for complex work",
-        "xhigh" | "max" => "Maximum available reasoning depth",
-        _ => "Use this model's configured reasoning effort",
+        "off" | "inherit" | "none" => "Quick answers for simple requests",
+        "minimal" => "A fast answer with a light check",
+        "low" => "Quick reasoning for routine work",
+        "medium" => "Balanced for most tasks",
+        "high" => "Deeper reasoning for complex work",
+        "xhigh" | "max" => "Most thorough; may take longer",
+        _ => "Uses this model's recommended reasoning depth",
     }
 }
 

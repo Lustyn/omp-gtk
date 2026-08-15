@@ -5,7 +5,7 @@ use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
 
-use super::chat::{self, MessageRole, ThinkingBlock};
+use super::chat::{self, MessageBody, MessageRole, ThinkingBlock};
 
 #[derive(Clone)]
 pub(crate) struct ConversationView {
@@ -65,7 +65,7 @@ impl ConversationView {
         self.root.upcast_ref()
     }
 
-    pub(crate) fn append_message(&self, role: MessageRole, text: &str) -> gtk::Label {
+    pub(crate) fn append_message(&self, role: MessageRole, text: &str) -> MessageBody {
         chat::append_message(&self.items, role, text)
     }
 

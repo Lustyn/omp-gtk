@@ -119,7 +119,7 @@ fn present_direct_story(app: &adw::Application, story: Story, snapshot_path: Opt
     let content = story_canvas(story, &subject);
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title(format!("OMP UI Gallery — {}", story.id))
+        .title(format!("omp UI Gallery — {}", story.id))
         .default_width(story.width.max(360))
         .default_height(story.height.max(180))
         .content(&content)
@@ -194,7 +194,7 @@ fn present_browser(app: &adw::Application) {
     root.append(&canvas);
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title("OMP UI Gallery")
+        .title("omp UI Gallery")
         .default_width(1180)
         .default_height(820)
         .content(&root)
@@ -237,11 +237,21 @@ fn snapshot_widget(
     let parent = widget
         .parent()
         .ok_or_else(|| "story widget has no mapped parent".to_owned())?;
-    let snapshot = gtk::Snapshot::new();
-    parent.snapshot_child(widget, &snapshot);
-    let node = snapshot
+    let content_snapshot = gtk::Snapshot::new();
+    parent.snapshot_child(widget, &content_snapshot);
+    let content = content_snapshot
         .to_node()
         .ok_or_else(|| "story widget produced no render node".to_owned())?;
+    let bounds = content.bounds();
+    let snapshot = gtk::Snapshot::new();
+    snapshot.append_color(
+        &gtk::gdk::RGBA::new(11.0 / 255.0, 13.0 / 255.0, 16.0 / 255.0, 1.0),
+        &bounds,
+    );
+    snapshot.append_node(&content);
+    let node = snapshot
+        .to_node()
+        .ok_or_else(|| "story widget produced no composed render node".to_owned())?;
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())

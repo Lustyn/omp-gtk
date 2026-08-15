@@ -75,6 +75,18 @@ impl BridgeClient {
         Ok(())
     }
 
+    pub fn move_session(&self, path: &Path) -> Result<(), BridgeError> {
+        let path = path
+            .to_str()
+            .ok_or_else(|| BridgeError("workspace path is not valid UTF-8".to_owned()))?;
+        if path.contains('\n') || path.contains('\r') {
+            return Err(BridgeError(
+                "workspace path cannot contain a line break".to_owned(),
+            ));
+        }
+        self.prompt(&format!("/move {path}"))
+    }
+
     pub fn get_subagent_messages(&self, subagent_id: &str) -> Result<(), BridgeError> {
         self.request(
             "get_subagent_messages",
@@ -386,11 +398,14 @@ impl std::error::Error for BridgeError {}
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_omp_executable;
+    use super::{BridgeClient, WriterMessage, resolve_omp_executable};
+    use serde_json::Value;
     use std::ffi::OsStr;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{Arc, mpsc};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn fixture_directory(name: &str) -> std::path::PathBuf {
@@ -443,5 +458,25 @@ mod tests {
         );
 
         assert_eq!(resolved, Path::new(expected));
+    }
+
+    #[test]
+    fn moves_session_to_directory_with_spaces() {
+        let (writer, receiver) = mpsc::channel();
+        let client = BridgeClient {
+            writer,
+            next_request_id: Arc::new(AtomicU64::new(1)),
+        };
+
+        client
+            .move_session(Path::new("/tmp/project with spaces"))
+            .expect("queue move request");
+
+        let WriterMessage::Frame(frame) = receiver.recv().expect("receive move request") else {
+            panic!("expected RPC frame");
+        };
+        let frame = serde_json::from_str::<Value>(&frame).expect("decode move request");
+        assert_eq!(frame["type"], "prompt");
+        assert_eq!(frame["message"], "/move /tmp/project with spaces");
     }
 }

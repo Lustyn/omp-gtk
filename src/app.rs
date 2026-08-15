@@ -1,10 +1,14 @@
-use crate::ui::{chat, composer, model_picker, sidebar, tool_components, workspace};
+use crate::alerts::{self, AlertKind, Alerts, SoundEvent, SoundPackChoice, WindowStatus};
+use crate::sound_registry::{self, RegistryPack};
+use crate::ui::{
+    chat, composer, model_picker, sidebar, sound_settings, tool_components, workspace,
+};
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -20,10 +24,14 @@ use crate::bridge::protocol::{
 use crate::bridge::{BridgeClient, OmpBridge};
 use crate::commands::{CommandCompletion, completions};
 use crate::session_catalog::{self, SessionEntry};
-use chat::{MessageRole, ThinkingBlock};
+use chat::{MessageBody, MessageRole, ThinkingBlock};
 use sidebar::SessionRow;
 use tool_components::ToolCard;
 use workspace::WorkspaceView;
+
+const TASK_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
+const PROMPT_BURST_WINDOW: Duration = Duration::from_secs(5);
+const PROMPT_BURST_THRESHOLD: usize = 3;
 
 pub(crate) fn build(app: &adw::Application) {
     let ui = workspace::build(app);
@@ -42,9 +50,16 @@ pub(crate) fn build(app: &adw::Application) {
         }),
     };
 
+    let alerts = Alerts::new(app);
+    let present_action = gio::SimpleAction::new("present", None);
+    let window = ui.window.clone();
+    present_action.connect_activate(move |_, _| window.present());
+    app.add_action(&present_action);
+
     let controller = Rc::new(AppController {
         ui,
         bridge: RefCell::new(bridge),
+        alerts,
         client,
         models: RefCell::new(Vec::new()),
         commands: RefCell::new(Vec::new()),
@@ -71,9 +86,16 @@ pub(crate) fn build(app: &adw::Application) {
         current_model: RefCell::new(None),
         ready: Cell::new(false),
         running: Cell::new(false),
+        goal_completion_calls: RefCell::new(HashSet::new()),
+        goal_completed_this_run: Cell::new(false),
+        window_status: Cell::new(WindowStatus::Ready),
+        session_sound_started: Cell::new(false),
+        last_task_progress: Cell::new(None),
+        recent_prompts: RefCell::new(VecDeque::new()),
     });
 
     controller.wire_interactions();
+    controller.set_window_status(WindowStatus::Ready);
     if let Some(events) = events {
         AppController::run_event_loop(&controller, events);
     }
@@ -83,6 +105,7 @@ pub(crate) fn build(app: &adw::Application) {
             return glib::ControlFlow::Break;
         };
         controller.refresh_titles_from_disk();
+        controller.tick_sound_events();
         glib::ControlFlow::Continue
     });
     controller.ui.window.present();
@@ -90,7 +113,7 @@ pub(crate) fn build(app: &adw::Application) {
 }
 
 struct StreamingMessage {
-    label: gtk::Label,
+    body: MessageBody,
     text: String,
 }
 
@@ -105,6 +128,7 @@ struct SubagentState {
 
 struct AppController {
     ui: WorkspaceView,
+    alerts: Alerts,
     bridge: RefCell<Option<OmpBridge>>,
     client: Option<BridgeClient>,
     models: RefCell<Vec<ModelSummary>>,
@@ -132,6 +156,12 @@ struct AppController {
     current_model: RefCell<Option<(String, String)>>,
     ready: Cell<bool>,
     running: Cell<bool>,
+    goal_completion_calls: RefCell<HashSet<String>>,
+    goal_completed_this_run: Cell<bool>,
+    window_status: Cell<WindowStatus>,
+    session_sound_started: Cell<bool>,
+    last_task_progress: Cell<Option<Instant>>,
+    recent_prompts: RefCell<VecDeque<Instant>>,
 }
 
 impl AppController {
@@ -215,6 +245,28 @@ impl AppController {
                 controller.present_history();
             }
         });
+        let weak = Rc::downgrade(self);
+        self.ui.preferences_button.connect_clicked(move |_| {
+            if let Some(controller) = weak.upgrade() {
+                controller.present_alert_preferences();
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.ui.telemetry.cwd_button.connect_clicked(move |_| {
+            if let Some(controller) = weak.upgrade() {
+                controller.present_workspace_picker();
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.ui.window.connect_is_active_notify(move |window| {
+            if window.is_active()
+                && let Some(controller) = weak.upgrade()
+            {
+                controller.alerts.withdraw();
+            }
+        });
 
         let sidebar_root = self.ui.sidebar_root.clone();
         let show_sidebar = self.ui.show_sidebar_button.clone();
@@ -278,10 +330,11 @@ impl AppController {
 
         let weak = Rc::downgrade(self);
         self.ui.window.connect_close_request(move |_| {
-            if let Some(controller) = weak.upgrade()
-                && let Some(bridge) = controller.bridge.borrow().as_ref()
-            {
-                bridge.shutdown();
+            if let Some(controller) = weak.upgrade() {
+                controller.alerts.play(SoundEvent::SessionEnd);
+                if let Some(bridge) = controller.bridge.borrow().as_ref() {
+                    bridge.shutdown();
+                }
             }
             glib::Propagation::Proceed
         });
@@ -299,6 +352,9 @@ impl AppController {
     fn handle_event(self: &Rc<Self>, event: RpcEvent) {
         match event {
             RpcEvent::Ready => {
+                if !self.session_sound_started.replace(true) {
+                    self.alerts.play(SoundEvent::SessionStart);
+                }
                 if let Some(client) = &self.client
                     && let Err(error) = client.initialize()
                 {
@@ -316,17 +372,33 @@ impl AppController {
             RpcEvent::MessageEnd(message) => self.message_ended(&message),
             RpcEvent::AgentStart => {
                 self.running.set(true);
+                self.goal_completed_this_run.set(false);
+                self.goal_completion_calls.borrow_mut().clear();
+                self.last_task_progress.set(Some(Instant::now()));
+                self.alerts.play(SoundEvent::TaskAcknowledge);
+                self.set_window_status(WindowStatus::Working);
                 self.ui.chat_status.activity("Thinking");
                 self.update_activity_counts();
                 self.update_send_state();
             }
             RpcEvent::AgentEnd => {
-                self.running.set(false);
+                let was_running = self.running.replace(false);
+                self.last_task_progress.set(None);
                 if let Some(thinking) = self.streaming_thinking.borrow_mut().take() {
                     thinking.finish(None);
                 }
                 self.streaming_message.borrow_mut().take();
                 self.ui.chat_status.idle();
+                let goal_completed = self.goal_completed_this_run.get();
+                self.set_window_status(if goal_completed {
+                    WindowStatus::GoalComplete
+                } else {
+                    WindowStatus::Ready
+                });
+                if let Some(alert) = alerts::alert_for_agent_end(was_running, goal_completed) {
+                    self.alerts.play(SoundEvent::TaskComplete);
+                    self.send_alert(alert);
+                }
                 self.update_activity_counts();
                 self.update_send_state();
                 if let Some(client) = &self.client {
@@ -385,6 +457,7 @@ impl AppController {
             RpcEvent::Disconnected(message) => {
                 self.ready.set(false);
                 self.running.set(false);
+                self.set_window_status(WindowStatus::Disconnected);
                 self.ui.chat_status.disconnected();
                 self.ui.composer.set_input_sensitive(false);
                 self.update_send_state();
@@ -504,6 +577,10 @@ impl AppController {
         self.current_session_title
             .replace("New conversation".to_owned());
         self.session_cost.set(0.0);
+        self.goal_completed_this_run.set(false);
+        self.goal_completion_calls.borrow_mut().clear();
+        self.alerts.play(SoundEvent::SessionStart);
+        self.set_window_status(WindowStatus::Ready);
         self.clear_messages();
         self.clear_subagents();
         self.set_session_title("New conversation");
@@ -586,8 +663,12 @@ impl AppController {
             } else {
                 "Working"
             });
+            self.set_window_status(WindowStatus::Working);
         } else {
             self.ui.chat_status.idle();
+            if self.window_status.get() != WindowStatus::GoalComplete {
+                self.set_window_status(WindowStatus::Ready);
+            }
         }
         self.refresh_session_sidebar();
         self.update_activity_counts();
@@ -604,6 +685,7 @@ impl AppController {
         if self.active_subagent.borrow().is_none() {
             self.ui.title.set_text(title);
         }
+        self.refresh_window_title();
     }
 
     fn refresh_titles_from_disk(self: &Rc<Self>) {
@@ -705,6 +787,54 @@ impl AppController {
         self.update_activity_counts();
     }
 
+    fn present_workspace_picker(self: &Rc<Self>) {
+        if !self.ready.get() || self.running.get() {
+            return;
+        }
+
+        let current_workspace = session_catalog::session_entry(
+            self.current_session_file.borrow().as_deref(),
+            &self.current_session_title.borrow(),
+            true,
+        )
+        .cwd
+        .or_else(|| std::env::current_dir().ok());
+        let dialog = gtk::FileDialog::builder()
+            .title("Select workspace")
+            .modal(true)
+            .build();
+        if let Some(path) = current_workspace.as_deref() {
+            dialog.set_initial_folder(Some(&gio::File::for_path(path)));
+        }
+
+        let weak = Rc::downgrade(self);
+        dialog.select_folder(
+            Some(&self.ui.window),
+            None::<&gio::Cancellable>,
+            move |result| {
+                let Ok(folder) = result else {
+                    return;
+                };
+                let Some(controller) = weak.upgrade() else {
+                    return;
+                };
+                let Some(path) = folder.path() else {
+                    controller.show_error("Only local workspace directories are supported");
+                    return;
+                };
+                if current_workspace.as_deref() == Some(path.as_path()) {
+                    return;
+                }
+                let Some(client) = &controller.client else {
+                    return;
+                };
+                if let Err(error) = client.move_session(&path) {
+                    controller.show_error(&error.to_string());
+                }
+            },
+        );
+    }
+
     fn present_history(self: &Rc<Self>) {
         let sessions =
             session_catalog::discover_all_sessions(self.current_session_file.borrow().as_deref());
@@ -756,6 +886,9 @@ impl AppController {
     }
 
     fn close_session(self: &Rc<Self>, entry: &SessionEntry) {
+        if entry.current {
+            self.alerts.play(SoundEvent::SessionEnd);
+        }
         self.active_sessions
             .borrow_mut()
             .retain(|active| active.path != entry.path);
@@ -869,17 +1002,31 @@ impl AppController {
     }
 
     fn present_model_picker(self: &Rc<Self>) {
+        if self.ui.composer.model_picker_visible() {
+            self.ui.composer.close_model_picker();
+            return;
+        }
         let models = self.models.borrow().clone();
         if models.is_empty() {
             return;
         }
         let selected = self.current_model.borrow().clone();
         let weak = Rc::downgrade(self);
-        model_picker::present(&self.ui.window, models, selected, move |model| {
-            if let Some(controller) = weak.upgrade() {
-                controller.choose_model(model);
-            }
-        });
+        let composer_for_select = self.ui.composer.clone();
+        let composer_for_close = self.ui.composer.clone();
+        let view = model_picker::ModelPickerView::new(
+            models,
+            selected,
+            move |model| {
+                composer_for_select.close_model_picker();
+                if let Some(controller) = weak.upgrade() {
+                    controller.choose_model(model);
+                }
+            },
+            move || composer_for_close.close_model_picker(),
+        );
+        self.ui.composer.show_model_picker(view.widget());
+        view.focus_search();
     }
 
     fn choose_model(&self, model: ModelSummary) {
@@ -984,7 +1131,7 @@ impl AppController {
         else {
             return;
         };
-        self.ui.composer.set_thinking_label(&title_case(level));
+        self.ui.composer.set_thinking_label(level);
         for (button_index, button) in self.thinking_buttons.borrow().iter().enumerate() {
             if button_index == index {
                 button.add_css_class("thinking-option-selected");
@@ -1089,12 +1236,12 @@ impl AppController {
                 let text = message_text(message);
                 self.streaming_message.borrow_mut().take();
                 if !text.is_empty() {
-                    let label = self
+                    let body = self
                         .ui
                         .conversation
                         .append_message(MessageRole::Assistant, &text);
                     self.streaming_message
-                        .replace(Some(StreamingMessage { label, text }));
+                        .replace(Some(StreamingMessage { body, text }));
                     self.scroll_to_bottom();
                 }
             }
@@ -1109,18 +1256,18 @@ impl AppController {
         self.remove_empty_state();
         let mut slot = self.streaming_message.borrow_mut();
         if slot.is_none() {
-            let label = self
+            let body = self
                 .ui
                 .conversation
                 .append_message(MessageRole::Assistant, "");
             *slot = Some(StreamingMessage {
-                label,
+                body,
                 text: String::new(),
             });
         }
         let streaming = slot.as_mut().expect("streaming message exists");
         streaming.text.push_str(delta);
-        streaming.label.set_text(&streaming.text);
+        streaming.body.set_text(&streaming.text);
         drop(slot);
         self.scroll_to_bottom();
     }
@@ -1155,7 +1302,7 @@ impl AppController {
                 if let Some(mut streaming) = self.streaming_message.borrow_mut().take() {
                     if !final_text.is_empty() && final_text != streaming.text {
                         streaming.text = final_text;
-                        streaming.label.set_text(&streaming.text);
+                        streaming.body.set_text(&streaming.text);
                     }
                 } else if !final_text.is_empty() {
                     self.ui
@@ -1191,6 +1338,11 @@ impl AppController {
     }
 
     fn tool_started(&self, tool: ToolStart) {
+        if alerts::is_goal_completion(&tool.name, &tool.args) {
+            self.goal_completion_calls
+                .borrow_mut()
+                .insert(tool.id.clone());
+        }
         let card = self.ensure_tool_card(&tool);
         card.status.set_text("Running");
         card.spinner.set_visible(true);
@@ -1225,6 +1377,18 @@ impl AppController {
             })
         });
         card.complete(&tool.result, tool.is_error);
+        if tool.is_error {
+            self.alerts
+                .play(alerts::sound_event_for_error(&tool.result.to_string()));
+        }
+        let completed_goal =
+            self.goal_completion_calls.borrow_mut().remove(&tool.id) && !tool.is_error;
+        if completed_goal {
+            self.goal_completed_this_run.set(true);
+            self.set_window_status(WindowStatus::GoalComplete);
+            self.alerts.play(SoundEvent::TaskComplete);
+            self.send_alert(AlertKind::GoalComplete);
+        }
         if self.running.get() {
             self.ui.chat_status.activity("Working");
         }
@@ -1446,6 +1610,11 @@ impl AppController {
                     .set_tooltip_text(Some("Active subagents in this conversation"));
             }
         }
+        if active_items > 0 {
+            self.set_window_status(WindowStatus::Working);
+        } else if self.window_status.get() == WindowStatus::Working {
+            self.set_window_status(WindowStatus::Ready);
+        }
     }
 
     fn activate_primary_action(&self) {
@@ -1467,11 +1636,14 @@ impl AppController {
         };
         match client.new_session() {
             Ok(()) => {
+                self.goal_completed_this_run.set(false);
+                self.goal_completion_calls.borrow_mut().clear();
                 self.ui.chat_status.activity("Starting conversation");
                 self.clear_messages();
                 self.clear_subagents();
                 self.current_session_file.borrow_mut().take();
                 self.set_session_title("New conversation");
+                self.set_window_status(WindowStatus::Working);
                 self.ui
                     .conversation
                     .append_notice("Starting a new conversation…", false);
@@ -1493,6 +1665,10 @@ impl AppController {
         };
         match client.prompt(&text) {
             Ok(()) => {
+                self.goal_completed_this_run.set(false);
+                self.goal_completion_calls.borrow_mut().clear();
+                self.record_prompt_sound();
+                self.set_window_status(WindowStatus::Working);
                 self.remove_empty_state();
                 self.ui
                     .conversation
@@ -1507,9 +1683,13 @@ impl AppController {
     }
 
     fn update_send_state(&self) {
+        let ready = self.ready.get();
+        let running = self.running.get();
+        self.ui.composer.set_primary_action(ready, running);
         self.ui
-            .composer
-            .set_primary_action(self.ready.get(), self.running.get());
+            .telemetry
+            .cwd_button
+            .set_sensitive(ready && !running);
     }
 
     fn update_completions(&self) {
@@ -1582,9 +1762,234 @@ impl AppController {
         self.ui.conversation.scroll_to_bottom();
     }
 
+    fn tick_sound_events(&self) {
+        if !self.running.get() {
+            return;
+        }
+        let now = Instant::now();
+        if self
+            .last_task_progress
+            .get()
+            .is_some_and(|last| now.duration_since(last) >= TASK_PROGRESS_INTERVAL)
+        {
+            self.last_task_progress.set(Some(now));
+            self.alerts.play(SoundEvent::TaskProgress);
+        }
+    }
+
+    fn record_prompt_sound(&self) {
+        let now = Instant::now();
+        let mut prompts = self.recent_prompts.borrow_mut();
+        while prompts
+            .front()
+            .is_some_and(|sent| now.duration_since(*sent) > PROMPT_BURST_WINDOW)
+        {
+            prompts.pop_front();
+        }
+        prompts.push_back(now);
+        if prompts.len() >= PROMPT_BURST_THRESHOLD {
+            prompts.clear();
+            self.alerts.play(SoundEvent::UserSpam);
+        }
+    }
+
     fn show_error(&self, message: &str) {
+        self.alerts.play(alerts::sound_event_for_error(message));
         self.ui.conversation.append_notice(message, true);
         self.scroll_to_bottom();
+    }
+    fn set_window_status(&self, status: WindowStatus) {
+        self.window_status.set(status);
+        self.refresh_window_title();
+    }
+
+    fn refresh_window_title(&self) {
+        let title = alerts::window_title(
+            self.window_status.get(),
+            &self.current_session_title.borrow(),
+        );
+        self.ui.window.set_title(Some(&title));
+    }
+
+    fn send_alert(&self, kind: AlertKind) {
+        self.alerts.notify(
+            kind,
+            &self.current_session_title.borrow(),
+            !self.ui.window.is_active(),
+        );
+    }
+
+    fn present_alert_preferences(self: &Rc<Self>) {
+        let preferences = self.alerts.preferences();
+        let settings = sound_settings::SoundSettingsDialog::new(
+            &preferences,
+            &self.sound_pack_choices(),
+            self.alerts.installed_pack_count(),
+        );
+
+        let weak = Rc::downgrade(self);
+        settings
+            .desktop_notifications
+            .connect_active_notify(move |row| {
+                if let Some(controller) = weak.upgrade()
+                    && let Err(error) = controller.alerts.set_desktop_notifications(row.is_active())
+                {
+                    controller.show_error(&error);
+                }
+            });
+
+        let weak = Rc::downgrade(self);
+        let settings_for_toggle = settings.clone();
+        settings.sounds.connect_active_notify(move |row| {
+            settings_for_toggle.set_sounds_enabled(row.is_active());
+            if let Some(controller) = weak.upgrade()
+                && let Err(error) = controller.alerts.set_sounds(row.is_active())
+            {
+                controller.show_error(&error);
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        settings.volume.connect_value_changed(move |scale| {
+            if let Some(controller) = weak.upgrade()
+                && let Err(error) = controller.alerts.set_volume(scale.value() / 100.0)
+            {
+                controller.show_error(&error);
+            }
+        });
+
+        for event_row in settings.event_rows.iter() {
+            let weak = Rc::downgrade(self);
+            event_row.connect_changed(move |event, pack_id| {
+                if let Some(controller) = weak.upgrade()
+                    && let Err(error) = controller.alerts.set_event_pack(event, pack_id.as_deref())
+                {
+                    controller.show_error(&error);
+                }
+            });
+            let weak = Rc::downgrade(self);
+            event_row.connect_preview(move |event, pack_id| {
+                if let Some(controller) = weak.upgrade() {
+                    controller.alerts.preview(event, &pack_id);
+                }
+            });
+        }
+
+        let weak = Rc::downgrade(self);
+        let settings_for_browser = settings.clone();
+        settings.browse_packs.connect_clicked(move |_| {
+            if let Some(controller) = weak.upgrade() {
+                controller.present_sound_pack_browser(&settings_for_browser);
+            }
+        });
+        settings.present(&self.ui.window);
+    }
+
+    fn sound_pack_choices(&self) -> HashMap<SoundEvent, Vec<SoundPackChoice>> {
+        SoundEvent::ALL
+            .into_iter()
+            .map(|event| (event, self.alerts.sound_pack_choices(event)))
+            .collect()
+    }
+
+    fn present_sound_pack_browser(self: &Rc<Self>, settings: &sound_settings::SoundSettingsDialog) {
+        let browser = sound_settings::PackBrowserDialog::new();
+        let weak = Rc::downgrade(self);
+        let browser_for_retry = browser.clone();
+        let settings_for_retry = settings.clone();
+        browser.connect_retry(move || {
+            if let Some(controller) = weak.upgrade() {
+                controller.load_sound_pack_registry(
+                    settings_for_retry.clone(),
+                    browser_for_retry.clone(),
+                );
+            }
+        });
+        browser.present(&self.ui.window);
+        self.load_sound_pack_registry(settings.clone(), browser);
+    }
+
+    fn load_sound_pack_registry(
+        self: &Rc<Self>,
+        settings: sound_settings::SoundSettingsDialog,
+        browser: sound_settings::PackBrowserDialog,
+    ) {
+        browser.show_loading();
+        let (sender, receiver) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = sender.send_blocking(sound_registry::fetch_registry());
+        });
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let Ok(result) = receiver.recv().await else {
+                browser.show_error("The sound pack catalog stopped responding.");
+                return;
+            };
+            let packs = match result {
+                Ok(packs) => packs,
+                Err(error) => {
+                    browser.show_error(&error);
+                    return;
+                }
+            };
+            let Some(controller) = weak.upgrade() else {
+                return;
+            };
+            let installed = controller.alerts.installed_pack_names();
+            let weak = Rc::downgrade(&controller);
+            let settings_for_install = settings.clone();
+            let browser_for_install = browser.clone();
+            browser.set_packs(&packs, &installed, move |pack, button| {
+                if let Some(controller) = weak.upgrade() {
+                    controller.install_sound_pack(
+                        pack,
+                        button,
+                        settings_for_install.clone(),
+                        browser_for_install.clone(),
+                    );
+                }
+            });
+        });
+    }
+
+    fn install_sound_pack(
+        self: &Rc<Self>,
+        pack: RegistryPack,
+        button: gtk::Button,
+        settings: sound_settings::SoundSettingsDialog,
+        browser: sound_settings::PackBrowserDialog,
+    ) {
+        sound_settings::PackBrowserDialog::set_installing(&button);
+        let installed_name = pack.display_name.clone();
+        let (sender, receiver) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = sender.send_blocking(sound_registry::install_pack(&pack));
+        });
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let result = match receiver.recv().await {
+                Ok(result) => result,
+                Err(_) => Err("The sound pack installation stopped unexpectedly.".to_owned()),
+            };
+            let Some(controller) = weak.upgrade() else {
+                return;
+            };
+            match result {
+                Ok(_) => {
+                    controller.alerts.refresh_sound_packs();
+                    sound_settings::PackBrowserDialog::set_installed(&button);
+                    settings.refresh_packs(
+                        &controller.alerts.preferences(),
+                        &controller.sound_pack_choices(),
+                        controller.alerts.installed_pack_count(),
+                    );
+                    browser
+                        .dialog
+                        .add_toast(adw::Toast::new(&format!("Installed {installed_name}")));
+                }
+                Err(error) => browser.set_install_error(&button, &error),
+            }
+        });
     }
 
     fn handle_extension_ui(self: &Rc<Self>, request: Value) {
@@ -1599,6 +2004,9 @@ impl AppController {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 let is_error = request.get("notifyType").and_then(Value::as_str) == Some("error");
+                if is_error {
+                    self.alerts.play(alerts::sound_event_for_error(message));
+                }
                 self.ui.conversation.append_notice(message, is_error);
             }
             "setTitle" => {
@@ -1633,6 +2041,7 @@ impl AppController {
                 }
             }
             "confirm" | "select" | "input" | "editor" => {
+                self.alerts.play(SoundEvent::InputRequired);
                 self.present_extension_dialog(request);
             }
             _ => {}

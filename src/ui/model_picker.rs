@@ -1,9 +1,8 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use adw::prelude::*;
+use gtk::prelude::*;
 use gtk4 as gtk;
-use libadwaita as adw;
 
 use super::icons;
 use crate::bridge::protocol::ModelSummary;
@@ -44,55 +43,45 @@ impl ModelPickerView {
         on_close: impl Fn() + 'static,
     ) -> Self {
         models.sort_by(|left, right| {
-            icons::provider_label(&left.provider)
-                .cmp(&icons::provider_label(&right.provider))
+            provider_name(left)
+                .cmp(&provider_name(right))
                 .then_with(|| left.display_name().cmp(right.display_name()))
         });
 
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        root.set_size_request(720, 600);
+        root.set_accessible_role(gtk::AccessibleRole::Dialog);
+        root.update_property(&[gtk::accessible::Property::Label("Choose a model")]);
         root.add_css_class("model-picker");
 
-        let header = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         header.add_css_class("model-picker-header");
+        let heading_copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        heading_copy.set_hexpand(true);
         let heading = gtk::Label::new(Some("Choose a model"));
         heading.set_xalign(0.0);
-        heading.set_hexpand(true);
         heading.add_css_class("model-picker-heading");
+        let subtitle = gtk::Label::new(Some("Pick the model that best fits your task."));
+        subtitle.set_xalign(0.0);
+        subtitle.add_css_class("model-picker-subtitle");
+        heading_copy.append(&heading);
+        heading_copy.append(&subtitle);
         let close = icons::icon_button(icons::Icon::X, "Close model picker");
         close.add_css_class("model-picker-close");
-        header.append(&heading);
+        header.append(&heading_copy);
         header.append(&close);
         root.append(&header);
 
         let search = gtk::SearchEntry::new();
         search.update_property(&[gtk::accessible::Property::Label("Search models")]);
-        search.set_placeholder_text(Some("Search models and providers"));
+        search.set_placeholder_text(Some("Search by model or provider"));
         search.add_css_class("model-picker-search");
         root.append(&search);
-
-        let filters_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        filters_box.add_css_class("model-picker-filters");
-        let provider_heading = filter_heading("Provider");
-        filters_box.append(&provider_heading);
-        let provider_flow = gtk::FlowBox::new();
-        provider_flow.set_selection_mode(gtk::SelectionMode::None);
-        provider_flow.set_row_spacing(6);
-        provider_flow.set_column_spacing(6);
-        provider_flow.set_max_children_per_line(8);
-        filters_box.append(&provider_flow);
-
-        let context_heading = filter_heading("Context size");
-        filters_box.append(&context_heading);
-        let context_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        filters_box.append(&context_box);
-        root.append(&filters_box);
 
         let list = gtk::ListBox::new();
         list.set_selection_mode(gtk::SelectionMode::None);
         list.add_css_class("model-picker-list");
-        let empty = gtk::Label::new(Some("No models match these filters."));
-        empty.add_css_class("model-picker-empty");
-        list.set_placeholder(Some(&empty));
+        list.set_placeholder(Some(&empty_state()));
 
         let rows = models
             .into_iter()
@@ -108,6 +97,50 @@ impl ModelPickerView {
         let rows = Rc::new(rows);
         let filters = Rc::new(RefCell::new(Filters::default()));
 
+        let mut providers = rows
+            .iter()
+            .map(|entry| provider_name(&entry.model))
+            .collect::<Vec<_>>();
+        providers.sort();
+        providers.dedup();
+        let providers = Rc::new(providers);
+        let mut provider_choices = vec!["All providers".to_owned()];
+        provider_choices.extend(providers.iter().cloned());
+        let provider_refs = provider_choices
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let provider_filter = gtk::DropDown::from_strings(&provider_refs);
+        provider_filter.set_enable_search(true);
+        provider_filter.update_property(&[gtk::accessible::Property::Label("Filter by provider")]);
+        provider_filter.add_css_class("model-filter-dropdown");
+
+        let context_filter = gtk::DropDown::from_strings(&[
+            "Any context",
+            "Up to 128K",
+            "128K–256K",
+            "More than 256K",
+        ]);
+        context_filter
+            .update_property(&[gtk::accessible::Property::Label("Filter by context size")]);
+        context_filter.add_css_class("model-filter-dropdown");
+
+        let result_count = gtk::Label::new(None);
+        result_count.set_xalign(1.0);
+        result_count.set_hexpand(true);
+        result_count.add_css_class("model-picker-result-count");
+        let clear = gtk::Button::with_label("Clear filters");
+        clear.add_css_class("model-picker-clear");
+        clear.set_visible(false);
+
+        let filters_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        filters_bar.add_css_class("model-picker-filters");
+        filters_bar.append(&provider_filter);
+        filters_bar.append(&context_filter);
+        filters_bar.append(&result_count);
+        filters_bar.append(&clear);
+        root.append(&filters_bar);
+
         let scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
@@ -120,53 +153,74 @@ impl ModelPickerView {
 
         let rows_for_search = rows.clone();
         let filters_for_search = filters.clone();
+        let count_for_search = result_count.clone();
+        let clear_for_search = clear.clone();
         search.connect_search_changed(move |entry| {
             filters_for_search.borrow_mut().query = entry.text().trim().to_ascii_lowercase();
-            apply_filters(&rows_for_search, &filters_for_search.borrow());
+            update_results(
+                &rows_for_search,
+                &filters_for_search.borrow(),
+                &count_for_search,
+                &clear_for_search,
+            );
         });
 
-        let mut providers = rows
-            .iter()
-            .map(|entry| icons::provider_label(&entry.model.provider))
-            .collect::<Vec<_>>();
-        providers.sort();
-        providers.dedup();
-        let all_providers = filter_button("All providers");
-        all_providers.set_active(true);
-        provider_flow.insert(&all_providers, -1);
-        wire_provider_filter(&all_providers, None, rows.clone(), filters.clone());
-        for provider in providers {
-            let button = filter_button(&provider);
-            button.set_group(Some(&all_providers));
-            provider_flow.insert(&button, -1);
-            wire_provider_filter(&button, Some(provider), rows.clone(), filters.clone());
-        }
+        let rows_for_provider = rows.clone();
+        let filters_for_provider = filters.clone();
+        let providers_for_filter = providers.clone();
+        let count_for_provider = result_count.clone();
+        let clear_for_provider = clear.clone();
+        provider_filter.connect_selected_notify(move |dropdown| {
+            filters_for_provider.borrow_mut().provider = dropdown
+                .selected()
+                .checked_sub(1)
+                .and_then(|index| providers_for_filter.get(index as usize).cloned());
+            update_results(
+                &rows_for_provider,
+                &filters_for_provider.borrow(),
+                &count_for_provider,
+                &clear_for_provider,
+            );
+        });
 
-        let context_filters = [
-            ("Any size", ContextBand::Any),
-            ("≤ 128K", ContextBand::UpTo128k),
-            ("129–256K", ContextBand::UpTo256k),
-            ("257K+", ContextBand::Above256k),
-        ];
-        let mut context_group = None;
-        for (label, band) in context_filters {
-            let button = filter_button(label);
-            if let Some(group) = context_group.as_ref() {
-                button.set_group(Some(group));
-            } else {
-                button.set_active(true);
-                context_group = Some(button.clone());
-            }
-            let rows = rows.clone();
-            let filters = filters.clone();
-            button.connect_toggled(move |button| {
-                if button.is_active() {
-                    filters.borrow_mut().context = band;
-                    apply_filters(&rows, &filters.borrow());
-                }
-            });
-            context_box.append(&button);
-        }
+        let rows_for_context = rows.clone();
+        let filters_for_context = filters.clone();
+        let count_for_context = result_count.clone();
+        let clear_for_context = clear.clone();
+        context_filter.connect_selected_notify(move |dropdown| {
+            filters_for_context.borrow_mut().context = match dropdown.selected() {
+                1 => ContextBand::UpTo128k,
+                2 => ContextBand::UpTo256k,
+                3 => ContextBand::Above256k,
+                _ => ContextBand::Any,
+            };
+            update_results(
+                &rows_for_context,
+                &filters_for_context.borrow(),
+                &count_for_context,
+                &clear_for_context,
+            );
+        });
+
+        let search_for_clear = search.clone();
+        let provider_for_clear = provider_filter.clone();
+        let context_for_clear = context_filter.clone();
+        let rows_for_clear = rows.clone();
+        let filters_for_clear = filters.clone();
+        let count_for_clear = result_count.clone();
+        let clear_for_clear = clear.clone();
+        clear.connect_clicked(move |_| {
+            filters_for_clear.replace(Filters::default());
+            search_for_clear.set_text("");
+            provider_for_clear.set_selected(0);
+            context_for_clear.set_selected(0);
+            update_results(
+                &rows_for_clear,
+                &filters_for_clear.borrow(),
+                &count_for_clear,
+                &clear_for_clear,
+            );
+        });
 
         let on_select = Rc::new(on_select);
         for entry in rows.iter() {
@@ -176,7 +230,17 @@ impl ModelPickerView {
                 .button
                 .connect_clicked(move |_| on_select(model.clone()));
         }
+        let rows_for_activate = rows.clone();
+        search.connect_activate(move |_| {
+            if let Some(entry) = rows_for_activate
+                .iter()
+                .find(|entry| entry.row.is_visible())
+            {
+                entry.button.emit_clicked();
+            }
+        });
 
+        update_results(&rows, &filters.borrow(), &result_count, &clear);
         Self { root, search }
     }
 
@@ -189,61 +253,53 @@ impl ModelPickerView {
     }
 }
 
-pub(crate) fn present(
-    parent: &gtk::ApplicationWindow,
-    models: Vec<ModelSummary>,
-    selected: Option<(String, String)>,
-    on_select: impl Fn(ModelSummary) + 'static,
-) {
-    let dialog = adw::Dialog::builder()
-        .title("Choose a model")
-        .content_width(760)
-        .content_height(660)
-        .build();
-    let weak_dialog_for_close = dialog.downgrade();
-    let weak_dialog_for_select = dialog.downgrade();
-    let view = ModelPickerView::new(
-        models,
-        selected,
-        move |model| {
-            on_select(model);
-            if let Some(dialog) = weak_dialog_for_select.upgrade() {
-                dialog.close();
-            }
-        },
-        move || {
-            if let Some(dialog) = weak_dialog_for_close.upgrade() {
-                dialog.close();
-            }
-        },
-    );
-    dialog.set_child(Some(view.widget()));
-    dialog.present(Some(parent));
-    view.focus_search();
+fn provider_name(model: &ModelSummary) -> String {
+    icons::provider_label(&model.provider)
 }
 
-fn wire_provider_filter(
-    button: &gtk::ToggleButton,
-    provider: Option<String>,
-    rows: Rc<Vec<PickerRow>>,
-    filters: Rc<RefCell<Filters>>,
-) {
-    button.connect_toggled(move |button| {
-        if button.is_active() {
-            filters.borrow_mut().provider = provider.clone();
-            apply_filters(&rows, &filters.borrow());
-        }
-    });
+fn empty_state() -> gtk::Widget {
+    let empty = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    empty.set_halign(gtk::Align::Center);
+    empty.set_valign(gtk::Align::Center);
+    empty.add_css_class("model-picker-empty");
+    let icon = icons::icon(icons::Icon::SearchX, 24);
+    icon.add_css_class("model-picker-empty-icon");
+    let title = gtk::Label::new(Some("No models found"));
+    title.add_css_class("model-picker-empty-title");
+    let detail = gtk::Label::new(Some("Try a different search or clear the filters."));
+    detail.add_css_class("model-picker-empty-detail");
+    empty.append(&icon);
+    empty.append(&title);
+    empty.append(&detail);
+    empty.upcast()
 }
 
-fn apply_filters(rows: &[PickerRow], filters: &Filters) {
+fn update_results(
+    rows: &[PickerRow],
+    filters: &Filters,
+    result_count: &gtk::Label,
+    clear: &gtk::Button,
+) {
+    let mut visible = 0;
     for entry in rows {
-        entry.row.set_visible(model_matches(&entry.model, filters));
+        let matches = model_matches(&entry.model, filters);
+        entry.row.set_visible(matches);
+        visible += usize::from(matches);
     }
+    result_count.set_text(&if visible == 1 {
+        "1 model".to_owned()
+    } else {
+        format!("{visible} models")
+    });
+    clear.set_visible(
+        !filters.query.is_empty()
+            || filters.provider.is_some()
+            || filters.context != ContextBand::Any,
+    );
 }
 
 fn model_matches(model: &ModelSummary, filters: &Filters) -> bool {
-    let provider = icons::provider_label(&model.provider);
+    let provider = provider_name(model);
     if filters
         .provider
         .as_ref()
@@ -303,18 +359,19 @@ fn model_row(model: &ModelSummary, selected: bool) -> (gtk::ListBoxRow, gtk::But
     name.set_xalign(0.0);
     name.set_ellipsize(gtk::pango::EllipsizeMode::End);
     name.add_css_class("model-picker-name");
-    let provider = icons::provider_label(&model.provider);
-    let output_limit = model
-        .max_tokens
-        .map(|tokens| format!(" · {} max output", format_tokens(tokens)))
-        .unwrap_or_default();
-    let detail = gtk::Label::new(Some(&format!(
-        "{} · {} · {}{}",
-        provider,
-        model.id,
-        context_label(model.context_window),
-        output_limit
-    )));
+    let provider = provider_name(model);
+    let mut details = vec![provider.clone()];
+    if let Some(context) = context_label(model.context_window) {
+        details.push(context);
+    }
+    if model
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| !thinking.efforts.is_empty())
+    {
+        details.push("Reasoning".to_owned());
+    }
+    let detail = gtk::Label::new(Some(&details.join(" · ")));
     detail.set_xalign(0.0);
     detail.set_ellipsize(gtk::pango::EllipsizeMode::End);
     detail.add_css_class("model-picker-detail");
@@ -341,11 +398,8 @@ fn model_row(model: &ModelSummary, selected: bool) -> (gtk::ListBoxRow, gtk::But
     (row, button)
 }
 
-fn context_label(window: Option<u64>) -> String {
-    window.map_or_else(
-        || "Context size unknown".to_owned(),
-        |window| format!("{} context", format_tokens(window)),
-    )
+fn context_label(window: Option<u64>) -> Option<String> {
+    window.map(|window| format!("{} context", format_tokens(window)))
 }
 
 fn format_tokens(tokens: u64) -> String {
@@ -363,19 +417,6 @@ fn format_tokens(tokens: u64) -> String {
     }
 }
 
-fn filter_heading(text: &str) -> gtk::Label {
-    let label = gtk::Label::new(Some(text));
-    label.set_xalign(0.0);
-    label.add_css_class("model-picker-filter-heading");
-    label
-}
-
-fn filter_button(text: &str) -> gtk::ToggleButton {
-    let button = gtk::ToggleButton::with_label(text);
-    button.add_css_class("model-filter-chip");
-    button
-}
-
 #[cfg(test)]
 mod tests {
     use super::{ContextBand, Filters, context_matches, model_matches};
@@ -388,7 +429,6 @@ mod tests {
             name: Some(name.to_owned()),
             thinking: None,
             context_window: Some(context_window),
-            max_tokens: None,
         }
     }
 

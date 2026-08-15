@@ -3,4 +3,8 @@
   <gresource prefix="/dev/omp/Native/icons/scalable/apps">
     <file alias="dev.omp.Native.svg">omp.svg</file>
   </gresource>
+  <!-- CC0 confirmation sound by Kenney, sourced from soundcn. -->
+  <gresource prefix="/dev/omp/Native/sounds">
+    <file>confirmation-001.ogg</file>
+  </gresource>
 </gresources>

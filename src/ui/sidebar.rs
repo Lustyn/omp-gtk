@@ -18,6 +18,7 @@ pub struct SidebarWidgets {
     pub new_chat: gtk::Button,
     pub history: gtk::Button,
     pub collapse: gtk::Button,
+    pub preferences: gtk::Button,
     pub active_count: gtk::Label,
 }
 
@@ -97,10 +98,18 @@ pub fn build() -> SidebarWidgets {
         .vexpand(true)
         .child(&list)
         .build();
+    let preferences = icons::labeled_button(icons::Icon::Settings, "Settings");
+    preferences.set_margin_top(8);
+    preferences.set_margin_bottom(12);
+    preferences.set_margin_start(12);
+    preferences.set_margin_end(12);
+    preferences.set_tooltip_text(Some("Configure notifications and sound packs"));
+    preferences.add_css_class("sidebar-preferences");
     sidebar.append(&brand_handle);
     sidebar.append(&new_chat);
     sidebar.append(&section_row);
     sidebar.append(&session_scroll);
+    sidebar.append(&preferences);
 
     SidebarWidgets {
         root: sidebar,
@@ -108,6 +117,7 @@ pub fn build() -> SidebarWidgets {
         new_chat,
         history,
         collapse,
+        preferences,
         active_count,
     }
 }

@@ -1,7 +1,9 @@
+mod alerts;
 mod app;
 mod bridge;
 mod commands;
 mod session_catalog;
+mod sound_registry;
 pub mod ui;
 
 use gtk::glib;
