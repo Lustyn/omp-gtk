@@ -15,6 +15,7 @@ use async_channel::{Receiver, Sender};
 use serde_json::{Map, Value, json};
 
 use self::protocol::{RpcEvent, RpcFrameDecoder, decode_event};
+use crate::commands::unsupported_native_mode_error;
 
 #[derive(Clone)]
 pub struct BridgeClient {
@@ -35,6 +36,9 @@ impl BridgeClient {
     }
 
     pub fn prompt(&self, message: &str) -> Result<(), BridgeError> {
+        if let Some(error) = unsupported_native_mode_error(message) {
+            return Err(BridgeError(error));
+        }
         self.request("prompt", json!({ "message": message }))?;
         Ok(())
     }
@@ -399,6 +403,7 @@ impl std::error::Error for BridgeError {}
 #[cfg(test)]
 mod tests {
     use super::{BridgeClient, WriterMessage, resolve_omp_executable};
+    use crate::commands::unsupported_native_mode_error;
     use serde_json::Value;
     use std::ffi::OsStr;
     use std::fs;
@@ -478,5 +483,32 @@ mod tests {
         let frame = serde_json::from_str::<Value>(&frame).expect("decode move request");
         assert_eq!(frame["type"], "prompt");
         assert_eq!(frame["message"], "/move /tmp/project with spaces");
+    }
+
+    #[test]
+    fn terminal_only_mode_commands_never_reach_rpc() {
+        for message in [
+            "/vibe",
+            "/goal set ship it",
+            "/guided-goal rough objective",
+            "/loop 5 prompt",
+        ] {
+            let (writer, receiver) = mpsc::channel();
+            let client = BridgeClient {
+                writer,
+                next_request_id: Arc::new(AtomicU64::new(1)),
+            };
+
+            let error = client.prompt(message).expect_err("reject mode command");
+
+            assert_eq!(
+                error.to_string(),
+                unsupported_native_mode_error(message).expect("mode command error")
+            );
+            assert!(
+                matches!(receiver.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "{message} reached RPC"
+            );
+        }
     }
 }
