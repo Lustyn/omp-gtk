@@ -1,7 +1,9 @@
 pub mod protocol;
 
+use std::ffi::{OsStr, OsString};
 use std::io::{self, BufRead, BufReader, Write};
-use std::path::Path;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -138,9 +140,49 @@ pub struct OmpBridge {
     stopped: Arc<AtomicBool>,
 }
 
+fn resolve_omp_executable(
+    override_bin: Option<&OsStr>,
+    search_path: Option<&OsStr>,
+    home_dir: Option<&OsStr>,
+) -> PathBuf {
+    if let Some(override_bin) = override_bin {
+        return override_bin.into();
+    }
+
+    if let Some(search_path) = search_path {
+        for directory in std::env::split_paths(search_path) {
+            let candidate = directory.join("omp");
+            if is_executable(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    if let Some(home_dir) = home_dir {
+        let candidate = Path::new(home_dir).join(".local/bin/omp");
+        if is_executable(&candidate) {
+            return candidate;
+        }
+    }
+
+    "omp".into()
+}
+
+fn is_executable(path: &Path) -> bool {
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
 impl OmpBridge {
     pub fn spawn() -> io::Result<Self> {
-        let executable = std::env::var_os("OMP_BIN").unwrap_or_else(|| "omp".into());
+        let override_bin: Option<OsString> = std::env::var_os("OMP_BIN");
+        let search_path = std::env::var_os("PATH");
+        let home_dir = std::env::var_os("HOME");
+        let executable = resolve_omp_executable(
+            override_bin.as_deref(),
+            search_path.as_deref(),
+            home_dir.as_deref(),
+        );
         let mut child = Command::new(executable)
             .args(["--mode", "rpc-ui"])
             .stdin(Stdio::piped())
@@ -341,3 +383,65 @@ impl std::fmt::Display for BridgeError {
 }
 
 impl std::error::Error for BridgeError {}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_omp_executable;
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn fixture_directory(name: &str) -> std::path::PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("omp-native-bridge-{name}-{nonce}"));
+        fs::create_dir_all(&directory).expect("create fixture directory");
+        directory
+    }
+
+    fn create_executable(path: &Path) {
+        fs::create_dir_all(path.parent().expect("executable has a parent"))
+            .expect("create executable directory");
+        fs::write(path, b"").expect("create executable");
+        let mut permissions = fs::metadata(path)
+            .expect("read executable metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("make fixture executable");
+    }
+
+    #[test]
+    fn resolves_omp_from_user_local_bin_when_path_does_not_contain_it() {
+        let fixture = fixture_directory("user-local");
+        let path_directory = fixture.join("path");
+        let home = fixture.join("home");
+        fs::create_dir_all(&path_directory).expect("create PATH fixture");
+        let expected = home.join(".local/bin/omp");
+        create_executable(&expected);
+
+        let resolved = resolve_omp_executable(
+            None,
+            Some(path_directory.as_os_str()),
+            Some(home.as_os_str()),
+        );
+
+        assert_eq!(resolved, expected);
+        fs::remove_dir_all(fixture).expect("remove fixture");
+    }
+
+    #[test]
+    fn omp_bin_override_takes_precedence() {
+        let expected = OsStr::new("/opt/omp/bin/omp");
+        let resolved = resolve_omp_executable(
+            Some(expected),
+            Some(OsStr::new("/usr/bin")),
+            Some(OsStr::new("/home/user")),
+        );
+
+        assert_eq!(resolved, Path::new(expected));
+    }
+}

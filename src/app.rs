@@ -1,9 +1,4 @@
-mod chat;
-mod composer;
-mod icons;
-mod model_picker;
-mod sidebar;
-mod tool_components;
+use crate::ui::{chat, composer, model_picker, sidebar, tool_components, workspace};
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -17,12 +12,6 @@ use gtk4 as gtk;
 use libadwaita as adw;
 use serde_json::{Value, json};
 
-use self::chat::{
-    ChatStatus, MessageRole, TelemetryWidgets, ThinkingBlock, append_message, append_notice,
-    append_thinking, empty_chat_hero,
-};
-use self::sidebar::SessionRow;
-use self::tool_components::ToolCard;
 use crate::bridge::protocol::{
     ModelSummary, RpcEvent, RpcResponse, SessionState, SlashCommand, SubagentUpdate,
     SubagentUpdateKind, ToolEnd, ToolStart, ToolUpdate, message_cost, message_role, message_text,
@@ -30,11 +19,14 @@ use crate::bridge::protocol::{
 };
 use crate::bridge::{BridgeClient, OmpBridge};
 use crate::commands::{CommandCompletion, completions};
+use crate::session_catalog::{self, SessionEntry};
+use chat::{MessageRole, ThinkingBlock};
+use sidebar::SessionRow;
+use tool_components::ToolCard;
+use workspace::WorkspaceView;
 
-pub fn build(app: &adw::Application) {
-    icons::initialize_lucide_font().expect("failed to load bundled Lucide icon font");
-    load_styles();
-    let ui = build_shell(app);
+pub(crate) fn build(app: &adw::Application) {
+    let ui = workspace::build(app);
 
     let (bridge, client, events) = match OmpBridge::spawn() {
         Ok(bridge) => {
@@ -43,8 +35,9 @@ pub fn build(app: &adw::Application) {
             (Some(bridge), Some(client), Some(events))
         }
         Err(error) => (None, None, {
-            ui.input.set_sensitive(false);
-            append_notice(&ui.messages, &format!("Could not start omp: {error}"), true);
+            ui.composer.set_input_sensitive(false);
+            ui.conversation
+                .append_notice(&format!("Could not start omp: {error}"), true);
             None
         }),
     };
@@ -96,45 +89,6 @@ pub fn build(app: &adw::Application) {
     eprintln!("omp native bridge UI ready");
 }
 
-struct Ui {
-    window: adw::ApplicationWindow,
-    title: gtk::Label,
-    session_list: gtk::ListBox,
-    sidebar_activity_count: gtk::Label,
-    sidebar_root: gtk::Box,
-    show_sidebar_button: gtk::Button,
-    hide_sidebar_button: gtk::Button,
-    history_button: gtk::Button,
-    back_button: gtk::Button,
-    content_stack: gtk::Stack,
-    subagent_messages: gtk::Box,
-    subagent_scroller: gtk::ScrolledWindow,
-    composer_clamp: adw::Clamp,
-    chat_status: ChatStatus,
-    telemetry: TelemetryWidgets,
-    messages: gtk::Box,
-    empty_chat_hero: gtk::Box,
-    message_scroller: gtk::ScrolledWindow,
-    input: gtk::TextView,
-    send_button: gtk::Button,
-    new_chat_button: gtk::Button,
-    model_button: gtk::Button,
-    model_label: gtk::Label,
-    model_icon: icons::ProviderIcon,
-    thinking_button: gtk::Button,
-    thinking_label: gtk::Label,
-    thinking_popover: gtk::Popover,
-    thinking_list: gtk::Box,
-    completion_popover: gtk::Popover,
-    completion_list: gtk::ListBox,
-    extension_above: gtk::Box,
-    extension_below: gtk::Box,
-    extension_status: gtk::Label,
-    subagent_bar: gtk::Box,
-    subagent_count: gtk::Label,
-    subagent_chips: gtk::Box,
-}
-
 struct StreamingMessage {
     label: gtk::Label,
     text: String,
@@ -150,7 +104,7 @@ struct SubagentState {
 }
 
 struct AppController {
-    ui: Ui,
+    ui: WorkspaceView,
     bridge: RefCell<Option<OmpBridge>>,
     client: Option<BridgeClient>,
     models: RefCell<Vec<ModelSummary>>,
@@ -166,7 +120,7 @@ struct AppController {
     subagents: RefCell<HashMap<String, SubagentState>>,
     subagent_buttons: RefCell<HashMap<String, gtk::Button>>,
     session_rows: RefCell<Vec<SessionRow>>,
-    active_sessions: RefCell<Vec<sidebar::SessionEntry>>,
+    active_sessions: RefCell<Vec<SessionEntry>>,
     pending_delete: RefCell<Option<PathBuf>>,
     current_session_file: RefCell<Option<PathBuf>>,
     current_session_title: RefCell<String>,
@@ -183,7 +137,7 @@ struct AppController {
 impl AppController {
     fn wire_interactions(self: &Rc<Self>) {
         let weak = Rc::downgrade(self);
-        self.ui.input.buffer().connect_changed(move |_| {
+        self.ui.composer.connect_changed(move || {
             let Some(controller) = weak.upgrade() else {
                 return;
             };
@@ -205,14 +159,14 @@ impl AppController {
                 if enter_inserts_newline(modifiers) {
                     return glib::Propagation::Proceed;
                 }
-                if controller.ui.completion_popover.is_visible() {
+                if controller.ui.composer.completions_visible() {
                     controller.accept_completion(true);
                 } else {
                     controller.submit_current();
                 }
                 return glib::Propagation::Stop;
             }
-            if !controller.ui.completion_popover.is_visible() {
+            if !controller.ui.composer.completions_visible() {
                 return glib::Propagation::Proceed;
             }
             match key {
@@ -240,10 +194,10 @@ impl AppController {
                 _ => glib::Propagation::Proceed,
             }
         });
-        self.ui.input.add_controller(key_controller);
+        self.ui.composer.add_key_controller(key_controller);
 
         let weak = Rc::downgrade(self);
-        self.ui.send_button.connect_clicked(move |_| {
+        self.ui.composer.connect_send_clicked(move || {
             if let Some(controller) = weak.upgrade() {
                 controller.activate_primary_action();
             }
@@ -300,29 +254,27 @@ impl AppController {
         });
 
         let weak = Rc::downgrade(self);
-        self.ui.model_button.connect_clicked(move |_| {
+        self.ui.composer.connect_model_clicked(move || {
             if let Some(controller) = weak.upgrade() {
                 controller.present_model_picker();
             }
         });
 
         let weak = Rc::downgrade(self);
-        self.ui.thinking_button.connect_clicked(move |_| {
+        self.ui.composer.connect_thinking_clicked(move || {
             if let Some(controller) = weak.upgrade() {
-                controller.ui.thinking_popover.popup();
+                controller.ui.composer.show_thinking_popover();
             }
         });
 
         let weak = Rc::downgrade(self);
-        self.ui
-            .completion_list
-            .connect_row_activated(move |_, row| {
-                let Some(controller) = weak.upgrade() else {
-                    return;
-                };
-                controller.completion_index.set(row.index() as usize);
-                controller.accept_completion(false);
-            });
+        self.ui.composer.connect_completion_activated(move |index| {
+            let Some(controller) = weak.upgrade() else {
+                return;
+            };
+            controller.completion_index.set(index as usize);
+            controller.accept_completion(false);
+        });
 
         let weak = Rc::downgrade(self);
         self.ui.window.connect_close_request(move |_| {
@@ -388,7 +340,9 @@ impl AppController {
             RpcEvent::CommandOutput(text) => {
                 if !text.is_empty() {
                     self.remove_empty_state();
-                    append_message(&self.ui.messages, MessageRole::Assistant, &text);
+                    self.ui
+                        .conversation
+                        .append_message(MessageRole::Assistant, &text);
                     self.scroll_to_bottom();
                 }
             }
@@ -409,7 +363,9 @@ impl AppController {
                 }
             }
             RpcEvent::Notice { level, message } => {
-                append_notice(&self.ui.messages, &message, level == "error");
+                self.ui
+                    .conversation
+                    .append_notice(&message, level == "error");
                 self.scroll_to_bottom();
             }
             RpcEvent::ModelChanged => {
@@ -430,7 +386,7 @@ impl AppController {
                 self.ready.set(false);
                 self.running.set(false);
                 self.ui.chat_status.disconnected();
-                self.ui.input.set_sensitive(false);
+                self.ui.composer.set_input_sensitive(false);
                 self.update_send_state();
                 self.show_error(&message);
             }
@@ -537,7 +493,7 @@ impl AppController {
 
     fn refresh_after_new_session(self: &Rc<Self>) {
         if let Some(path) = self.pending_delete.borrow_mut().take() {
-            if let Err(error) = sidebar::delete_session_files(&path) {
+            if let Err(error) = session_catalog::delete_session_files(&path) {
                 self.show_error(&format!("Could not delete conversation: {error}"));
             }
             self.active_sessions
@@ -551,7 +507,9 @@ impl AppController {
         self.clear_messages();
         self.clear_subagents();
         self.set_session_title("New conversation");
-        append_notice(&self.ui.messages, "Starting a new conversation…", false);
+        self.ui
+            .conversation
+            .append_notice("Starting a new conversation…", false);
         self.refresh_session_sidebar();
         self.refresh_after_session_change();
     }
@@ -567,21 +525,23 @@ impl AppController {
     fn apply_state(self: &Rc<Self>, state: SessionState) {
         self.ready.set(true);
         self.running.set(state.is_streaming);
-        self.ui.input.set_sensitive(true);
+        self.ui.composer.set_input_sensitive(true);
 
         let session_file = state.session_file.as_deref().map(PathBuf::from);
         let disk_title = session_file
             .as_deref()
-            .and_then(sidebar::read_session_title);
+            .and_then(session_catalog::read_session_title);
         self.current_session_file.replace(session_file.clone());
-        let resolved =
-            sidebar::authoritative_title(state.session_name.as_deref(), disk_title.as_deref());
-        let title = sidebar::authoritative_title(
+        let resolved = session_catalog::authoritative_title(
+            state.session_name.as_deref(),
+            disk_title.as_deref(),
+        );
+        let title = session_catalog::authoritative_title(
             Some(&resolved),
             Some(&self.current_session_title.borrow()),
         );
         self.set_session_title(&title);
-        let current_entry = sidebar::session_entry(session_file.as_deref(), &title, true);
+        let current_entry = session_catalog::session_entry(session_file.as_deref(), &title, true);
         if let Some(cwd) = current_entry.cwd.as_deref() {
             self.ui.telemetry.cwd.set_text(&compact_path(cwd));
             self.ui
@@ -598,7 +558,7 @@ impl AppController {
             model_window = model.context_window.unwrap_or(0);
             self.current_model
                 .replace(Some((model.provider.clone(), model.id.clone())));
-            icons::set_provider_icon(&self.ui.model_icon, &model.provider);
+            self.ui.composer.set_model_provider(&model.provider);
             let efforts = model
                 .thinking
                 .as_ref()
@@ -655,7 +615,7 @@ impl AppController {
             .iter()
             .map(|entry| {
                 let current = entry.path == current_path;
-                sidebar::session_entry(
+                session_catalog::session_entry(
                     entry.path.as_deref(),
                     if current {
                         &current_title
@@ -679,7 +639,7 @@ impl AppController {
     }
 
     fn refresh_session_sidebar(self: &Rc<Self>) {
-        let current = sidebar::session_entry(
+        let current = session_catalog::session_entry(
             self.current_session_file.borrow().as_deref(),
             &self.current_session_title.borrow(),
             true,
@@ -700,7 +660,7 @@ impl AppController {
         self.render_session_sidebar(rendered);
     }
 
-    fn render_session_sidebar(self: &Rc<Self>, entries: Vec<sidebar::SessionEntry>) {
+    fn render_session_sidebar(self: &Rc<Self>, entries: Vec<SessionEntry>) {
         while let Some(child) = self.ui.session_list.first_child() {
             self.ui.session_list.remove(&child);
         }
@@ -747,7 +707,7 @@ impl AppController {
 
     fn present_history(self: &Rc<Self>) {
         let sessions =
-            sidebar::discover_all_sessions(self.current_session_file.borrow().as_deref());
+            session_catalog::discover_all_sessions(self.current_session_file.borrow().as_deref());
         let active_paths = self
             .active_sessions
             .borrow()
@@ -762,7 +722,7 @@ impl AppController {
         });
     }
 
-    fn open_session(self: &Rc<Self>, entry: &sidebar::SessionEntry) {
+    fn open_session(self: &Rc<Self>, entry: &SessionEntry) {
         if entry.current {
             return;
         }
@@ -787,13 +747,15 @@ impl AppController {
                 self.clear_messages();
                 self.clear_subagents();
                 self.set_session_title(&entry.title);
-                append_notice(&self.ui.messages, "Loading conversation…", false);
+                self.ui
+                    .conversation
+                    .append_notice("Loading conversation…", false);
             }
             Err(error) => self.show_error(&error.to_string()),
         }
     }
 
-    fn close_session(self: &Rc<Self>, entry: &sidebar::SessionEntry) {
+    fn close_session(self: &Rc<Self>, entry: &SessionEntry) {
         self.active_sessions
             .borrow_mut()
             .retain(|active| active.path != entry.path);
@@ -809,7 +771,7 @@ impl AppController {
         }
     }
 
-    fn present_delete_dialog(self: &Rc<Self>, entry: &sidebar::SessionEntry) {
+    fn present_delete_dialog(self: &Rc<Self>, entry: &SessionEntry) {
         let Some(path) = entry.path.clone() else {
             return;
         };
@@ -849,7 +811,7 @@ impl AppController {
     }
 
     fn delete_closed_session(self: &Rc<Self>, path: &Path) {
-        match sidebar::delete_session_files(path) {
+        match session_catalog::delete_session_files(path) {
             Ok(()) => {
                 self.active_sessions
                     .borrow_mut()
@@ -860,7 +822,7 @@ impl AppController {
         }
     }
 
-    fn present_rename_dialog(self: &Rc<Self>, entry: &sidebar::SessionEntry) {
+    fn present_rename_dialog(self: &Rc<Self>, entry: &SessionEntry) {
         let name = gtk::Entry::new();
         name.set_text(&entry.title);
         name.set_activates_default(true);
@@ -937,8 +899,8 @@ impl AppController {
     fn apply_models(&self, models: Vec<ModelSummary>) {
         self.models.replace(models);
         self.ui
-            .model_button
-            .set_sensitive(!self.models.borrow().is_empty());
+            .composer
+            .set_model_sensitive(!self.models.borrow().is_empty());
         let current = self.current_model.borrow().clone();
         if let Some((provider, model_id)) = current {
             self.select_model_inner(&provider, &model_id);
@@ -966,13 +928,9 @@ impl AppController {
     }
 
     fn show_model(&self, model: &ModelSummary) {
-        icons::set_provider_icon(&self.ui.model_icon, &model.provider);
-        self.ui.model_label.set_text(model.display_name());
-        self.ui.model_button.set_tooltip_text(Some(&format!(
-            "{} · {}",
-            model.display_name(),
-            icons::provider_label(&model.provider)
-        )));
+        self.ui
+            .composer
+            .set_model(&model.provider, model.display_name());
     }
 
     fn apply_thinking_levels(self: &Rc<Self>, mut efforts: Vec<String>, selected: Option<&str>) {
@@ -984,9 +942,7 @@ impl AppController {
             efforts.push(selected.to_owned());
         }
         efforts.dedup();
-        while let Some(child) = self.ui.thinking_list.first_child() {
-            self.ui.thinking_list.remove(&child);
-        }
+        self.ui.composer.clear_thinking_options();
         self.thinking_buttons.borrow_mut().clear();
         self.thinking_levels.replace(efforts.clone());
         for level in &efforts {
@@ -1003,15 +959,15 @@ impl AppController {
                 match client.set_thinking_level(&requested) {
                     Ok(()) => {
                         controller.select_thinking(&requested);
-                        controller.ui.thinking_popover.popdown();
+                        controller.ui.composer.close_thinking_popover();
                     }
                     Err(error) => controller.show_error(&error.to_string()),
                 }
             });
-            self.ui.thinking_list.append(&button);
+            self.ui.composer.append_thinking_option(&button);
             self.thinking_buttons.borrow_mut().push(button);
         }
-        self.ui.thinking_button.set_sensitive(!efforts.is_empty());
+        self.ui.composer.set_thinking_sensitive(!efforts.is_empty());
         self.select_thinking_inner(selected.unwrap_or("off"));
     }
 
@@ -1028,7 +984,7 @@ impl AppController {
         else {
             return;
         };
-        self.ui.thinking_label.set_text(&title_case(level));
+        self.ui.composer.set_thinking_label(&title_case(level));
         for (button_index, button) in self.thinking_buttons.borrow().iter().enumerate() {
             if button_index == index {
                 button.add_css_class("thinking-option-selected");
@@ -1049,17 +1005,21 @@ impl AppController {
                 Some("user") => {
                     let text = message_text(message);
                     if !text.is_empty() {
-                        append_message(&self.ui.messages, MessageRole::User, &text);
+                        self.ui
+                            .conversation
+                            .append_message(MessageRole::User, &text);
                     }
                 }
                 Some("assistant") => {
                     let thinking = message_thinking(message);
                     if !thinking.is_empty() {
-                        append_thinking(&self.ui.messages, &thinking, false);
+                        self.ui.conversation.append_thinking(&thinking, false);
                     }
                     let text = message_text(message);
                     if !text.is_empty() {
-                        append_message(&self.ui.messages, MessageRole::Assistant, &text);
+                        self.ui
+                            .conversation
+                            .append_message(MessageRole::Assistant, &text);
                     }
                     for tool in message_tool_calls(message) {
                         self.ensure_tool_card(&tool);
@@ -1079,7 +1039,7 @@ impl AppController {
                 Some("custom") | Some("developer") => {
                     let text = message_text(message);
                     if !text.is_empty() {
-                        append_notice(&self.ui.messages, &text, false);
+                        self.ui.conversation.append_notice(&text, false);
                     }
                 }
                 _ => {}
@@ -1087,7 +1047,7 @@ impl AppController {
         }
         self.session_cost.set(cost);
         self.ui.telemetry.set_cost(cost);
-        if self.ui.messages.first_child().is_none() {
+        if self.ui.conversation.is_empty() {
             self.show_empty_state();
         } else {
             self.remove_empty_state();
@@ -1113,7 +1073,9 @@ impl AppController {
                     }
                 };
                 if !matches_pending && !text.is_empty() {
-                    append_message(&self.ui.messages, MessageRole::User, &text);
+                    self.ui
+                        .conversation
+                        .append_message(MessageRole::User, &text);
                     self.scroll_to_bottom();
                 }
             }
@@ -1121,16 +1083,16 @@ impl AppController {
                 let thinking = message_thinking(message);
                 self.streaming_thinking.borrow_mut().take();
                 if !thinking.is_empty() {
-                    self.streaming_thinking.replace(Some(append_thinking(
-                        &self.ui.messages,
-                        &thinking,
-                        true,
-                    )));
+                    self.streaming_thinking
+                        .replace(Some(self.ui.conversation.append_thinking(&thinking, true)));
                 }
                 let text = message_text(message);
                 self.streaming_message.borrow_mut().take();
                 if !text.is_empty() {
-                    let label = append_message(&self.ui.messages, MessageRole::Assistant, &text);
+                    let label = self
+                        .ui
+                        .conversation
+                        .append_message(MessageRole::Assistant, &text);
                     self.streaming_message
                         .replace(Some(StreamingMessage { label, text }));
                     self.scroll_to_bottom();
@@ -1147,7 +1109,10 @@ impl AppController {
         self.remove_empty_state();
         let mut slot = self.streaming_message.borrow_mut();
         if slot.is_none() {
-            let label = append_message(&self.ui.messages, MessageRole::Assistant, "");
+            let label = self
+                .ui
+                .conversation
+                .append_message(MessageRole::Assistant, "");
             *slot = Some(StreamingMessage {
                 label,
                 text: String::new(),
@@ -1168,7 +1133,7 @@ impl AppController {
         self.ui.chat_status.activity("Reasoning");
         let mut slot = self.streaming_thinking.borrow_mut();
         if slot.is_none() {
-            *slot = Some(append_thinking(&self.ui.messages, "", true));
+            *slot = Some(self.ui.conversation.append_thinking("", true));
         }
         slot.as_ref()
             .expect("streaming thinking exists")
@@ -1184,7 +1149,7 @@ impl AppController {
                 if let Some(thinking) = self.streaming_thinking.borrow_mut().take() {
                     thinking.finish(Some(&final_thinking));
                 } else if !final_thinking.is_empty() {
-                    append_thinking(&self.ui.messages, &final_thinking, false);
+                    self.ui.conversation.append_thinking(&final_thinking, false);
                 }
                 let final_text = message_text(message);
                 if let Some(mut streaming) = self.streaming_message.borrow_mut().take() {
@@ -1193,7 +1158,9 @@ impl AppController {
                         streaming.label.set_text(&streaming.text);
                     }
                 } else if !final_text.is_empty() {
-                    append_message(&self.ui.messages, MessageRole::Assistant, &final_text);
+                    self.ui
+                        .conversation
+                        .append_message(MessageRole::Assistant, &final_text);
                 }
                 for tool in message_tool_calls(message) {
                     self.ensure_tool_card(&tool);
@@ -1215,7 +1182,7 @@ impl AppController {
             Some("custom") | Some("developer") => {
                 let text = message_text(message);
                 if !text.is_empty() {
-                    append_notice(&self.ui.messages, &text, false);
+                    self.ui.conversation.append_notice(&text, false);
                 }
             }
             _ => {}
@@ -1269,7 +1236,7 @@ impl AppController {
             return card.clone();
         }
         let card = ToolCard::new(&tool.name, &tool.args, tool.intent.as_deref());
-        self.ui.messages.append(&card.root);
+        self.ui.conversation.append(&card.root);
         self.tool_cards
             .borrow_mut()
             .insert(tool.id.clone(), card.clone());
@@ -1327,9 +1294,7 @@ impl AppController {
     }
 
     fn refresh_subagent_chips(self: &Rc<Self>) {
-        while let Some(child) = self.ui.subagent_chips.first_child() {
-            self.ui.subagent_chips.remove(&child);
-        }
+        self.ui.composer.clear_subagent_chips();
         self.subagent_buttons.borrow_mut().clear();
         let mut agents = self
             .subagents
@@ -1353,12 +1318,12 @@ impl AppController {
                     controller.open_subagent_view(&id);
                 }
             });
-            self.ui.subagent_chips.append(&chip);
+            self.ui.composer.append_subagent_chip(&chip);
             self.subagent_buttons.borrow_mut().insert(agent.id, chip);
         }
         self.ui
-            .subagent_bar
-            .set_visible(!self.subagents.borrow().is_empty());
+            .composer
+            .set_subagents_visible(!self.subagents.borrow().is_empty());
     }
 
     fn open_subagent_view(&self, id: &str) {
@@ -1366,11 +1331,8 @@ impl AppController {
             return;
         };
         self.active_subagent.replace(Some(id.to_owned()));
-        while let Some(child) = self.ui.subagent_messages.first_child() {
-            self.ui.subagent_messages.remove(&child);
-        }
-        append_notice(
-            &self.ui.subagent_messages,
+        self.ui.subagent_conversation.clear();
+        self.ui.subagent_conversation.append_notice(
             &format!("Loading {}’s transcript…", agent.display_name),
             false,
         );
@@ -1383,7 +1345,9 @@ impl AppController {
         if let Some(client) = &self.client
             && let Err(error) = client.get_subagent_messages(id)
         {
-            append_notice(&self.ui.subagent_messages, &error.to_string(), true);
+            self.ui
+                .subagent_conversation
+                .append_notice(&error.to_string(), true);
         }
     }
 
@@ -1396,30 +1360,34 @@ impl AppController {
     }
 
     fn hydrate_subagent_messages(&self, messages: &[Value]) {
-        while let Some(child) = self.ui.subagent_messages.first_child() {
-            self.ui.subagent_messages.remove(&child);
-        }
+        self.ui.subagent_conversation.clear();
         let mut cards = HashMap::<String, ToolCard>::new();
         for message in messages {
             match message_role(message) {
                 Some("user") => {
                     let text = message_text(message);
                     if !text.is_empty() {
-                        append_message(&self.ui.subagent_messages, MessageRole::User, &text);
+                        self.ui
+                            .subagent_conversation
+                            .append_message(MessageRole::User, &text);
                     }
                 }
                 Some("assistant") => {
                     let thinking = message_thinking(message);
                     if !thinking.is_empty() {
-                        append_thinking(&self.ui.subagent_messages, &thinking, false);
+                        self.ui
+                            .subagent_conversation
+                            .append_thinking(&thinking, false);
                     }
                     let text = message_text(message);
                     if !text.is_empty() {
-                        append_message(&self.ui.subagent_messages, MessageRole::Assistant, &text);
+                        self.ui
+                            .subagent_conversation
+                            .append_message(MessageRole::Assistant, &text);
                     }
                     for tool in message_tool_calls(message) {
                         let card = ToolCard::new(&tool.name, &tool.args, tool.intent.as_deref());
-                        self.ui.subagent_messages.append(&card.root);
+                        self.ui.subagent_conversation.append(&card.root);
                         cards.insert(tool.id, card);
                     }
                 }
@@ -1427,7 +1395,7 @@ impl AppController {
                     if let Some((id, name, result, is_error)) = tool_result_parts(message) {
                         let card = cards.entry(id).or_insert_with(|| {
                             let card = ToolCard::new(&name, &Value::Null, None);
-                            self.ui.subagent_messages.append(&card.root);
+                            self.ui.subagent_conversation.append(&card.root);
                             card
                         });
                         card.complete(&result, is_error);
@@ -1436,26 +1404,20 @@ impl AppController {
                 _ => {}
             }
         }
-        if self.ui.subagent_messages.first_child().is_none() {
-            append_notice(
-                &self.ui.subagent_messages,
+        if self.ui.subagent_conversation.is_empty() {
+            self.ui.subagent_conversation.append_notice(
                 "This subagent has not produced transcript messages yet.",
                 false,
             );
         }
-        let adjustment = self.ui.subagent_scroller.vadjustment();
-        glib::idle_add_local_once(move || {
-            adjustment.set_value((adjustment.upper() - adjustment.page_size()).max(0.0));
-        });
+        self.ui.subagent_conversation.scroll_to_bottom();
     }
 
     fn clear_subagents(&self) {
         self.subagents.borrow_mut().clear();
         self.subagent_buttons.borrow_mut().clear();
-        while let Some(child) = self.ui.subagent_chips.first_child() {
-            self.ui.subagent_chips.remove(&child);
-        }
-        self.ui.subagent_bar.set_visible(false);
+        self.ui.composer.clear_subagent_chips();
+        self.ui.composer.set_subagents_visible(false);
         self.update_activity_counts();
     }
 
@@ -1468,8 +1430,8 @@ impl AppController {
             .count();
         let total_agents = self.subagents.borrow().len();
         self.ui
-            .subagent_count
-            .set_text(&format!("{active_agents} active · {total_agents} total"));
+            .composer
+            .set_subagent_count(&format!("{active_agents} active · {total_agents} total"));
         let active_items = active_agents + usize::from(self.running.get());
         self.ui.sidebar_activity_count.set_visible(active_items > 0);
         self.ui
@@ -1510,7 +1472,9 @@ impl AppController {
                 self.clear_subagents();
                 self.current_session_file.borrow_mut().take();
                 self.set_session_title("New conversation");
-                append_notice(&self.ui.messages, "Starting a new conversation…", false);
+                self.ui
+                    .conversation
+                    .append_notice("Starting a new conversation…", false);
             }
             Err(error) => self.show_error(&error.to_string()),
         }
@@ -1520,11 +1484,7 @@ impl AppController {
         if !self.ready.get() {
             return;
         }
-        let buffer = self.ui.input.buffer();
-        let text = buffer
-            .text(&buffer.start_iter(), &buffer.end_iter(), false)
-            .trim()
-            .to_owned();
+        let text = self.ui.composer.text().trim().to_owned();
         if text.is_empty() {
             return;
         }
@@ -1534,9 +1494,11 @@ impl AppController {
         match client.prompt(&text) {
             Ok(()) => {
                 self.remove_empty_state();
-                append_message(&self.ui.messages, MessageRole::User, &text);
+                self.ui
+                    .conversation
+                    .append_message(MessageRole::User, &text);
                 self.pending_user_messages.borrow_mut().push_back(text);
-                buffer.set_text("");
+                self.ui.composer.set_text("");
                 self.hide_completions();
                 self.scroll_to_bottom();
             }
@@ -1545,48 +1507,24 @@ impl AppController {
     }
 
     fn update_send_state(&self) {
-        let buffer = self.ui.input.buffer();
-        let has_text = !buffer
-            .text(&buffer.start_iter(), &buffer.end_iter(), false)
-            .trim()
-            .is_empty();
-        let running = self.running.get();
-        icons::set_button_icon(
-            &self.ui.send_button,
-            if running {
-                icons::Icon::Square
-            } else {
-                icons::Icon::SendHorizontal
-            },
-        );
-        self.ui.send_button.set_tooltip_text(Some(if running {
-            "Stop response"
-        } else {
-            "Send · Enter"
-        }));
         self.ui
-            .send_button
-            .set_sensitive(self.ready.get() && (running || has_text));
+            .composer
+            .set_primary_action(self.ready.get(), self.running.get());
     }
 
     fn update_completions(&self) {
-        let buffer = self.ui.input.buffer();
-        let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
-        let candidates = completions(text.as_str(), &self.commands.borrow());
+        let text = self.ui.composer.text();
+        let candidates = completions(&text, &self.commands.borrow());
         self.completion_items.replace(candidates);
         self.completion_index.set(0);
-        while let Some(child) = self.ui.completion_list.first_child() {
-            self.ui.completion_list.remove(&child);
-        }
+        self.ui.composer.clear_completion_rows();
         for completion in self.completion_items.borrow().iter() {
-            self.ui.completion_list.append(&completion_row(completion));
+            self.ui
+                .composer
+                .append_completion_row(&completion_row(completion));
         }
-        if let Some(first) = self.ui.completion_list.row_at_index(0) {
-            self.ui.completion_list.select_row(Some(&first));
-            if let Some(parent) = self.ui.completion_popover.parent() {
-                self.ui.completion_popover.set_width_request(parent.width());
-            }
-            self.ui.completion_popover.popup();
+        if self.ui.composer.select_completion(0) {
+            self.ui.composer.show_completions();
         } else {
             self.hide_completions();
         }
@@ -1600,9 +1538,7 @@ impl AppController {
         let index =
             (self.completion_index.get() as isize + direction).rem_euclid(count as isize) as usize;
         self.completion_index.set(index);
-        if let Some(row) = self.ui.completion_list.row_at_index(index as i32) {
-            self.ui.completion_list.select_row(Some(&row));
-        }
+        self.ui.composer.select_completion(index as i32);
     }
 
     fn accept_completion(&self, submit_if_complete: bool) {
@@ -1614,8 +1550,8 @@ impl AppController {
         else {
             return;
         };
-        self.ui.input.buffer().set_text(&completion.replacement);
-        self.ui.input.grab_focus();
+        self.ui.composer.set_text(&completion.replacement);
+        self.ui.composer.focus();
         if submit_if_complete && !completion.replacement.ends_with(' ') {
             self.hide_completions();
             self.submit_current();
@@ -1623,14 +1559,11 @@ impl AppController {
     }
 
     fn hide_completions(&self) {
-        self.ui.completion_popover.popdown();
+        self.ui.composer.hide_completions();
     }
 
     fn clear_messages(&self) {
-        self.ui.empty_chat_hero.set_visible(false);
-        while let Some(child) = self.ui.messages.first_child() {
-            self.ui.messages.remove(&child);
-        }
+        self.ui.conversation.clear();
         self.streaming_message.borrow_mut().take();
         self.streaming_thinking.borrow_mut().take();
         self.tool_cards.borrow_mut().clear();
@@ -1638,28 +1571,19 @@ impl AppController {
     }
 
     fn show_empty_state(&self) {
-        self.ui.empty_chat_hero.set_visible(true);
+        self.ui.conversation.show_empty();
     }
 
     fn remove_empty_state(&self) {
-        self.ui.empty_chat_hero.set_visible(false);
+        self.ui.conversation.hide_empty();
     }
 
     fn scroll_to_bottom(&self) {
-        let adjustment = self.ui.message_scroller.vadjustment();
-        let adjustment_after_layout = adjustment.clone();
-        glib::idle_add_local_once(move || {
-            adjustment.set_value((adjustment.upper() - adjustment.page_size()).max(0.0));
-        });
-        glib::timeout_add_local_once(Duration::from_millis(50), move || {
-            adjustment_after_layout.set_value(
-                (adjustment_after_layout.upper() - adjustment_after_layout.page_size()).max(0.0),
-            );
-        });
+        self.ui.conversation.scroll_to_bottom();
     }
 
     fn show_error(&self, message: &str) {
-        append_notice(&self.ui.messages, message, true);
+        self.ui.conversation.append_notice(message, true);
         self.scroll_to_bottom();
     }
 
@@ -1675,7 +1599,7 @@ impl AppController {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 let is_error = request.get("notifyType").and_then(Value::as_str) == Some("error");
-                append_notice(&self.ui.messages, message, is_error);
+                self.ui.conversation.append_notice(message, is_error);
             }
             "setTitle" => {
                 if let Some(title) = request.get("title").and_then(Value::as_str) {
@@ -1684,8 +1608,8 @@ impl AppController {
             }
             "set_editor_text" => {
                 if let Some(text) = request.get("text").and_then(Value::as_str) {
-                    self.ui.input.buffer().set_text(text);
-                    self.ui.input.grab_focus();
+                    self.ui.composer.set_text(text);
+                    self.ui.composer.focus();
                 }
             }
             "setStatus" => self.update_extension_status(&request),
@@ -1735,19 +1659,15 @@ impl AppController {
             .map(|(_, value)| value.as_str())
             .collect::<Vec<_>>()
             .join(" · ");
-        self.ui.extension_status.set_text(&text);
-        self.ui.extension_status.set_visible(!text.is_empty());
+        self.ui.composer.set_extension_status(&text);
     }
 
     fn update_extension_widget(&self, request: &Value) {
         let Some(key) = request.get("widgetKey").and_then(Value::as_str) else {
             return;
         };
-        if let Some(label) = self.extension_widgets.borrow_mut().remove(key)
-            && let Some(parent) = label.parent().and_downcast::<gtk::Box>()
-        {
-            parent.remove(&label);
-            parent.set_visible(parent.first_child().is_some());
+        if let Some(label) = self.extension_widgets.borrow_mut().remove(key) {
+            self.ui.composer.remove_extension_widget(&label);
         }
 
         let Some(lines) = request.get("widgetLines").and_then(Value::as_array) else {
@@ -1766,14 +1686,11 @@ impl AppController {
         label.set_wrap(true);
         label.set_selectable(true);
         label.add_css_class("extension-widget");
-        let container =
-            if request.get("widgetPlacement").and_then(Value::as_str) == Some("belowEditor") {
-                &self.ui.extension_below
-            } else {
-                &self.ui.extension_above
-            };
-        container.append(&label);
-        container.set_visible(true);
+        let below_editor =
+            request.get("widgetPlacement").and_then(Value::as_str) == Some("belowEditor");
+        self.ui
+            .composer
+            .append_extension_widget(&label, below_editor);
         self.extension_widgets
             .borrow_mut()
             .insert(key.to_owned(), label);
@@ -1899,161 +1816,6 @@ impl AppController {
     }
 }
 
-fn build_shell(app: &adw::Application) -> Ui {
-    adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
-    let sidebar = sidebar::build();
-
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    root.add_css_class("workspace");
-    let header_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    header_box.add_css_class("header-box");
-    let header = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    header.add_css_class("chat-header");
-    let show_sidebar_button =
-        icons::icon_button(icons::Icon::PanelLeftOpen, "Show recent conversations");
-    show_sidebar_button.set_visible(false);
-    show_sidebar_button.add_css_class("sidebar-toggle");
-    let back_button = icons::icon_button(icons::Icon::ArrowLeft, "Back to main conversation");
-    back_button.set_visible(false);
-    back_button.set_tooltip_text(Some("Back to main conversation"));
-    back_button.add_css_class("back-button");
-    let assistant_mark = icons::omp_logo(19);
-    assistant_mark.add_css_class("header-logo");
-    let title = gtk::Label::new(Some("New conversation"));
-    title.set_xalign(0.0);
-    title.set_hexpand(true);
-    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    title.add_css_class("chat-title");
-    let chat_status = ChatStatus::new();
-    header.append(&show_sidebar_button);
-    header.append(&back_button);
-    header.append(&assistant_mark);
-    header.append(&title);
-    header.append(&chat_status.root);
-    header.append(&window_controls());
-
-    let telemetry = TelemetryWidgets::new("No workspace");
-    header_box.append(&header);
-    header_box.append(&telemetry.root);
-    let header_handle = gtk::WindowHandle::new();
-    header_handle.set_child(Some(&header_box));
-
-    let messages = gtk::Box::new(gtk::Orientation::Vertical, 24);
-    messages.set_margin_top(32);
-    messages.set_margin_bottom(28);
-    messages.set_margin_start(22);
-    messages.set_margin_end(22);
-    append_notice(&messages, "Connecting to the omp runtime…", false);
-    let message_clamp = adw::Clamp::builder()
-        .maximum_size(900)
-        .tightening_threshold(720)
-        .child(&messages)
-        .build();
-    let message_scroller = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vexpand(true)
-        .child(&message_clamp)
-        .build();
-    message_scroller.add_css_class("message-scroll");
-    let empty_chat_hero = empty_chat_hero();
-    empty_chat_hero.set_can_target(false);
-    empty_chat_hero.set_visible(false);
-    let message_overlay = gtk::Overlay::new();
-    message_overlay.set_child(Some(&message_scroller));
-    message_overlay.add_overlay(&empty_chat_hero);
-
-    let subagent_messages = gtk::Box::new(gtk::Orientation::Vertical, 20);
-    subagent_messages.set_margin_top(28);
-    subagent_messages.set_margin_bottom(28);
-    subagent_messages.set_margin_start(22);
-    subagent_messages.set_margin_end(22);
-    let subagent_clamp = adw::Clamp::builder()
-        .maximum_size(900)
-        .tightening_threshold(720)
-        .child(&subagent_messages)
-        .build();
-    let subagent_scroller = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vexpand(true)
-        .child(&subagent_clamp)
-        .build();
-    subagent_scroller.add_css_class("message-scroll");
-    let content_stack = gtk::Stack::new();
-    content_stack.set_transition_type(gtk::StackTransitionType::Crossfade);
-    content_stack.set_transition_duration(180);
-    content_stack.add_named(&message_overlay, Some("chat"));
-    content_stack.add_named(&subagent_scroller, Some("subagent"));
-    content_stack.set_visible_child_name("chat");
-
-    let composer = composer::build();
-    let composer_clamp = adw::Clamp::builder()
-        .maximum_size(900)
-        .tightening_threshold(720)
-        .child(&composer.root)
-        .build();
-    composer_clamp.set_margin_start(24);
-    composer_clamp.set_margin_end(24);
-    composer_clamp.set_margin_bottom(18);
-
-    root.append(&header_handle);
-    root.append(&content_stack);
-    root.append(&composer_clamp);
-    let split = gtk::Paned::new(gtk::Orientation::Horizontal);
-    split.set_start_child(Some(&sidebar.root));
-    split.set_end_child(Some(&root));
-    split.set_position(286);
-    split.set_resize_start_child(false);
-    split.set_shrink_start_child(false);
-
-    let window = adw::ApplicationWindow::builder()
-        .application(app)
-        .title("omp native")
-        .default_width(1260)
-        .default_height(800)
-        .content(&split)
-        .build();
-    window.set_decorated(false);
-
-    Ui {
-        window,
-        title,
-        session_list: sidebar.list,
-        sidebar_activity_count: sidebar.active_count,
-        sidebar_root: sidebar.root,
-        show_sidebar_button,
-        hide_sidebar_button: sidebar.collapse,
-        history_button: sidebar.history,
-        back_button,
-        content_stack,
-        subagent_messages,
-        subagent_scroller,
-        composer_clamp,
-        chat_status,
-        telemetry,
-        messages,
-        empty_chat_hero,
-        message_scroller,
-        input: composer.input,
-        send_button: composer.send,
-        new_chat_button: sidebar.new_chat,
-        model_button: composer.model_button,
-        model_label: composer.model_label,
-        model_icon: composer.model_icon,
-        thinking_button: composer.thinking_button,
-        thinking_label: composer.thinking_label,
-        thinking_popover: composer.thinking_popover,
-        thinking_list: composer.thinking_list,
-        completion_popover: composer.completion,
-        completion_list: composer.completion_list,
-        extension_above: composer.extension_above,
-        extension_below: composer.extension_below,
-        extension_status: composer.extension_status,
-        subagent_bar: composer.subagent_bar,
-        subagent_count: composer.subagent_count,
-        subagent_chips: composer.subagent_chips,
-    }
-}
-
 fn completion_row(completion: &CommandCompletion) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
     let content = gtk::Box::new(gtk::Orientation::Vertical, 3);
@@ -2081,25 +1843,6 @@ fn completion_row(completion: &CommandCompletion) -> gtk::ListBoxRow {
     content.append(&description);
     row.set_child(Some(&content));
     row
-}
-
-fn window_controls() -> gtk::Box {
-    let controls = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    controls.add_css_class("window-controls");
-    for (icon, action, tooltip) in [
-        (icons::Icon::Minus, "window.minimize", "Minimize"),
-        (
-            icons::Icon::Maximize2,
-            "window.toggle-maximized",
-            "Maximize",
-        ),
-        (icons::Icon::XCircle, "window.close", "Close"),
-    ] {
-        let button = icons::icon_button(icon, tooltip);
-        button.set_action_name(Some(action));
-        controls.append(&button);
-    }
-    controls
 }
 
 fn title_case(value: &str) -> String {
@@ -2150,17 +1893,6 @@ fn compact_path(path: &Path) -> String {
 
 fn enter_inserts_newline(modifiers: gdk::ModifierType) -> bool {
     modifiers.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK)
-}
-
-fn load_styles() {
-    let provider = gtk::CssProvider::new();
-    provider.load_from_string(include_str!("style.css"));
-    let display = gdk::Display::default().expect("a graphical display");
-    gtk::style_context_add_provider_for_display(
-        &display,
-        &provider,
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
 }
 
 #[cfg(test)]

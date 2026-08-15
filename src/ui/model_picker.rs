@@ -30,162 +30,196 @@ struct PickerRow {
     model: ModelSummary,
 }
 
-pub fn present(
+#[derive(Clone)]
+pub(crate) struct ModelPickerView {
+    root: gtk::Box,
+    search: gtk::SearchEntry,
+}
+
+impl ModelPickerView {
+    pub(crate) fn new(
+        mut models: Vec<ModelSummary>,
+        selected: Option<(String, String)>,
+        on_select: impl Fn(ModelSummary) + 'static,
+        on_close: impl Fn() + 'static,
+    ) -> Self {
+        models.sort_by(|left, right| {
+            icons::provider_label(&left.provider)
+                .cmp(&icons::provider_label(&right.provider))
+                .then_with(|| left.display_name().cmp(right.display_name()))
+        });
+
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        root.add_css_class("model-picker");
+
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        header.add_css_class("model-picker-header");
+        let heading = gtk::Label::new(Some("Choose a model"));
+        heading.set_xalign(0.0);
+        heading.set_hexpand(true);
+        heading.add_css_class("model-picker-heading");
+        let close = icons::icon_button(icons::Icon::X, "Close model picker");
+        close.add_css_class("model-picker-close");
+        header.append(&heading);
+        header.append(&close);
+        root.append(&header);
+
+        let search = gtk::SearchEntry::new();
+        search.update_property(&[gtk::accessible::Property::Label("Search models")]);
+        search.set_placeholder_text(Some("Search models and providers"));
+        search.add_css_class("model-picker-search");
+        root.append(&search);
+
+        let filters_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        filters_box.add_css_class("model-picker-filters");
+        let provider_heading = filter_heading("Provider");
+        filters_box.append(&provider_heading);
+        let provider_flow = gtk::FlowBox::new();
+        provider_flow.set_selection_mode(gtk::SelectionMode::None);
+        provider_flow.set_row_spacing(6);
+        provider_flow.set_column_spacing(6);
+        provider_flow.set_max_children_per_line(8);
+        filters_box.append(&provider_flow);
+
+        let context_heading = filter_heading("Context size");
+        filters_box.append(&context_heading);
+        let context_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        filters_box.append(&context_box);
+        root.append(&filters_box);
+
+        let list = gtk::ListBox::new();
+        list.set_selection_mode(gtk::SelectionMode::None);
+        list.add_css_class("model-picker-list");
+        let empty = gtk::Label::new(Some("No models match these filters."));
+        empty.add_css_class("model-picker-empty");
+        list.set_placeholder(Some(&empty));
+
+        let rows = models
+            .into_iter()
+            .map(|model| {
+                let is_selected = selected
+                    .as_ref()
+                    .is_some_and(|(provider, id)| provider == &model.provider && id == &model.id);
+                let (row, button) = model_row(&model, is_selected);
+                list.append(&row);
+                PickerRow { row, button, model }
+            })
+            .collect::<Vec<_>>();
+        let rows = Rc::new(rows);
+        let filters = Rc::new(RefCell::new(Filters::default()));
+
+        let scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .child(&list)
+            .build();
+        scroll.add_css_class("model-picker-scroll");
+        root.append(&scroll);
+
+        close.connect_clicked(move |_| on_close());
+
+        let rows_for_search = rows.clone();
+        let filters_for_search = filters.clone();
+        search.connect_search_changed(move |entry| {
+            filters_for_search.borrow_mut().query = entry.text().trim().to_ascii_lowercase();
+            apply_filters(&rows_for_search, &filters_for_search.borrow());
+        });
+
+        let mut providers = rows
+            .iter()
+            .map(|entry| icons::provider_label(&entry.model.provider))
+            .collect::<Vec<_>>();
+        providers.sort();
+        providers.dedup();
+        let all_providers = filter_button("All providers");
+        all_providers.set_active(true);
+        provider_flow.insert(&all_providers, -1);
+        wire_provider_filter(&all_providers, None, rows.clone(), filters.clone());
+        for provider in providers {
+            let button = filter_button(&provider);
+            button.set_group(Some(&all_providers));
+            provider_flow.insert(&button, -1);
+            wire_provider_filter(&button, Some(provider), rows.clone(), filters.clone());
+        }
+
+        let context_filters = [
+            ("Any size", ContextBand::Any),
+            ("≤ 128K", ContextBand::UpTo128k),
+            ("129–256K", ContextBand::UpTo256k),
+            ("257K+", ContextBand::Above256k),
+        ];
+        let mut context_group = None;
+        for (label, band) in context_filters {
+            let button = filter_button(label);
+            if let Some(group) = context_group.as_ref() {
+                button.set_group(Some(group));
+            } else {
+                button.set_active(true);
+                context_group = Some(button.clone());
+            }
+            let rows = rows.clone();
+            let filters = filters.clone();
+            button.connect_toggled(move |button| {
+                if button.is_active() {
+                    filters.borrow_mut().context = band;
+                    apply_filters(&rows, &filters.borrow());
+                }
+            });
+            context_box.append(&button);
+        }
+
+        let on_select = Rc::new(on_select);
+        for entry in rows.iter() {
+            let model = entry.model.clone();
+            let on_select = on_select.clone();
+            entry
+                .button
+                .connect_clicked(move |_| on_select(model.clone()));
+        }
+
+        Self { root, search }
+    }
+
+    pub(crate) fn widget(&self) -> &gtk::Widget {
+        self.root.upcast_ref()
+    }
+
+    pub(crate) fn focus_search(&self) {
+        self.search.grab_focus();
+    }
+}
+
+pub(crate) fn present(
     parent: &adw::ApplicationWindow,
-    mut models: Vec<ModelSummary>,
+    models: Vec<ModelSummary>,
     selected: Option<(String, String)>,
     on_select: impl Fn(ModelSummary) + 'static,
 ) {
-    models.sort_by(|left, right| {
-        icons::provider_label(&left.provider)
-            .cmp(&icons::provider_label(&right.provider))
-            .then_with(|| left.display_name().cmp(right.display_name()))
-    });
-
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    root.add_css_class("model-picker");
-
-    let header = gtk::Box::new(gtk::Orientation::Horizontal, 10);
-    header.add_css_class("model-picker-header");
-    let heading = gtk::Label::new(Some("Choose a model"));
-    heading.set_xalign(0.0);
-    heading.set_hexpand(true);
-    heading.add_css_class("model-picker-heading");
-    let close = icons::icon_button(icons::Icon::X, "Close model picker");
-    close.add_css_class("model-picker-close");
-    header.append(&heading);
-    header.append(&close);
-    root.append(&header);
-
-    let search = gtk::SearchEntry::new();
-    search.set_placeholder_text(Some("Search models and providers"));
-    search.add_css_class("model-picker-search");
-    root.append(&search);
-
-    let filters_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    filters_box.add_css_class("model-picker-filters");
-    let provider_heading = filter_heading("Provider");
-    filters_box.append(&provider_heading);
-    let provider_flow = gtk::FlowBox::new();
-    provider_flow.set_selection_mode(gtk::SelectionMode::None);
-    provider_flow.set_row_spacing(6);
-    provider_flow.set_column_spacing(6);
-    provider_flow.set_max_children_per_line(8);
-    filters_box.append(&provider_flow);
-
-    let context_heading = filter_heading("Context size");
-    filters_box.append(&context_heading);
-    let context_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    filters_box.append(&context_box);
-    root.append(&filters_box);
-
-    let list = gtk::ListBox::new();
-    list.set_selection_mode(gtk::SelectionMode::None);
-    list.add_css_class("model-picker-list");
-    let empty = gtk::Label::new(Some("No models match these filters."));
-    empty.add_css_class("model-picker-empty");
-    list.set_placeholder(Some(&empty));
-
-    let rows = models
-        .into_iter()
-        .map(|model| {
-            let is_selected = selected
-                .as_ref()
-                .is_some_and(|(provider, id)| provider == &model.provider && id == &model.id);
-            let (row, button) = model_row(&model, is_selected);
-            list.append(&row);
-            PickerRow { row, button, model }
-        })
-        .collect::<Vec<_>>();
-    let rows = Rc::new(rows);
-    let filters = Rc::new(RefCell::new(Filters::default()));
-
-    let scroll = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vexpand(true)
-        .child(&list)
-        .build();
-    scroll.add_css_class("model-picker-scroll");
-    root.append(&scroll);
-
     let dialog = adw::Dialog::builder()
         .title("Choose a model")
         .content_width(760)
         .content_height(660)
-        .child(&root)
         .build();
-    let weak_dialog = dialog.downgrade();
-    close.connect_clicked(move |_| {
-        if let Some(dialog) = weak_dialog.upgrade() {
-            dialog.close();
-        }
-    });
-
-    let rows_for_search = rows.clone();
-    let filters_for_search = filters.clone();
-    search.connect_search_changed(move |entry| {
-        filters_for_search.borrow_mut().query = entry.text().trim().to_ascii_lowercase();
-        apply_filters(&rows_for_search, &filters_for_search.borrow());
-    });
-
-    let mut providers = rows
-        .iter()
-        .map(|entry| icons::provider_label(&entry.model.provider))
-        .collect::<Vec<_>>();
-    providers.sort();
-    providers.dedup();
-    let all_providers = filter_button("All providers");
-    all_providers.set_active(true);
-    provider_flow.insert(&all_providers, -1);
-    wire_provider_filter(&all_providers, None, rows.clone(), filters.clone());
-    for provider in providers {
-        let button = filter_button(&provider);
-        button.set_group(Some(&all_providers));
-        provider_flow.insert(&button, -1);
-        wire_provider_filter(&button, Some(provider), rows.clone(), filters.clone());
-    }
-
-    let context_filters = [
-        ("Any size", ContextBand::Any),
-        ("≤ 128K", ContextBand::UpTo128k),
-        ("129–256K", ContextBand::UpTo256k),
-        ("257K+", ContextBand::Above256k),
-    ];
-    let mut context_group = None;
-    for (label, band) in context_filters {
-        let button = filter_button(label);
-        if let Some(group) = context_group.as_ref() {
-            button.set_group(Some(group));
-        } else {
-            button.set_active(true);
-            context_group = Some(button.clone());
-        }
-        let rows = rows.clone();
-        let filters = filters.clone();
-        button.connect_toggled(move |button| {
-            if button.is_active() {
-                filters.borrow_mut().context = band;
-                apply_filters(&rows, &filters.borrow());
-            }
-        });
-        context_box.append(&button);
-    }
-
-    let on_select = Rc::new(on_select);
-    for entry in rows.iter() {
-        let model = entry.model.clone();
-        let on_select = on_select.clone();
-        let weak_dialog = dialog.downgrade();
-        entry.button.connect_clicked(move |_| {
-            on_select(model.clone());
-            if let Some(dialog) = weak_dialog.upgrade() {
+    let weak_dialog_for_close = dialog.downgrade();
+    let weak_dialog_for_select = dialog.downgrade();
+    let view = ModelPickerView::new(
+        models,
+        selected,
+        move |model| {
+            on_select(model);
+            if let Some(dialog) = weak_dialog_for_select.upgrade() {
                 dialog.close();
             }
-        });
-    }
-
+        },
+        move || {
+            if let Some(dialog) = weak_dialog_for_close.upgrade() {
+                dialog.close();
+            }
+        },
+    );
+    dialog.set_child(Some(view.widget()));
     dialog.present(Some(parent));
-    search.grab_focus();
+    view.focus_search();
 }
 
 fn wire_provider_filter(

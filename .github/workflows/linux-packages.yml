@@ -1,0 +1,36 @@
+name: Linux packages
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: ${{ matrix.distro }} package
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - ubuntu
+          - fedora
+          - arch
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build package
+        run: ./packaging/build-packages.sh "${{ matrix.distro }}"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: omp-native-${{ matrix.distro }}-${{ github.ref_name }}
+          path: dist/*
+          if-no-files-found: error

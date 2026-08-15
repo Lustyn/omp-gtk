@@ -4,28 +4,28 @@ use gtk4 as gtk;
 use super::icons;
 
 #[derive(Clone)]
-pub struct ComposerWidgets {
-    pub root: gtk::Box,
-    pub input: gtk::TextView,
-    pub send: gtk::Button,
-    pub model_button: gtk::Button,
-    pub model_label: gtk::Label,
-    pub model_icon: icons::ProviderIcon,
-    pub thinking_button: gtk::Button,
-    pub thinking_label: gtk::Label,
-    pub thinking_popover: gtk::Popover,
-    pub thinking_list: gtk::Box,
-    pub completion: gtk::Popover,
-    pub completion_list: gtk::ListBox,
-    pub extension_above: gtk::Box,
-    pub extension_below: gtk::Box,
-    pub extension_status: gtk::Label,
-    pub subagent_bar: gtk::Box,
-    pub subagent_count: gtk::Label,
-    pub subagent_chips: gtk::Box,
+pub(crate) struct ComposerView {
+    root: gtk::Box,
+    input: gtk::TextView,
+    send: gtk::Button,
+    model_button: gtk::Button,
+    model_label: gtk::Label,
+    model_icon: icons::ProviderIcon,
+    thinking_button: gtk::Button,
+    thinking_label: gtk::Label,
+    thinking_popover: gtk::Popover,
+    thinking_list: gtk::Box,
+    completion: gtk::Popover,
+    completion_list: gtk::ListBox,
+    extension_above: gtk::Box,
+    extension_below: gtk::Box,
+    extension_status: gtk::Label,
+    subagent_bar: gtk::Box,
+    subagent_count: gtk::Label,
+    subagent_chips: gtk::Box,
 }
 
-pub fn build() -> ComposerWidgets {
+pub(crate) fn build() -> ComposerView {
     let composer = gtk::Box::new(gtk::Orientation::Vertical, 4);
     composer.add_css_class("composer");
 
@@ -45,6 +45,7 @@ pub fn build() -> ComposerWidgets {
     subagent_bar.append(&subagent_chips);
 
     let input = gtk::TextView::new();
+    input.update_property(&[gtk::accessible::Property::Label("Prompt")]);
     input.set_wrap_mode(gtk::WrapMode::WordChar);
     input.set_top_margin(12);
     input.set_bottom_margin(8);
@@ -183,7 +184,7 @@ pub fn build() -> ComposerWidgets {
         thinking_for_unrealize.unparent();
     });
 
-    ComposerWidgets {
+    ComposerView {
         root: composer,
         input,
         send,
@@ -202,6 +203,189 @@ pub fn build() -> ComposerWidgets {
         subagent_bar,
         subagent_count,
         subagent_chips,
+    }
+}
+
+impl ComposerView {
+    pub(crate) fn widget(&self) -> &gtk::Widget {
+        self.root.upcast_ref()
+    }
+
+    pub(crate) fn connect_changed(&self, callback: impl Fn() + 'static) {
+        self.input.buffer().connect_changed(move |_| callback());
+    }
+
+    pub(crate) fn add_key_controller(&self, controller: gtk::EventControllerKey) {
+        self.input.add_controller(controller);
+    }
+
+    pub(crate) fn connect_send_clicked(&self, callback: impl Fn() + 'static) {
+        self.send.connect_clicked(move |_| callback());
+    }
+
+    pub(crate) fn connect_model_clicked(&self, callback: impl Fn() + 'static) {
+        self.model_button.connect_clicked(move |_| callback());
+    }
+
+    pub(crate) fn connect_thinking_clicked(&self, callback: impl Fn() + 'static) {
+        self.thinking_button.connect_clicked(move |_| callback());
+    }
+
+    pub(crate) fn connect_completion_activated(&self, callback: impl Fn(i32) + 'static) {
+        self.completion_list
+            .connect_row_activated(move |_, row| callback(row.index()));
+    }
+
+    pub(crate) fn set_input_sensitive(&self, sensitive: bool) {
+        self.input.set_sensitive(sensitive);
+    }
+
+    pub(crate) fn text(&self) -> String {
+        let buffer = self.input.buffer();
+        buffer
+            .text(&buffer.start_iter(), &buffer.end_iter(), false)
+            .to_string()
+    }
+
+    pub(crate) fn set_text(&self, text: &str) {
+        self.input.buffer().set_text(text);
+    }
+
+    pub(crate) fn focus(&self) {
+        self.input.grab_focus();
+    }
+
+    pub(crate) fn set_primary_action(&self, ready: bool, running: bool) {
+        icons::set_button_icon(
+            &self.send,
+            if running {
+                icons::Icon::Square
+            } else {
+                icons::Icon::SendHorizontal
+            },
+        );
+        self.send.set_tooltip_text(Some(if running {
+            "Stop response"
+        } else {
+            "Send · Enter"
+        }));
+        self.send
+            .set_sensitive(ready && (running || !self.text().trim().is_empty()));
+    }
+
+    pub(crate) fn set_model(&self, provider: &str, display_name: &str) {
+        icons::set_provider_icon(&self.model_icon, provider);
+        self.model_label.set_text(display_name);
+        self.model_button.set_tooltip_text(Some(&format!(
+            "{display_name} · {}",
+            icons::provider_label(provider)
+        )));
+    }
+
+    pub(crate) fn set_model_provider(&self, provider: &str) {
+        icons::set_provider_icon(&self.model_icon, provider);
+    }
+
+    pub(crate) fn set_model_sensitive(&self, sensitive: bool) {
+        self.model_button.set_sensitive(sensitive);
+    }
+
+    pub(crate) fn show_thinking_popover(&self) {
+        self.thinking_popover.popup();
+    }
+
+    pub(crate) fn clear_thinking_options(&self) {
+        while let Some(child) = self.thinking_list.first_child() {
+            self.thinking_list.remove(&child);
+        }
+    }
+
+    pub(crate) fn append_thinking_option(&self, option: &gtk::Button) {
+        self.thinking_list.append(option);
+    }
+
+    pub(crate) fn set_thinking_sensitive(&self, sensitive: bool) {
+        self.thinking_button.set_sensitive(sensitive);
+    }
+
+    pub(crate) fn set_thinking_label(&self, label: &str) {
+        self.thinking_label.set_text(label);
+    }
+
+    pub(crate) fn close_thinking_popover(&self) {
+        self.thinking_popover.popdown();
+    }
+
+    pub(crate) fn clear_completion_rows(&self) {
+        while let Some(child) = self.completion_list.first_child() {
+            self.completion_list.remove(&child);
+        }
+    }
+
+    pub(crate) fn append_completion_row(&self, row: &gtk::ListBoxRow) {
+        self.completion_list.append(row);
+    }
+
+    pub(crate) fn select_completion(&self, index: i32) -> bool {
+        let Some(row) = self.completion_list.row_at_index(index) else {
+            return false;
+        };
+        self.completion_list.select_row(Some(&row));
+        true
+    }
+
+    pub(crate) fn completions_visible(&self) -> bool {
+        self.completion.is_visible()
+    }
+    pub(crate) fn show_completions(&self) {
+        if let Some(parent) = self.completion.parent() {
+            self.completion.set_width_request(parent.width());
+        }
+        self.completion.popup();
+    }
+
+    pub(crate) fn hide_completions(&self) {
+        self.completion.popdown();
+    }
+
+    pub(crate) fn clear_subagent_chips(&self) {
+        while let Some(child) = self.subagent_chips.first_child() {
+            self.subagent_chips.remove(&child);
+        }
+    }
+
+    pub(crate) fn append_subagent_chip(&self, chip: &gtk::Button) {
+        self.subagent_chips.append(chip);
+    }
+
+    pub(crate) fn set_subagents_visible(&self, visible: bool) {
+        self.subagent_bar.set_visible(visible);
+    }
+
+    pub(crate) fn set_subagent_count(&self, text: &str) {
+        self.subagent_count.set_text(text);
+    }
+
+    pub(crate) fn set_extension_status(&self, text: &str) {
+        self.extension_status.set_text(text);
+        self.extension_status.set_visible(!text.is_empty());
+    }
+
+    pub(crate) fn remove_extension_widget(&self, label: &gtk::Label) {
+        if let Some(parent) = label.parent().and_downcast::<gtk::Box>() {
+            parent.remove(label);
+            parent.set_visible(parent.first_child().is_some());
+        }
+    }
+
+    pub(crate) fn append_extension_widget(&self, label: &gtk::Label, below_editor: bool) {
+        let container = if below_editor {
+            &self.extension_below
+        } else {
+            &self.extension_above
+        };
+        container.append(label);
+        container.set_visible(true);
     }
 }
 

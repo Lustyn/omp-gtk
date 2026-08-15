@@ -28,138 +28,60 @@ OMP_BIN=/path/to/omp target/debug/omp-native
 
 Close any existing `omp-native` windows before launching a separate test process. `dev.omp.Native` is a single-instance GTK application, so a second invocation can activate the existing process and exit immediately.
 
-## Python helper functions
+## Component gallery
 
-Start `/usr/bin/python3` or an IPython kernel and load these helpers once. A persistent kernel can reuse them in later cells.
+Use the native component gallery when work does not require a live OMP session. Stories render the production GTK components, icons, and stylesheet with deterministic fixture data.
 
-```python
-from pathlib import Path
-import subprocess
-import time
-
-import pyatspi
-
-APP_NAME = "omp-native"
-
-
-def descendants(root):
-    """Yield root and every currently reachable AT-SPI descendant."""
-    stack = [root]
-    while stack:
-        node = stack.pop()
-        yield node
-        try:
-            children = [node[index] for index in range(node.childCount)]
-        except Exception:
-            # The GTK tree can change while a dialog opens or a row disappears.
-            children = []
-        stack.extend(reversed(children))
-
-
-def wait_for(probe, timeout=5.0, interval=0.05):
-    """Return the first truthy probe result, or raise after timeout."""
-    deadline = time.monotonic() + timeout
-    last_error = None
-    while time.monotonic() < deadline:
-        try:
-            result = probe()
-            if result:
-                return result
-        except Exception as error:
-            last_error = error
-        time.sleep(interval)
-    detail = f": {last_error}" if last_error else ""
-    raise TimeoutError(f"UI condition was not met within {timeout:.1f}s{detail}")
-
-
-def application(timeout=10.0):
-    """Wait for and return the omp-native AT-SPI application node."""
-    desktop = pyatspi.Registry.getDesktop(0)
-    return wait_for(
-        lambda: next((app for app in desktop if app.name == APP_NAME), None),
-        timeout=timeout,
-    )
-
-
-def find_node(*, root=None, role=None, name=None, contains=None, showing=True, timeout=5.0):
-    """Wait for one accessible node matching role and accessible name."""
-    search_root = root or application(timeout=timeout)
-
-    def probe():
-        for node in descendants(search_root):
-            try:
-                node_name = node.name or ""
-                if role is not None and node.getRoleName() != role:
-                    continue
-                if name is not None and node_name != name:
-                    continue
-                if contains is not None and contains not in node_name:
-                    continue
-                if showing and not node.getState().contains(pyatspi.STATE_SHOWING):
-                    continue
-                return node
-            except Exception:
-                # A stale node is normal while GTK replaces a popover or list.
-                continue
-        return None
-
-    return wait_for(probe, timeout=timeout)
-
-
-def click(node):
-    """Invoke a node's accessible click action."""
-    actions = node.queryAction()
-    for index in range(actions.nActions):
-        if actions.getName(index) == "click":
-            if not actions.doAction(index):
-                raise RuntimeError(f"AT-SPI click was rejected for {node.name!r}")
-            return
-    available = [actions.getName(index) for index in range(actions.nActions)]
-    raise RuntimeError(f"No click action for {node.getRoleName()} {node.name!r}; actions={available}")
-
-
-def replace_text(node, text):
-    """Replace the contents of an editable entry or GTK text view."""
-    if not node.queryEditableText().setTextContents(text):
-        raise RuntimeError(f"AT-SPI text replacement was rejected for {node.name!r}")
-
-
-def visible_names(root=None, role=None):
-    """Return accessible names for currently visible nodes, useful for assertions."""
-    search_root = root or application()
-    result = []
-    for node in descendants(search_root):
-        try:
-            if role is not None and node.getRoleName() != role:
-                continue
-            if node.name and node.getState().contains(pyatspi.STATE_SHOWING):
-                result.append(node.name)
-        except Exception:
-            continue
-    return result
-
-
-def screenshot(filename, directory=Path("artifacts/screenshots")):
-    """Capture the active window with Spectacle and return the saved path."""
-    directory.mkdir(parents=True, exist_ok=True)
-    destination = (directory / filename).resolve()
-    subprocess.run(
-        [
-            "spectacle",
-            "--activewindow",
-            "--background",
-            "--nonotify",
-            "--output",
-            str(destination),
-        ],
-        check=True,
-    )
-    if not destination.is_file():
-        raise RuntimeError(f"Spectacle did not create {destination}")
-    return destination
+```bash
+cargo build --features ui-stories --bin ui-gallery
+target/debug/ui-gallery --list
+target/debug/ui-gallery --story composer/running
 ```
 
-Run Python from the repository root if screenshots should be written beneath `artifacts/screenshots/`. Generated screenshots are verification artifacts; add only intentional reference images to Git.
+The gallery uses the separate `dev.omp.Native.UiGallery` application ID and does not start `omp --mode rpc-ui`. Direct stories print `UI_STORY_READY <story-id>` after their window is mapped. `--snapshot <path>` renders the component itself through GSK and exits; the story canvas chrome is not included.
+
+The automation wrapper builds the gallery and can inspect a visible story through AT-SPI:
+
+```bash
+/usr/bin/python3 tools/ui_story.py list
+/usr/bin/python3 tools/ui_story.py inspect tool-card/error
+```
+
+Capture is headless by default. The wrapper starts an isolated GTK Broadway display in the background, renders the requested component to a PNG, and terminates both processes. It does not open or focus a desktop window and does not use Spectacle:
+
+```bash
+/usr/bin/python3 tools/ui_story.py capture composer/running \
+  --output artifacts/screenshots/composer-running.png
+```
+
+Pass `--visible` only when the compositor-rendered window itself is under review. Visible capture uses the existing AT-SPI readiness check and Spectacle workflow:
+
+```bash
+/usr/bin/python3 tools/ui_story.py capture composer/running \
+  --visible --output artifacts/screenshots/composer-running-visible.png
+```
+
+Prefer a component story while changing layout, styling, empty states, loading states, errors, or long-content behavior. Use the production application only for bridge integration and end-to-end flows.
+
+## Python helper functions
+
+Reusable helpers live in `tools/ui_automation.py`. Run Python from the repository root:
+
+```python
+from tools.ui_automation import (
+    application,
+    click,
+    descendants,
+    find_node,
+    replace_text,
+    screenshot,
+    visible_names,
+    wait_for,
+)
+```
+
+The helpers accept an `app_name` argument when automation targets an application other than `omp-native`. Generated screenshots are verification artifacts; add only intentional reference images to Git.
+
 
 ## Inspect the accessible tree
 
@@ -190,7 +112,7 @@ model_button = find_node(root=app, role="button", contains="GPT-5.6")
 click(model_button)
 
 dialog = find_node(root=app, role="dialog", name="Choose a model")
-search = find_node(root=dialog, role="entry", name="")
+search = find_node(root=dialog, role="entry", name="Search models")
 replace_text(search, "claude")
 
 models = visible_names(dialog, role="button")
@@ -227,7 +149,7 @@ GTK exposes the multiline composer as a `text` role. Use `queryEditableText()` f
 
 ```python
 app = application()
-composer = find_node(root=app, role="text", name="")
+composer = find_node(root=app, role="text", name="Prompt")
 replace_text(composer, "Summarize the current project structure")
 
 send = find_node(root=app, role="button", contains="Send")

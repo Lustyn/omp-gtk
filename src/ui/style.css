@@ -914,3 +914,36 @@ popover.thinking-popover > contents {
     padding: 36px;
     color: #7d8794;
 }
+
+.story-browser,
+.story-canvas {
+    background: #0b0d10;
+}
+
+.story-sidebar {
+    border-right: 1px solid #282c34;
+    background: #111318;
+}
+
+.story-list,
+.story-list row {
+    background: transparent;
+}
+
+.story-list row:hover,
+.story-list row:selected {
+    background: #242832;
+}
+
+.story-canvas-heading {
+    padding: 10px 14px;
+    border-bottom: 1px solid #22262d;
+    color: #9299a6;
+    font-family: monospace;
+    font-size: 11px;
+}
+
+.story-frame {
+    margin: 18px;
+    background: #0b0d10;
+}
