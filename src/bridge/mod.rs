@@ -14,7 +14,7 @@ use std::time::Duration;
 use async_channel::{Receiver, Sender};
 use serde_json::{Map, Value, json};
 
-use self::protocol::{RpcEvent, RpcFrameDecoder, decode_event};
+use self::protocol::{InterruptMode, QueueMode, RpcEvent, RpcFrameDecoder, decode_event};
 use crate::commands::unsupported_native_mode_error;
 
 #[derive(Clone)]
@@ -35,11 +35,33 @@ impl BridgeClient {
         Ok(())
     }
 
-    pub fn prompt(&self, message: &str) -> Result<(), BridgeError> {
+    pub fn prompt(&self, message: &str) -> Result<String, BridgeError> {
         if let Some(error) = unsupported_native_mode_error(message) {
             return Err(BridgeError(error));
         }
-        self.request("prompt", json!({ "message": message }))?;
+        self.request("prompt", json!({ "message": message }))
+    }
+
+    pub fn steer(&self, message: &str) -> Result<String, BridgeError> {
+        self.request("steer", json!({ "message": message }))
+    }
+
+    pub fn follow_up(&self, message: &str) -> Result<String, BridgeError> {
+        self.request("follow_up", json!({ "message": message }))
+    }
+
+    pub fn set_steering_mode(&self, mode: QueueMode) -> Result<(), BridgeError> {
+        self.request("set_steering_mode", json!({ "mode": mode.as_str() }))?;
+        Ok(())
+    }
+
+    pub fn set_follow_up_mode(&self, mode: QueueMode) -> Result<(), BridgeError> {
+        self.request("set_follow_up_mode", json!({ "mode": mode.as_str() }))?;
+        Ok(())
+    }
+
+    pub fn set_interrupt_mode(&self, mode: InterruptMode) -> Result<(), BridgeError> {
+        self.request("set_interrupt_mode", json!({ "mode": mode.as_str() }))?;
         Ok(())
     }
 
@@ -88,7 +110,7 @@ impl BridgeClient {
                 "workspace path cannot contain a line break".to_owned(),
             ));
         }
-        self.prompt(&format!("/move {path}"))
+        self.prompt(&format!("/move {path}")).map(|_| ())
     }
 
     pub fn get_subagent_messages(&self, subagent_id: &str) -> Result<(), BridgeError> {
@@ -403,6 +425,7 @@ impl std::error::Error for BridgeError {}
 #[cfg(test)]
 mod tests {
     use super::{BridgeClient, WriterMessage, resolve_omp_executable};
+    use crate::bridge::protocol::{InterruptMode, QueueMode};
     use crate::commands::unsupported_native_mode_error;
     use serde_json::Value;
     use std::ffi::OsStr;
@@ -463,6 +486,49 @@ mod tests {
         );
 
         assert_eq!(resolved, Path::new(expected));
+    }
+
+    #[test]
+    fn emits_typed_running_turn_and_queue_mode_requests() {
+        let (writer, receiver) = mpsc::channel();
+        let client = BridgeClient {
+            writer,
+            next_request_id: Arc::new(AtomicU64::new(1)),
+        };
+
+        client.steer("adjust course").expect("queue steer request");
+        client
+            .follow_up("verify afterward")
+            .expect("queue follow-up request");
+        client
+            .set_steering_mode(QueueMode::All)
+            .expect("queue steering mode request");
+        client
+            .set_follow_up_mode(QueueMode::OneAtATime)
+            .expect("queue follow-up mode request");
+        client
+            .set_interrupt_mode(InterruptMode::Wait)
+            .expect("queue interrupt mode request");
+
+        let frames = (0..5)
+            .map(|_| {
+                let WriterMessage::Frame(frame) = receiver.recv().expect("receive RPC request")
+                else {
+                    panic!("expected RPC frame");
+                };
+                serde_json::from_str::<Value>(&frame).expect("decode RPC request")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(frames[0]["type"], "steer");
+        assert_eq!(frames[0]["message"], "adjust course");
+        assert_eq!(frames[1]["type"], "follow_up");
+        assert_eq!(frames[1]["message"], "verify afterward");
+        assert_eq!(frames[2]["type"], "set_steering_mode");
+        assert_eq!(frames[2]["mode"], "all");
+        assert_eq!(frames[3]["type"], "set_follow_up_mode");
+        assert_eq!(frames[3]["mode"], "one-at-a-time");
+        assert_eq!(frames[4]["type"], "set_interrupt_mode");
+        assert_eq!(frames[4]["mode"], "wait");
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::fmt;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const MAX_REASSEMBLED_BYTES: usize = 64 * 1024 * 1024;
@@ -66,6 +66,40 @@ pub struct ContextUsage {
     pub percent: f64,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum QueueMode {
+    All,
+    #[default]
+    OneAtATime,
+}
+
+impl QueueMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::OneAtATime => "one-at-a-time",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum InterruptMode {
+    #[default]
+    Immediate,
+    Wait,
+}
+
+impl InterruptMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Immediate => "immediate",
+            Self::Wait => "wait",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionState {
@@ -79,11 +113,20 @@ pub struct SessionState {
     pub is_compacting: bool,
     pub tokens_per_second: Option<f64>,
     pub context_usage: Option<ContextUsage>,
+    #[serde(default)]
+    pub steering_mode: QueueMode,
+    #[serde(default)]
+    pub follow_up_mode: QueueMode,
+    #[serde(default)]
+    pub interrupt_mode: InterruptMode,
+    #[serde(default)]
+    pub queued_message_count: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct RpcResponse {
     pub command: String,
+    pub id: Option<String>,
     pub success: bool,
     pub data: Option<Value>,
     pub error: Option<String>,
@@ -164,6 +207,7 @@ pub fn decode_event(value: Value) -> RpcEvent {
     match kind {
         "ready" => RpcEvent::Ready,
         "response" => RpcEvent::Response(RpcResponse {
+            id: string_field(&value, "id"),
             command: string_field(&value, "command").unwrap_or_default(),
             success: value
                 .get("success")

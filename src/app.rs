@@ -17,9 +17,9 @@ use libadwaita as adw;
 use serde_json::{Value, json};
 
 use crate::bridge::protocol::{
-    ModelSummary, RpcEvent, RpcResponse, SessionState, SlashCommand, SubagentUpdate,
-    SubagentUpdateKind, ToolEnd, ToolStart, ToolUpdate, message_cost, message_role, message_text,
-    message_thinking, message_tool_calls, tool_result_parts,
+    InterruptMode, ModelSummary, QueueMode, RpcEvent, RpcResponse, SessionState, SlashCommand,
+    SubagentUpdate, SubagentUpdateKind, ToolEnd, ToolStart, ToolUpdate, message_cost,
+    message_role, message_text, message_thinking, message_tool_calls, tool_result_parts,
 };
 use crate::bridge::{BridgeClient, OmpBridge};
 use crate::commands::{CommandCompletion, completions};
@@ -69,6 +69,7 @@ pub(crate) fn build(app: &adw::Application) {
         completion_index: Cell::new(0),
         pending_user_messages: RefCell::new(VecDeque::new()),
         streaming_message: RefCell::new(None),
+        pending_submission: RefCell::new(None),
         streaming_thinking: RefCell::new(None),
         tool_cards: RefCell::new(HashMap::new()),
         subagents: RefCell::new(HashMap::new()),
@@ -86,6 +87,12 @@ pub(crate) fn build(app: &adw::Application) {
         current_model: RefCell::new(None),
         ready: Cell::new(false),
         running: Cell::new(false),
+        running_turn_action: Cell::new(RunningTurnAction::Steer),
+        steering_mode: Cell::new(QueueMode::OneAtATime),
+        follow_up_mode: Cell::new(QueueMode::OneAtATime),
+        interrupt_mode: Cell::new(InterruptMode::Immediate),
+        queued_message_count: Cell::new(0),
+        reconciling_queue_state: Cell::new(false),
         goal_completion_calls: RefCell::new(HashSet::new()),
         goal_completed_this_run: Cell::new(false),
         window_status: Cell::new(WindowStatus::Ready),
@@ -116,6 +123,59 @@ struct StreamingMessage {
     body: MessageBody,
     text: String,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunningTurnAction {
+    Steer,
+    FollowUp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmissionAction {
+    Prompt,
+    Steer,
+    FollowUp,
+}
+
+impl SubmissionAction {
+    fn select(running: bool, running_turn_action: RunningTurnAction) -> Self {
+        if !running {
+            return Self::Prompt;
+        }
+        match running_turn_action {
+            RunningTurnAction::Steer => Self::Steer,
+            RunningTurnAction::FollowUp => Self::FollowUp,
+        }
+    }
+}
+
+struct PendingSubmission {
+    request_id: String,
+    draft: String,
+    message: String,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReconciledComposerState {
+    running_turn_action: RunningTurnAction,
+    steering_mode: QueueMode,
+    follow_up_mode: QueueMode,
+    interrupt_mode: InterruptMode,
+    queued_message_count: usize,
+}
+
+fn reconcile_composer_state(
+    running_turn_action: RunningTurnAction,
+    state: &SessionState,
+) -> ReconciledComposerState {
+    ReconciledComposerState {
+        running_turn_action,
+        steering_mode: state.steering_mode,
+        follow_up_mode: state.follow_up_mode,
+        interrupt_mode: state.interrupt_mode,
+        queued_message_count: state.queued_message_count,
+    }
+}
+
+
 
 #[derive(Clone)]
 struct SubagentState {
@@ -138,6 +198,7 @@ struct AppController {
     completion_items: RefCell<Vec<CommandCompletion>>,
     completion_index: Cell<usize>,
     pending_user_messages: RefCell<VecDeque<String>>,
+    pending_submission: RefCell<Option<PendingSubmission>>,
     streaming_message: RefCell<Option<StreamingMessage>>,
     streaming_thinking: RefCell<Option<ThinkingBlock>>,
     tool_cards: RefCell<HashMap<String, ToolCard>>,
@@ -156,6 +217,12 @@ struct AppController {
     current_model: RefCell<Option<(String, String)>>,
     ready: Cell<bool>,
     running: Cell<bool>,
+    running_turn_action: Cell<RunningTurnAction>,
+    steering_mode: Cell<QueueMode>,
+    follow_up_mode: Cell<QueueMode>,
+    interrupt_mode: Cell<InterruptMode>,
+    queued_message_count: Cell<usize>,
+    reconciling_queue_state: Cell<bool>,
     goal_completion_calls: RefCell<HashSet<String>>,
     goal_completed_this_run: Cell<bool>,
     window_status: Cell<WindowStatus>,
@@ -229,9 +296,61 @@ impl AppController {
         let weak = Rc::downgrade(self);
         self.ui.composer.connect_send_clicked(move || {
             if let Some(controller) = weak.upgrade() {
-                controller.activate_primary_action();
+                controller.submit_current();
             }
         });
+
+        let weak = Rc::downgrade(self);
+        self.ui.composer.connect_stop_clicked(move || {
+            if let Some(controller) = weak.upgrade() {
+                controller.stop_current_turn();
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.ui.composer.connect_steer_selected(move || {
+            if let Some(controller) = weak.upgrade() {
+                controller
+                    .running_turn_action
+                    .set(RunningTurnAction::Steer);
+                controller.update_send_state();
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.ui.composer.connect_follow_up_selected(move || {
+            if let Some(controller) = weak.upgrade() {
+                controller
+                    .running_turn_action
+                    .set(RunningTurnAction::FollowUp);
+                controller.update_send_state();
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.ui.composer.connect_steering_mode_changed(move |mode| {
+            if let Some(controller) = weak.upgrade() {
+                controller.request_steering_mode(mode);
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        self.ui
+            .composer
+            .connect_follow_up_mode_changed(move |mode| {
+                if let Some(controller) = weak.upgrade() {
+                    controller.request_follow_up_mode(mode);
+                }
+            });
+
+        let weak = Rc::downgrade(self);
+        self.ui
+            .composer
+            .connect_interrupt_mode_changed(move |mode| {
+                if let Some(controller) = weak.upgrade() {
+                    controller.request_interrupt_mode(mode);
+                }
+            });
 
         let weak = Rc::downgrade(self);
         self.ui.new_chat_button.connect_clicked(move |_| {
@@ -461,6 +580,7 @@ impl AppController {
                 self.ui.chat_status.disconnected();
                 self.ui.composer.set_input_sensitive(false);
                 self.update_send_state();
+                self.pending_submission.borrow_mut().take();
                 self.show_error(&message);
             }
             RpcEvent::Other => {}
@@ -468,12 +588,18 @@ impl AppController {
     }
 
     fn handle_response(self: &Rc<Self>, response: RpcResponse) {
+        if matches!(response.command.as_str(), "prompt" | "steer" | "follow_up") {
+            self.finish_submission(&response);
+        }
         if !response.success {
-            if response.command == "prompt" {
-                self.pending_user_messages.borrow_mut().pop_front();
-            }
             if response.command == "new_session" {
                 self.pending_delete.borrow_mut().take();
+            }
+            if matches!(
+                response.command.as_str(),
+                "set_steering_mode" | "set_follow_up_mode" | "set_interrupt_mode"
+            ) {
+                self.render_authoritative_queue_state();
             }
             self.show_error(
                 response
@@ -482,6 +608,13 @@ impl AppController {
                     .unwrap_or("omp rejected the request"),
             );
             return;
+        }
+        if matches!(
+            response.command.as_str(),
+            "set_steering_mode" | "set_follow_up_mode" | "set_interrupt_mode"
+        ) && let Some(client) = &self.client
+        {
+            let _ = client.refresh_state();
         }
         let Some(data) = response.data else {
             if response.command == "new_session" {
@@ -563,6 +696,48 @@ impl AppController {
             _ => {}
         }
     }
+    fn finish_submission(&self, response: &RpcResponse) {
+        let matches_pending = self
+            .pending_submission
+            .borrow()
+            .as_ref()
+            .is_some_and(|pending| {
+                response
+                    .id
+                    .as_deref()
+                    .map_or(true, |id| id == pending.request_id)
+            });
+        if !matches_pending {
+            return;
+        }
+        let pending = self
+            .pending_submission
+            .borrow_mut()
+            .take()
+            .expect("matched pending submission exists");
+        if response.success {
+            self.goal_completed_this_run.set(false);
+            self.goal_completion_calls.borrow_mut().clear();
+            self.record_prompt_sound();
+            self.set_window_status(WindowStatus::Working);
+            self.remove_empty_state();
+            self.ui
+                .conversation
+                .append_message(MessageRole::User, &pending.message);
+            self.pending_user_messages
+                .borrow_mut()
+                .push_back(pending.message);
+            if self.ui.composer.text() == pending.draft {
+                self.ui.composer.set_text("");
+            }
+            self.hide_completions();
+            self.scroll_to_bottom();
+            if let Some(client) = &self.client {
+                let _ = client.refresh_state();
+            }
+        }
+        self.update_send_state();
+    }
 
     fn refresh_after_new_session(self: &Rc<Self>) {
         if let Some(path) = self.pending_delete.borrow_mut().take() {
@@ -603,6 +778,15 @@ impl AppController {
         self.ready.set(true);
         self.running.set(state.is_streaming);
         self.ui.composer.set_input_sensitive(true);
+        let composer_state = reconcile_composer_state(self.running_turn_action.get(), &state);
+        self.running_turn_action
+            .set(composer_state.running_turn_action);
+        self.steering_mode.set(composer_state.steering_mode);
+        self.follow_up_mode.set(composer_state.follow_up_mode);
+        self.interrupt_mode.set(composer_state.interrupt_mode);
+        self.queued_message_count
+            .set(composer_state.queued_message_count);
+        self.render_authoritative_queue_state();
 
         let session_file = state.session_file.as_deref().map(PathBuf::from);
         let disk_title = session_file
@@ -1617,16 +1801,15 @@ impl AppController {
         }
     }
 
-    fn activate_primary_action(&self) {
-        if self.running.get() {
-            if let Some(client) = &self.client {
-                match client.abort() {
-                    Ok(()) => self.ui.chat_status.activity("Stopping"),
-                    Err(error) => self.show_error(&error.to_string()),
-                }
+    fn stop_current_turn(&self) {
+        if !self.running.get() {
+            return;
+        }
+        if let Some(client) = &self.client {
+            match client.abort() {
+                Ok(()) => self.ui.chat_status.activity("Stopping"),
+                Err(error) => self.show_error(&error.to_string()),
             }
-        } else {
-            self.submit_current();
         }
     }
 
@@ -1653,39 +1836,103 @@ impl AppController {
     }
 
     fn submit_current(&self) {
-        if !self.ready.get() {
+        if !self.ready.get() || self.pending_submission.borrow().is_some() {
             return;
         }
-        let text = self.ui.composer.text().trim().to_owned();
-        if text.is_empty() {
+        let draft = self.ui.composer.text();
+        let message = draft.trim().to_owned();
+        if message.is_empty() {
             return;
         }
         let Some(client) = &self.client else {
             return;
         };
-        match client.prompt(&text) {
-            Ok(()) => {
-                self.goal_completed_this_run.set(false);
-                self.goal_completion_calls.borrow_mut().clear();
-                self.record_prompt_sound();
-                self.set_window_status(WindowStatus::Working);
-                self.remove_empty_state();
-                self.ui
-                    .conversation
-                    .append_message(MessageRole::User, &text);
-                self.pending_user_messages.borrow_mut().push_back(text);
-                self.ui.composer.set_text("");
-                self.hide_completions();
-                self.scroll_to_bottom();
+        let action = SubmissionAction::select(self.running.get(), self.running_turn_action.get());
+        let request = match action {
+            SubmissionAction::Prompt => client.prompt(&message),
+            SubmissionAction::Steer => client.steer(&message),
+            SubmissionAction::FollowUp => client.follow_up(&message),
+        };
+        match request {
+            Ok(request_id) => {
+                self.pending_submission.replace(Some(PendingSubmission {
+                    request_id,
+                    draft,
+                    message,
+                }));
+                self.update_send_state();
             }
             Err(error) => self.show_error(&error.to_string()),
         }
     }
 
+    fn request_steering_mode(&self, mode: QueueMode) {
+        if self.reconciling_queue_state.get() || mode == self.steering_mode.get() {
+            return;
+        }
+        let result = self
+            .client
+            .as_ref()
+            .ok_or_else(|| "omp is disconnected".to_owned())
+            .and_then(|client| client.set_steering_mode(mode).map_err(|error| error.to_string()));
+        if let Err(error) = result {
+            self.render_authoritative_queue_state();
+            self.show_error(&error);
+        }
+    }
+
+    fn request_follow_up_mode(&self, mode: QueueMode) {
+        if self.reconciling_queue_state.get() || mode == self.follow_up_mode.get() {
+            return;
+        }
+        let result = self
+            .client
+            .as_ref()
+            .ok_or_else(|| "omp is disconnected".to_owned())
+            .and_then(|client| client.set_follow_up_mode(mode).map_err(|error| error.to_string()));
+        if let Err(error) = result {
+            self.render_authoritative_queue_state();
+            self.show_error(&error);
+        }
+    }
+
+    fn request_interrupt_mode(&self, mode: InterruptMode) {
+        if self.reconciling_queue_state.get() || mode == self.interrupt_mode.get() {
+            return;
+        }
+        let result = self
+            .client
+            .as_ref()
+            .ok_or_else(|| "omp is disconnected".to_owned())
+            .and_then(|client| client.set_interrupt_mode(mode).map_err(|error| error.to_string()));
+        if let Err(error) = result {
+            self.render_authoritative_queue_state();
+            self.show_error(&error);
+        }
+    }
+
+    fn render_authoritative_queue_state(&self) {
+        self.reconciling_queue_state.set(true);
+        self.ui.composer.set_queue_state(
+            self.steering_mode.get(),
+            self.follow_up_mode.get(),
+            self.interrupt_mode.get(),
+            self.queued_message_count.get(),
+        );
+        self.reconciling_queue_state.set(false);
+    }
+
     fn update_send_state(&self) {
         let ready = self.ready.get();
         let running = self.running.get();
+        self.ui.composer.set_running_turn_action(matches!(
+            self.running_turn_action.get(),
+            RunningTurnAction::Steer
+        ));
         self.ui.composer.set_primary_action(ready, running);
+        self.ui
+            .composer
+            .set_submission_pending(self.pending_submission.borrow().is_some());
         self.ui
             .telemetry
             .cwd_button
@@ -2306,12 +2553,56 @@ fn enter_inserts_newline(modifiers: gdk::ModifierType) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{enter_inserts_newline, gdk};
+    use super::{
+        RunningTurnAction, SubmissionAction, enter_inserts_newline, gdk,
+        reconcile_composer_state,
+    };
+    use crate::bridge::protocol::{InterruptMode, QueueMode, SessionState};
+    use serde_json::json;
 
     #[test]
     fn ctrl_or_shift_enter_inserts_newline_while_plain_enter_submits() {
         assert!(enter_inserts_newline(gdk::ModifierType::CONTROL_MASK));
         assert!(enter_inserts_newline(gdk::ModifierType::SHIFT_MASK));
         assert!(!enter_inserts_newline(gdk::ModifierType::empty()));
+    }
+
+    #[test]
+    fn submission_action_never_maps_running_text_to_abort() {
+        assert_eq!(
+            SubmissionAction::select(false, RunningTurnAction::FollowUp),
+            SubmissionAction::Prompt
+        );
+        assert_eq!(
+            SubmissionAction::select(true, RunningTurnAction::Steer),
+            SubmissionAction::Steer
+        );
+        assert_eq!(
+            SubmissionAction::select(true, RunningTurnAction::FollowUp),
+            SubmissionAction::FollowUp
+        );
+    }
+
+    #[test]
+    fn state_refresh_reconciles_queue_settings_without_resetting_running_action() {
+        let state: SessionState = serde_json::from_value(json!({
+            "isStreaming": true,
+            "steeringMode": "all",
+            "followUpMode": "one-at-a-time",
+            "interruptMode": "wait",
+            "queuedMessageCount": 3
+        }))
+        .expect("deserialize session state");
+
+        let reconciled = reconcile_composer_state(RunningTurnAction::FollowUp, &state);
+
+        assert_eq!(
+            reconciled.running_turn_action,
+            RunningTurnAction::FollowUp
+        );
+        assert_eq!(reconciled.steering_mode, QueueMode::All);
+        assert_eq!(reconciled.follow_up_mode, QueueMode::OneAtATime);
+        assert_eq!(reconciled.interrupt_mode, InterruptMode::Wait);
+        assert_eq!(reconciled.queued_message_count, 3);
     }
 }

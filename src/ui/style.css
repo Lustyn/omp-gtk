@@ -184,6 +184,26 @@ paned > separator {
     color: #eef1f5;
 }
 
+.queue-count {
+    color: #aeb6c2;
+    font-size: 11px;
+    padding: 0 4px;
+}
+
+.stop-button {
+    min-width: 34px;
+    min-height: 34px;
+    padding: 0;
+    border-radius: 50%;
+    color: #f0b5b5;
+    background: #372529;
+}
+
+.stop-button:hover {
+    color: #ffffff;
+    background: #71343d;
+}
+
 .extension-status {
     color: #8793a3;
     font-size: 11px;

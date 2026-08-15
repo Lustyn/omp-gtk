@@ -11,7 +11,7 @@ use super::conversation::ConversationView;
 use super::model_picker::ModelPickerView;
 use super::tool_components::ToolCard;
 use super::{composer, sidebar};
-use crate::bridge::protocol::{ModelSummary, ModelThinking};
+use crate::bridge::protocol::{InterruptMode, ModelSummary, ModelThinking, QueueMode};
 use crate::session_catalog::SessionEntry;
 
 #[derive(Clone, Copy)]
@@ -31,7 +31,7 @@ pub(crate) fn find(id: &str) -> Option<Story> {
     STORIES.iter().copied().find(|story| story.id == id)
 }
 
-const STORIES: [Story; 15] = [
+const STORIES: [Story; 18] = [
     Story {
         id: "header/ready",
         title: "Header · Ready",
@@ -82,11 +82,32 @@ const STORIES: [Story; 15] = [
         build: composer_ready,
     },
     Story {
-        id: "composer/running",
-        title: "Composer · Running with agents",
+        id: "composer/running-empty",
+        title: "Composer · Running, empty draft",
+        width: 900,
+        height: 190,
+        build: composer_running_empty,
+    },
+    Story {
+        id: "composer/running-draft",
+        title: "Composer · Running with draft",
         width: 900,
         height: 220,
-        build: composer_running,
+        build: composer_running_draft,
+    },
+    Story {
+        id: "composer/queued",
+        title: "Composer · Queued messages",
+        width: 900,
+        height: 220,
+        build: composer_queued,
+    },
+    Story {
+        id: "composer/disconnected",
+        title: "Composer · Disconnected",
+        width: 900,
+        height: 180,
+        build: composer_disconnected,
     },
     Story {
         id: "model-picker/default",
@@ -256,18 +277,62 @@ fn composer_ready() -> gtk::Widget {
     view.widget().clone()
 }
 
-fn composer_running() -> gtk::Widget {
+fn composer_running_empty() -> gtk::Widget {
     let view = composer::build();
     view.set_input_sensitive(true);
     view.set_model("anthropic", "Claude Opus 4.6");
     view.set_thinking_sensitive(true);
     view.set_thinking_label("High");
-    view.set_text("Implement the native UI gallery");
+    view.set_running_turn_action(true);
+    view.set_queue_state(
+        QueueMode::OneAtATime,
+        QueueMode::OneAtATime,
+        InterruptMode::Immediate,
+        0,
+    );
+    view.set_primary_action(true, true);
+    view.widget().clone()
+}
+
+fn composer_running_draft() -> gtk::Widget {
+    let view = composer::build();
+    view.set_input_sensitive(true);
+    view.set_model("anthropic", "Claude Opus 4.6");
+    view.set_thinking_sensitive(true);
+    view.set_thinking_label("High");
+    view.set_text("Run the accessibility review after this turn");
+    view.set_running_turn_action(false);
     view.append_subagent_chip(&composer::subagent_chip("Designer", "Working", true));
     view.append_subagent_chip(&composer::subagent_chip("Reviewer", "Done", false));
     view.set_subagent_count("1 active · 2 total");
     view.set_subagents_visible(true);
     view.set_primary_action(true, true);
+    view.widget().clone()
+}
+
+fn composer_queued() -> gtk::Widget {
+    let view = composer::build();
+    view.set_input_sensitive(true);
+    view.set_model("openai-codex", "GPT-5.6-Sol");
+    view.set_thinking_sensitive(true);
+    view.set_thinking_label("High");
+    view.set_queue_state(
+        QueueMode::All,
+        QueueMode::OneAtATime,
+        InterruptMode::Wait,
+        3,
+    );
+    view.set_running_turn_action(true);
+    view.set_primary_action(true, true);
+    view.widget().clone()
+}
+
+fn composer_disconnected() -> gtk::Widget {
+    let view = composer::build();
+    view.set_model("openai-codex", "GPT-5.6-Sol");
+    view.set_text("This draft remains available while omp reconnects");
+    view.set_input_sensitive(false);
+    view.set_primary_action(false, false);
     view.widget().clone()
 }
 
