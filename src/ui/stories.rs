@@ -10,8 +10,10 @@ use super::chat::{ChatStatus, MessageRole, TelemetryWidgets};
 use super::conversation::ConversationView;
 use super::model_picker::ModelPickerView;
 use super::tool_components::ToolCard;
-use super::{composer, sidebar};
-use crate::bridge::protocol::{InterruptMode, ModelSummary, ModelThinking, QueueMode};
+use super::{composer, sidebar, todos};
+use crate::bridge::protocol::{
+    InterruptMode, ModelSummary, ModelThinking, QueueMode, TodoItem, TodoPhase, TodoStatus,
+};
 use crate::session_catalog::SessionEntry;
 
 #[derive(Clone, Copy)]
@@ -31,7 +33,7 @@ pub(crate) fn find(id: &str) -> Option<Story> {
     STORIES.iter().copied().find(|story| story.id == id)
 }
 
-const STORIES: [Story; 19] = [
+const STORIES: [Story; 28] = [
     Story {
         id: "header/ready",
         title: "Header · Ready",
@@ -136,6 +138,55 @@ const STORIES: [Story; 19] = [
         width: 900,
         height: 360,
         build: composer_attachments_error,
+    },
+    Story {
+        id: "todos/empty",
+        title: "Todos · Empty",
+        width: 900,
+        height: 180,
+        build: todos_empty,
+    },
+    Story {
+        id: "todos/multi-phase",
+        title: "Todos · Multiple phases",
+        width: 900,
+        height: 560,
+        build: todos_multi_phase,
+    },
+    Story {
+        id: "todos/blocked",
+        title: "Todos · Blocked",
+        width: 900,
+        height: 280,
+        build: todos_blocked,
+    },
+    Story {
+        id: "todos/completed",
+        title: "Todos · Completed",
+        width: 900,
+        height: 280,
+        build: todos_completed,
+    },
+    Story {
+        id: "todos/abandoned",
+        title: "Todos · Abandoned",
+        width: 900,
+        height: 280,
+        build: todos_abandoned,
+    },
+    Story {
+        id: "todos/active",
+        title: "Todos · Active task",
+        width: 900,
+        height: 320,
+        build: todos_active,
+    },
+    Story {
+        id: "todos/long-text",
+        title: "Todos · Long text",
+        width: 900,
+        height: 360,
+        build: todos_long_text,
     },
     Story {
         id: "model-picker/default",
@@ -423,6 +474,101 @@ fn composer_attachments_error() -> gtk::Widget {
     root.append(conversation.widget());
     root.append(view.widget());
     root.upcast()
+}
+
+fn todos_empty() -> gtk::Widget {
+    todo_story(Vec::new())
+}
+
+fn todos_multi_phase() -> gtk::Widget {
+    todo_story(vec![
+        TodoPhase {
+            name: "Research".to_owned(),
+            tasks: vec![
+                todo_item("Inspect the omp RPC todo contract", TodoStatus::Completed),
+                todo_item("Map native workspace state", TodoStatus::InProgress),
+                todo_item("Review accessible controls", TodoStatus::Pending),
+            ],
+        },
+        TodoPhase {
+            name: "Implementation".to_owned(),
+            tasks: vec![
+                todo_item("Build the ordered todo panel", TodoStatus::Pending),
+                todo_item("Add focused serialization tests", TodoStatus::Pending),
+            ],
+        },
+    ])
+}
+
+fn todos_blocked() -> gtk::Widget {
+    todo_story(vec![TodoPhase {
+        name: "Release".to_owned(),
+        tasks: vec![TodoItem {
+            content: "Publish the native package".to_owned(),
+            status: TodoStatus::Blocked,
+            blocker: Some("Waiting for signing credentials from the release owner".to_owned()),
+        }],
+    }])
+}
+
+fn todos_completed() -> gtk::Widget {
+    todo_story(vec![TodoPhase {
+        name: "Verification".to_owned(),
+        tasks: vec![
+            todo_item("Round-trip every todo status", TodoStatus::Completed),
+            todo_item("Confirm session switching", TodoStatus::Completed),
+        ],
+    }])
+}
+
+fn todos_abandoned() -> gtk::Widget {
+    todo_story(vec![TodoPhase {
+        name: "Experiments".to_owned(),
+        tasks: vec![
+            todo_item("Parse todo state from transcript prose", TodoStatus::Abandoned),
+            todo_item("Use authoritative get_state instead", TodoStatus::InProgress),
+        ],
+    }])
+}
+
+fn todos_active() -> gtk::Widget {
+    todo_story(vec![TodoPhase {
+        name: "Native todos".to_owned(),
+        tasks: vec![
+            todo_item("Read protocol definitions", TodoStatus::Completed),
+            todo_item("Implement authoritative reconciliation", TodoStatus::InProgress),
+            todo_item("Add component stories", TodoStatus::Pending),
+        ],
+    }])
+}
+
+fn todos_long_text() -> gtk::Widget {
+    todo_story(vec![TodoPhase {
+        name: "Long-form validation and accessibility review".to_owned(),
+        tasks: vec![TodoItem {
+            content: "Confirm that an unusually long todo description wraps across multiple lines without hiding its state, blocker, or semantically named actions from keyboard and assistive-technology users.".to_owned(),
+            status: TodoStatus::Blocked,
+            blocker: Some(
+                "The external accessibility audit is scheduled after the remaining workspace controls land."
+                    .to_owned(),
+            ),
+        }],
+    }])
+}
+
+fn todo_story(phases: Vec<TodoPhase>) -> gtk::Widget {
+    let panel = todos::TodoPanel::new();
+    panel.set_phases(&phases);
+    panel.set_expanded(true);
+    panel.root.upcast()
+}
+
+fn todo_item(content: &str, status: TodoStatus) -> TodoItem {
+    TodoItem {
+        content: content.to_owned(),
+        status,
+        blocker: None,
+    }
 }
 
 fn model_picker_default() -> gtk::Widget {

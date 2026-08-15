@@ -1127,3 +1127,132 @@ popover.model-picker-popover > contents {
     border-radius: 12px;
     background: #303136;
 }
+
+.todo-panel {
+    border: 1px solid #303540;
+    border-radius: 12px;
+    background: #12151a;
+}
+
+.todo-summary {
+    min-height: 34px;
+    padding: 5px 11px;
+    border: 0;
+    border-radius: 11px;
+    background: transparent;
+    color: #c9ced7;
+    box-shadow: none;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.todo-summary:hover,
+.todo-summary:checked {
+    background: #1b1f26;
+    color: #f0f2f6;
+}
+
+.todo-panel-heading {
+    color: #8d95a1;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+}
+
+.todo-panel-status {
+    padding: 7px 12px 9px;
+    color: #8f98a5;
+    font-size: 11px;
+}
+
+.todo-panel-status.error {
+    color: #ff9c9c;
+}
+
+.todo-phase {
+    padding: 9px 10px;
+    border: 1px solid #292e37;
+    border-radius: 9px;
+    background: #171a20;
+}
+
+.todo-phase-title {
+    color: #eef0f4;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.todo-task {
+    padding: 7px 2px;
+    border-top: 1px solid #262b33;
+}
+
+.todo-task-marker {
+    min-width: 16px;
+    color: #858d99;
+    font-size: 13px;
+    font-weight: 700;
+}
+
+.todo-task.in-progress .todo-task-marker {
+    color: #82aaff;
+}
+
+.todo-task.completed .todo-task-marker {
+    color: #76c99b;
+}
+
+.todo-task.blocked .todo-task-marker {
+    color: #f1b267;
+}
+
+.todo-task.abandoned .todo-task-marker {
+    color: #777f8b;
+}
+
+.todo-task.completed .todo-task-content,
+.todo-task.abandoned .todo-task-content {
+    color: #747c88;
+}
+
+.todo-task-content {
+    color: #d8dce3;
+    font-size: 12px;
+}
+
+.todo-task-state,
+.todo-empty {
+    color: #747d8a;
+    font-size: 10px;
+}
+
+.todo-blocker {
+    color: #d6a36b;
+    font-size: 10px;
+}
+
+.todo-action {
+    min-height: 25px;
+    padding: 2px 7px;
+    border: 0;
+    border-radius: 6px;
+    background: #222730;
+    color: #aeb5c0;
+    box-shadow: none;
+    font-size: 10px;
+}
+
+.todo-action:hover {
+    background: #2b313c;
+    color: #f0f2f6;
+}
+
+.todo-action.destructive-action {
+    color: #d49a9a;
+}
+
+.todo-dialog-label {
+    color: #aeb5c0;
+    font-size: 11px;
+    font-weight: 600;
+}

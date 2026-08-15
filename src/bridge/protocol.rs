@@ -125,6 +125,38 @@ impl InterruptMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Abandoned,
+    Blocked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TodoItem {
+    pub content: String,
+    pub status: TodoStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TodoPhase {
+    pub name: String,
+    pub tasks: Vec<TodoItem>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetTodosResponse {
+    pub todo_phases: Vec<TodoPhase>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionState {
@@ -146,13 +178,14 @@ pub struct SessionState {
     pub interrupt_mode: InterruptMode,
     #[serde(default)]
     pub queued_message_count: usize,
+    #[serde(default)]
+    pub todo_phases: Vec<TodoPhase>,
 }
 
 #[derive(Debug, Clone)]
 pub struct RpcResponse {
     pub id: Option<String>,
     pub command: String,
-    pub id: Option<String>,
     pub success: bool,
     pub data: Option<Value>,
     pub error: Option<String>,
@@ -577,7 +610,10 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use serde_json::json;
 
-    use super::{RpcEvent, RpcFrameDecoder, decode_event};
+    use super::{
+        RpcEvent, RpcFrameDecoder, SessionState, SetTodosResponse, TodoPhase, TodoStatus,
+        decode_event,
+    };
 
     #[test]
     fn passes_regular_frames_through() {
@@ -679,5 +715,44 @@ mod tests {
             panic!("expected command output");
         };
         assert_eq!(text, "Current model: openai-codex/gpt-5.6-sol");
+    }
+
+    #[test]
+    fn todo_phases_round_trip_the_exact_rpc_shape_and_every_state() {
+        let wire = json!([
+            {
+                "name": "Ordered",
+                "tasks": [
+                    {"content": "Wait", "status": "pending"},
+                    {"content": "Work", "status": "in_progress"},
+                    {"content": "Done", "status": "completed"},
+                    {"content": "Drop", "status": "abandoned"},
+                    {"content": "Blocked", "status": "blocked", "blocker": "Needs approval"}
+                ]
+            }
+        ]);
+        let phases: Vec<TodoPhase> = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(phases[0].tasks[0].status, TodoStatus::Pending);
+        assert_eq!(phases[0].tasks[1].status, TodoStatus::InProgress);
+        assert_eq!(phases[0].tasks[2].status, TodoStatus::Completed);
+        assert_eq!(phases[0].tasks[3].status, TodoStatus::Abandoned);
+        assert_eq!(phases[0].tasks[4].status, TodoStatus::Blocked);
+        assert_eq!(serde_json::to_value(&phases).unwrap(), wire);
+    }
+
+    #[test]
+    fn state_and_set_todos_response_decode_camel_case_todo_phases() {
+        let phases = json!([
+            {
+                "name": "Ship",
+                "tasks": [{"content": "Commit", "status": "in_progress"}]
+            }
+        ]);
+        let state: SessionState =
+            serde_json::from_value(json!({"todoPhases": phases.clone()})).unwrap();
+        assert_eq!(state.todo_phases[0].name, "Ship");
+        let response: SetTodosResponse =
+            serde_json::from_value(json!({"todoPhases": phases})).unwrap();
+        assert_eq!(response.todo_phases, state.todo_phases);
     }
 }

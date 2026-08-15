@@ -4,7 +4,7 @@ use libadwaita as adw;
 
 use super::chat::{ChatStatus, TelemetryWidgets};
 use super::conversation::ConversationView;
-use super::{composer, icons, sidebar};
+use super::{composer, icons, sidebar, todos};
 
 pub(crate) struct WorkspaceView {
     pub(crate) window: gtk::ApplicationWindow,
@@ -23,6 +23,7 @@ pub(crate) struct WorkspaceView {
     pub(crate) chat_status: ChatStatus,
     pub(crate) telemetry: TelemetryWidgets,
     pub(crate) conversation: ConversationView,
+    pub(crate) todos: todos::TodoPanel,
     pub(crate) composer: composer::ComposerView,
     pub(crate) new_chat_button: gtk::Button,
 }
@@ -76,6 +77,16 @@ pub(crate) fn build(app: &adw::Application) -> WorkspaceView {
     content_stack.add_named(subagent_conversation.widget(), Some("subagent"));
     content_stack.set_visible_child_name("chat");
 
+    let todos = todos::TodoPanel::new();
+    let todos_clamp = adw::Clamp::builder()
+        .maximum_size(900)
+        .tightening_threshold(720)
+        .child(&todos.root)
+        .build();
+    todos_clamp.set_margin_start(24);
+    todos_clamp.set_margin_end(24);
+    todos_clamp.set_margin_bottom(10);
+
     let composer = composer::build();
     let composer_clamp = adw::Clamp::builder()
         .maximum_size(900)
@@ -88,6 +99,7 @@ pub(crate) fn build(app: &adw::Application) -> WorkspaceView {
 
     root.append(&header_handle);
     root.append(&content_stack);
+    root.append(&todos_clamp);
     root.append(&composer_clamp);
     let split = gtk::Paned::new(gtk::Orientation::Horizontal);
     split.set_start_child(Some(&sidebar.root));
@@ -126,6 +138,7 @@ pub(crate) fn build(app: &adw::Application) -> WorkspaceView {
         chat_status,
         telemetry,
         conversation,
+        todos,
         composer,
         new_chat_button: sidebar.new_chat,
     }

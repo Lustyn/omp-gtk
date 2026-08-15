@@ -16,7 +16,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use self::protocol::{
-    ImageContent, InterruptMode, QueueMode, RpcEvent, RpcFrameDecoder, decode_event,
+    ImageContent, InterruptMode, QueueMode, RpcEvent, RpcFrameDecoder, TodoPhase, decode_event,
 };
 use crate::commands::unsupported_native_mode_error;
 
@@ -117,6 +117,11 @@ impl BridgeClient {
 
     pub fn set_session_name(&self, name: &str) -> Result<(), BridgeError> {
         self.request("set_session_name", json!({ "name": name }))?;
+        Ok(())
+    }
+
+    pub fn set_todos(&self, phases: &[TodoPhase]) -> Result<(), BridgeError> {
+        self.request("set_todos", json!({ "phases": phases }))?;
         Ok(())
     }
 
@@ -458,7 +463,9 @@ impl std::error::Error for BridgeError {}
 #[cfg(test)]
 mod tests {
     use super::{BridgeClient, WriterMessage, resolve_omp_executable};
-    use crate::bridge::protocol::{ImageContent, InterruptMode, QueueMode};
+    use crate::bridge::protocol::{
+        ImageContent, InterruptMode, QueueMode, TodoItem, TodoPhase, TodoStatus,
+    };
     use crate::commands::unsupported_native_mode_error;
     use serde_json::Value;
     use std::ffi::OsStr;
@@ -659,5 +666,37 @@ mod tests {
         assert_eq!(frame["type"], "follow_up");
         assert_eq!(frame["images"][0]["mimeType"], "image/png");
         assert_eq!(frame["images"][1]["mimeType"], "image/jpeg");
+}
+
+#[test]
+    fn sends_complete_todo_state_through_set_todos() {
+        let (writer, receiver) = mpsc::channel();
+        let client = BridgeClient {
+            writer,
+            next_request_id: Arc::new(AtomicU64::new(7)),
+        };
+        let phases = vec![TodoPhase {
+            name: "Build".to_owned(),
+            tasks: vec![TodoItem {
+                content: "Wire the panel".to_owned(),
+                status: TodoStatus::Blocked,
+                blocker: Some("Needs protocol state".to_owned()),
+            }],
+        }];
+
+        client.set_todos(&phases).expect("queue todo request");
+
+        let WriterMessage::Frame(frame) = receiver.recv().expect("receive todo request") else {
+            panic!("expected RPC frame");
+        };
+        let frame = serde_json::from_str::<Value>(&frame).expect("decode todo request");
+        assert_eq!(frame["id"], "native_7");
+        assert_eq!(frame["type"], "set_todos");
+        assert_eq!(frame["phases"][0]["name"], "Build");
+        assert_eq!(frame["phases"][0]["tasks"][0]["status"], "blocked");
+        assert_eq!(
+            frame["phases"][0]["tasks"][0]["blocker"],
+            "Needs protocol state"
+        );
     }
 }

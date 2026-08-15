@@ -2,7 +2,7 @@ use crate::alerts::{self, AlertKind, Alerts, SoundEvent, SoundPackChoice, Window
 use crate::sound_registry::{self, RegistryPack};
 use crate::ui::{
     attachments::{self, AttachmentId, ComposerAttachments},
-    chat, composer, model_picker, sidebar, sound_settings, tool_components, workspace,
+    chat, composer, model_picker, sidebar, sound_settings, todos, tool_components, workspace,
 };
 
 use std::cell::{Cell, RefCell};
@@ -18,9 +18,10 @@ use libadwaita as adw;
 use serde_json::{Value, json};
 
 use crate::bridge::protocol::{
-    InterruptMode, ModelSummary, QueueMode, RpcEvent, RpcResponse, SessionState, SlashCommand,
-    SubagentUpdate, SubagentUpdateKind, ToolEnd, ToolStart, ToolUpdate, message_cost,
-    message_role, message_text, message_thinking, message_tool_calls, tool_result_parts,
+    InterruptMode, ModelSummary, QueueMode, RpcEvent, RpcResponse, SessionState, SetTodosResponse,
+    SlashCommand, SubagentUpdate, SubagentUpdateKind, TodoItem, TodoPhase, TodoStatus, ToolEnd,
+    ToolStart, ToolUpdate, message_cost, message_role, message_text, message_thinking,
+    message_tool_calls, tool_result_parts,
 };
 use crate::bridge::{BridgeClient, OmpBridge};
 use crate::commands::{CommandCompletion, completions, unsupported_native_mode_error};
@@ -28,6 +29,7 @@ use crate::session_catalog::{self, SessionEntry};
 use chat::{MessageBody, MessageRole, ThinkingBlock};
 use sidebar::SessionRow;
 use tool_components::ToolCard;
+use todos::{TodoAction, TodoEdit, apply_edit, validate_phases};
 use workspace::WorkspaceView;
 
 const TASK_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
@@ -78,6 +80,7 @@ pub(crate) fn build(app: &adw::Application) {
         subagents: RefCell::new(HashMap::new()),
         subagent_buttons: RefCell::new(HashMap::new()),
         session_rows: RefCell::new(Vec::new()),
+        todo_phases: RefCell::new(Vec::new()),
         active_sessions: RefCell::new(Vec::new()),
         pending_delete: RefCell::new(None),
         current_session_file: RefCell::new(None),
@@ -212,6 +215,7 @@ struct AppController {
     subagents: RefCell<HashMap<String, SubagentState>>,
     subagent_buttons: RefCell<HashMap<String, gtk::Button>>,
     session_rows: RefCell<Vec<SessionRow>>,
+    todo_phases: RefCell<Vec<TodoPhase>>,
     active_sessions: RefCell<Vec<SessionEntry>>,
     pending_delete: RefCell<Option<PathBuf>>,
     current_session_file: RefCell<Option<PathBuf>>,
@@ -239,7 +243,15 @@ struct AppController {
 }
 
 impl AppController {
+
     fn wire_interactions(self: &Rc<Self>) {
+        let weak = Rc::downgrade(self);
+        self.ui.todos.connect_action(move |action| {
+            if let Some(controller) = weak.upgrade() {
+                controller.handle_todo_action(action);
+            }
+        });
+
         let weak = Rc::downgrade(self);
         self.ui.composer.connect_changed(move || {
             let Some(controller) = weak.upgrade() else {
@@ -624,12 +636,15 @@ impl AppController {
             ) {
                 self.render_authoritative_queue_state();
             }
-            self.show_error(
-                response
-                    .error
-                    .as_deref()
-                    .unwrap_or("omp rejected the request"),
-            );
+            let error = response
+                .error
+                .as_deref()
+                .unwrap_or("omp rejected the request");
+            if response.command == "set_todos" {
+                self.ui.todos.set_pending(false);
+                self.ui.todos.set_error(Some(error));
+            }
+            self.show_error(error);
             return;
         }
         if matches!(response.command.as_str(), "prompt" | "steer" | "follow_up") {
@@ -645,16 +660,17 @@ impl AppController {
         let Some(data) = response.data else {
             if response.command == "new_session" {
                 self.refresh_after_new_session();
+            } else if response.command == "set_todos" {
+                self.reject_todo_reconciliation("omp returned no todo state.");
             }
             return;
         };
 
         match response.command.as_str() {
-            "get_state" => {
-                if let Ok(state) = serde_json::from_value::<SessionState>(data) {
-                    self.apply_state(state);
-                }
-            }
+            "get_state" => match serde_json::from_value::<SessionState>(data) {
+                Ok(state) => self.apply_state(state),
+                Err(error) => self.show_error(&format!("omp returned invalid session state: {error}")),
+            },
             "get_available_models" => {
                 if let Some(models) = data.get("models").cloned()
                     && let Ok(models) = serde_json::from_value::<Vec<ModelSummary>>(models)
@@ -717,6 +733,12 @@ impl AppController {
                     self.pending_user_messages.borrow_mut().pop_front();
                 }
             }
+            "set_todos" => match serde_json::from_value::<SetTodosResponse>(data) {
+                Ok(response) => self.reconcile_todos(response.todo_phases),
+                Err(error) => self.reject_todo_reconciliation(&format!(
+                    "omp returned invalid todo state: {error}"
+                )),
+            },
             "new_session" => self.refresh_after_new_session(),
             "switch_session" | "set_session_name" => self.refresh_after_session_change(),
             _ => {}
@@ -838,6 +860,7 @@ impl AppController {
         self.queued_message_count
             .set(composer_state.queued_message_count);
         self.render_authoritative_queue_state();
+        self.reconcile_todos(state.todo_phases.clone());
 
         let session_file = state.session_file.as_deref().map(PathBuf::from);
         let disk_title = session_file
@@ -908,6 +931,232 @@ impl AppController {
         self.refresh_session_sidebar();
         self.update_activity_counts();
         self.update_send_state();
+    }
+
+    fn reconcile_todos(&self, phases: Vec<TodoPhase>) {
+        if let Err(error) = validate_phases(&phases) {
+            self.reject_todo_reconciliation(&format!("omp returned invalid todo state: {error}"));
+            return;
+        }
+        self.todo_phases.replace(phases.clone());
+        self.ui.todos.set_phases(&phases);
+        self.ui.todos.set_pending(false);
+        self.ui.todos.set_error(None);
+    }
+
+    fn reject_todo_reconciliation(&self, message: &str) {
+        self.ui.todos.set_pending(false);
+        self.ui.todos.set_error(Some(message));
+        self.show_error(message);
+    }
+
+    fn handle_todo_action(self: &Rc<Self>, action: TodoAction) {
+        match action {
+            TodoAction::AddPhase => self.present_add_todo_phase_dialog(),
+            TodoAction::AddTask { phase } => self.present_add_todo_task_dialog(phase),
+            TodoAction::Start { phase, task } => {
+                self.submit_todo_edit(TodoEdit::Start { phase, task });
+            }
+            TodoAction::Complete { phase, task } => {
+                self.submit_todo_edit(TodoEdit::Complete { phase, task });
+            }
+            TodoAction::Drop { phase, task } => {
+                self.submit_todo_edit(TodoEdit::Drop { phase, task });
+            }
+            TodoAction::Block { phase, task } => {
+                self.present_block_todo_dialog(phase, task);
+            }
+            TodoAction::Unblock { phase, task } => {
+                self.submit_todo_edit(TodoEdit::Unblock { phase, task });
+            }
+            TodoAction::Remove { phase, task } => {
+                self.submit_todo_edit(TodoEdit::Remove { phase, task });
+            }
+            TodoAction::Clear => self.present_clear_todos_dialog(),
+        }
+    }
+
+    fn submit_todo_edit(&self, edit: TodoEdit) {
+        let next = match apply_edit(&self.todo_phases.borrow(), edit) {
+            Ok(next) => next,
+            Err(error) => {
+                self.ui.todos.set_error(Some(&error));
+                return;
+            }
+        };
+        let Some(client) = &self.client else {
+            let error = "omp bridge is not running";
+            self.ui.todos.set_error(Some(error));
+            self.show_error(error);
+            return;
+        };
+        self.ui.todos.set_error(None);
+        match client.set_todos(&next) {
+            Ok(()) => self.ui.todos.set_pending(true),
+            Err(error) => {
+                self.ui.todos.set_pending(false);
+                self.ui.todos.set_error(Some(&error.to_string()));
+                self.show_error(&error.to_string());
+            }
+        }
+    }
+
+    fn present_add_todo_phase_dialog(self: &Rc<Self>) {
+        let phase_name = gtk::Entry::new();
+        phase_name.set_placeholder_text(Some("Phase name"));
+        phase_name.set_max_length(160);
+        let task_content = gtk::Entry::new();
+        task_content.set_placeholder_text(Some("First task"));
+        task_content.set_max_length(2_000);
+        task_content.set_activates_default(true);
+        let form = todo_form(&[
+            ("_Phase name", &phase_name),
+            ("_First task", &task_content),
+        ]);
+        let dialog = adw::AlertDialog::builder()
+            .heading("Add todo phase")
+            .body("Add the first task now; more tasks can be appended from the phase.")
+            .extra_child(&form)
+            .build();
+        dialog.add_responses(&[("cancel", "Cancel"), ("add", "Add phase")]);
+        dialog.set_default_response(Some("add"));
+        dialog.set_close_response("cancel");
+        dialog.set_response_appearance("add", adw::ResponseAppearance::Suggested);
+        let weak = Rc::downgrade(self);
+        dialog.connect_response(None, move |_, response| {
+            if response != "add" {
+                return;
+            }
+            let Some(controller) = weak.upgrade() else {
+                return;
+            };
+            let phase = phase_name.text().trim().to_owned();
+            let content = task_content.text().trim().to_owned();
+            let confirmed = controller.todo_phases.borrow();
+            if !confirmed.is_empty() && confirmed.iter().any(|candidate| candidate.name == phase) {
+                drop(confirmed);
+                controller
+                    .ui
+                    .todos
+                    .set_error(Some("A phase with that name already exists."));
+                return;
+            }
+            let empty = confirmed.is_empty();
+            drop(confirmed);
+            if empty {
+                controller.submit_todo_edit(TodoEdit::Initialize(vec![TodoPhase {
+                    name: phase,
+                    tasks: vec![TodoItem {
+                        content,
+                        status: TodoStatus::Pending,
+                        blocker: None,
+                    }],
+                }]));
+            } else {
+                controller.submit_todo_edit(TodoEdit::Append { phase, content });
+            }
+        });
+        dialog.present(Some(&self.ui.window));
+    }
+
+    fn present_add_todo_task_dialog(self: &Rc<Self>, phase_index: usize) {
+        let Some(phase_name) = self
+            .todo_phases
+            .borrow()
+            .get(phase_index)
+            .map(|phase| phase.name.clone())
+        else {
+            self.ui
+                .todos
+                .set_error(Some("That todo phase no longer exists."));
+            return;
+        };
+        let content = gtk::Entry::new();
+        content.set_placeholder_text(Some("Task description"));
+        content.set_max_length(2_000);
+        content.set_activates_default(true);
+        let form = todo_form(&[("_Task", &content)]);
+        let dialog = adw::AlertDialog::builder()
+            .heading(format!("Add task to {phase_name}"))
+            .body("The task will be appended after the existing tasks in this phase.")
+            .extra_child(&form)
+            .build();
+        dialog.add_responses(&[("cancel", "Cancel"), ("add", "Add task")]);
+        dialog.set_default_response(Some("add"));
+        dialog.set_close_response("cancel");
+        dialog.set_response_appearance("add", adw::ResponseAppearance::Suggested);
+        let weak = Rc::downgrade(self);
+        dialog.connect_response(None, move |_, response| {
+            if response == "add"
+                && let Some(controller) = weak.upgrade()
+            {
+                controller.submit_todo_edit(TodoEdit::Append {
+                    phase: phase_name.clone(),
+                    content: content.text().trim().to_owned(),
+                });
+            }
+        });
+        dialog.present(Some(&self.ui.window));
+    }
+
+    fn present_block_todo_dialog(self: &Rc<Self>, phase: usize, task: usize) {
+        let Some(content) = self
+            .todo_phases
+            .borrow()
+            .get(phase)
+            .and_then(|phase| phase.tasks.get(task))
+            .map(|task| task.content.clone())
+        else {
+            self.ui.todos.set_error(Some("That todo no longer exists."));
+            return;
+        };
+        let blocker = gtk::Entry::new();
+        blocker.set_placeholder_text(Some("Optional reason"));
+        blocker.set_max_length(2_000);
+        blocker.set_activates_default(true);
+        let form = todo_form(&[("_Blocked by", &blocker)]);
+        let dialog = adw::AlertDialog::builder()
+            .heading("Block todo")
+            .body(format!("Mark “{content}” as blocked."))
+            .extra_child(&form)
+            .build();
+        dialog.add_responses(&[("cancel", "Cancel"), ("block", "Block")]);
+        dialog.set_default_response(Some("block"));
+        dialog.set_close_response("cancel");
+        dialog.set_response_appearance("block", adw::ResponseAppearance::Suggested);
+        let weak = Rc::downgrade(self);
+        dialog.connect_response(None, move |_, response| {
+            if response == "block"
+                && let Some(controller) = weak.upgrade()
+            {
+                controller.submit_todo_edit(TodoEdit::Block {
+                    phase,
+                    task,
+                    blocker: Some(blocker.text().to_string()),
+                });
+            }
+        });
+        dialog.present(Some(&self.ui.window));
+    }
+
+    fn present_clear_todos_dialog(self: &Rc<Self>) {
+        let dialog = adw::AlertDialog::builder()
+            .heading("Clear all todos?")
+            .body("This removes every phase and task from the current session.")
+            .build();
+        dialog.add_responses(&[("cancel", "Cancel"), ("clear", "Clear todos")]);
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        dialog.set_response_appearance("clear", adw::ResponseAppearance::Destructive);
+        let weak = Rc::downgrade(self);
+        dialog.connect_response(None, move |_, response| {
+            if response == "clear"
+                && let Some(controller) = weak.upgrade()
+            {
+                controller.submit_todo_edit(TodoEdit::Clear);
+            }
+        });
+        dialog.present(Some(&self.ui.window));
     }
 
     fn set_session_title(&self, title: &str) {
@@ -1778,6 +2027,12 @@ impl AppController {
         if tool.is_error {
             self.alerts
                 .play(alerts::sound_event_for_error(&tool.result.to_string()));
+        }
+        if tool.name == "todo"
+            && !tool.is_error
+            && let Some(client) = &self.client
+        {
+            let _ = client.refresh_state();
         }
         let completed_goal =
             self.goal_completion_calls.borrow_mut().remove(&tool.id) && !tool.is_error;
@@ -2704,6 +2959,21 @@ impl AppController {
         });
         dialog.present(Some(&self.ui.window));
     }
+}
+
+fn todo_form(fields: &[(&str, &gtk::Entry)]) -> gtk::Box {
+    let form = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    for (label, entry) in fields {
+        let field = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        let label = gtk::Label::with_mnemonic(label);
+        label.set_xalign(0.0);
+        label.set_mnemonic_widget(Some(*entry));
+        label.add_css_class("todo-dialog-label");
+        field.append(&label);
+        field.append(*entry);
+        form.append(&field);
+    }
+    form
 }
 
 fn completion_row(completion: &CommandCompletion) -> gtk::ListBoxRow {

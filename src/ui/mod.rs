@@ -11,6 +11,7 @@ pub(crate) mod sound_settings;
 #[cfg(feature = "ui-stories")]
 pub(crate) mod stories;
 pub(crate) mod tool_components;
+pub(crate) mod todos;
 pub(crate) mod workspace;
 
 use gtk::gdk;
