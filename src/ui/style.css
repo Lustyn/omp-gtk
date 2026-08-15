@@ -567,6 +567,17 @@ popover.command-popover > contents {
     color: #e07b88;
 }
 
+.tool-image-box {
+    margin: 0 12px 12px;
+}
+
+.tool-image-preview {
+    min-height: 160px;
+    border: 1px solid #2d333d;
+    border-radius: 8px;
+    background: #0b0e12;
+}
+
 .subagent-bar {
     padding: 5px 3px 6px;
     border-bottom: 1px solid #2a2f38;

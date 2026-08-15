@@ -1,3 +1,5 @@
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -54,6 +56,7 @@ pub struct ToolCard {
     pub details: gtk::Label,
     pub spinner: gtk::Spinner,
     pub expander: gtk::Expander,
+    image_box: gtk::Box,
     name: String,
     args: Rc<RefCell<Value>>,
     intent: Rc<RefCell<Option<String>>>,
@@ -118,6 +121,10 @@ impl ToolCard {
         detail_box.append(&details);
         expander.set_child(Some(&detail_box));
         root.append(&expander);
+        let image_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        image_box.add_css_class("tool-image-box");
+        image_box.set_visible(false);
+        root.append(&image_box);
         wire_context_menu(&root, &details);
 
         let card = Self {
@@ -128,6 +135,7 @@ impl ToolCard {
             details,
             spinner,
             expander,
+            image_box,
             name: name.to_owned(),
             args: Rc::new(RefCell::new(args.clone())),
             intent: Rc::new(RefCell::new(intent.map(ToOwned::to_owned))),
@@ -168,6 +176,7 @@ impl ToolCard {
             self.intent.borrow().as_deref(),
         );
         self.apply(&presentation);
+        self.show_read_images(result, is_error);
         if is_error {
             self.expander.set_expanded(true);
         }
@@ -179,6 +188,40 @@ impl ToolCard {
         self.title.set_text(&presentation.title);
         self.summary.set_text(&presentation.summary);
         self.details.set_text(&presentation.details);
+    }
+
+    fn show_read_images(&self, result: &Value, is_error: bool) {
+        while let Some(child) = self.image_box.first_child() {
+            self.image_box.remove(&child);
+        }
+        if is_error || !self.name.eq_ignore_ascii_case("read") {
+            self.image_box.set_visible(false);
+            return;
+        }
+
+        let path = string(&self.args.borrow(), "path")
+            .unwrap_or("image")
+            .to_owned();
+        for data in read_image_data(result) {
+            let Ok(decoded) = STANDARD.decode(data) else {
+                continue;
+            };
+            let Ok(texture) = gdk::Texture::from_bytes(&glib::Bytes::from_owned(decoded)) else {
+                continue;
+            };
+            let picture = gtk::Picture::new();
+            picture.set_paintable(Some(&texture));
+            picture.set_alternative_text(Some(&format!("Read image preview: {path}")));
+            picture.set_tooltip_text(Some(&path));
+            picture.set_content_fit(gtk::ContentFit::Contain);
+            picture.set_can_shrink(true);
+            picture.set_hexpand(true);
+            picture.set_height_request(preview_height(texture.width(), texture.height()));
+            picture.add_css_class("tool-image-preview");
+            self.image_box.append(&picture);
+        }
+        self.image_box
+            .set_visible(self.image_box.first_child().is_some());
     }
 
     fn start_animation(&self) {
@@ -585,6 +628,30 @@ fn extract_text(value: &Value) -> Option<&str> {
         .or_else(|| value.get("message").and_then(Value::as_str))
 }
 
+fn read_image_data(result: &Value) -> Vec<&str> {
+    result
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("image"))
+        .filter(|block| {
+            block
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .is_some_and(|mime_type| mime_type.starts_with("image/"))
+        })
+        .filter_map(|block| block.get("data").and_then(Value::as_str))
+        .collect()
+}
+
+fn preview_height(width: i32, height: i32) -> i32 {
+    if width <= 0 || height <= 0 {
+        return 320;
+    }
+    ((720.0 * f64::from(height) / f64::from(width)).round() as i32).clamp(160, 420)
+}
+
 fn line_count(value: &Value) -> Option<usize> {
     extract_text(value).map(|text| text.lines().count())
 }
@@ -634,7 +701,7 @@ fn title_case(value: &str) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{BUILTIN_TOOL_NAMES, presentation};
+    use super::{BUILTIN_TOOL_NAMES, presentation, preview_height, read_image_data};
 
     #[test]
     fn every_builtin_tool_has_a_compact_renderer() {
@@ -672,5 +739,28 @@ mod tests {
         assert!(mcp.summary.contains("linear"));
         let custom = presentation("deploy_preview", &json!({"name": "staging"}), None, None);
         assert_eq!(custom.summary, "staging");
+    }
+
+    #[test]
+    fn extracts_only_valid_inline_image_blocks() {
+        let result = json!({
+            "content": [
+                {"type": "text", "text": "Loaded image"},
+                {"type": "image", "data": "aW1hZ2U=", "mimeType": "image/png"},
+                {"type": "image", "data": "bm90LWltYWdl", "mimeType": "application/octet-stream"},
+                {"type": "image", "mimeType": "image/jpeg"}
+            ],
+            "details": {}
+        });
+        assert_eq!(read_image_data(&result), vec!["aW1hZ2U="]);
+        assert!(read_image_data(&json!({"content": "text"})).is_empty());
+    }
+
+    #[test]
+    fn preview_height_preserves_common_ratios_within_bounds() {
+        assert_eq!(preview_height(1920, 1080), 405);
+        assert_eq!(preview_height(100, 1000), 420);
+        assert_eq!(preview_height(1000, 100), 160);
+        assert_eq!(preview_height(0, 0), 320);
     }
 }

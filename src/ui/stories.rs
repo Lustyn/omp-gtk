@@ -1,3 +1,5 @@
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use std::path::PathBuf;
 
 use gtk::prelude::*;
@@ -29,7 +31,7 @@ pub(crate) fn find(id: &str) -> Option<Story> {
     STORIES.iter().copied().find(|story| story.id == id)
 }
 
-const STORIES: [Story; 12] = [
+const STORIES: [Story; 13] = [
     Story {
         id: "header/ready",
         title: "Header · Ready",
@@ -99,6 +101,13 @@ const STORIES: [Story; 12] = [
         width: 780,
         height: 220,
         build: tool_card_success,
+    },
+    Story {
+        id: "tool-card/read-image",
+        title: "Tool card · Read image",
+        width: 780,
+        height: 560,
+        build: tool_card_read_image,
     },
     Story {
         id: "tool-card/error",
@@ -284,6 +293,29 @@ fn tool_card_success() -> gtk::Widget {
         Some("Creating native gallery"),
     );
     card.complete(&json!({"text": "Successfully wrote 180 lines"}), false);
+    card.root.clone().upcast()
+}
+
+fn tool_card_read_image() -> gtk::Widget {
+    let card = ToolCard::new(
+        "read",
+        &json!({"path": "src/assets/omp.svg"}),
+        Some("Reading application artwork"),
+    );
+    card.complete(
+        &json!({
+            "content": [
+                {"type": "text", "text": "Decoded image"},
+                {
+                    "type": "image",
+                    "data": STANDARD.encode(include_bytes!("../assets/omp.svg")),
+                    "mimeType": "image/svg+xml"
+                }
+            ],
+            "details": {}
+        }),
+        false,
+    );
     card.root.clone().upcast()
 }
 
