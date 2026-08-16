@@ -294,8 +294,8 @@ Parity work should extend rather than replace these working native surfaces:
 
 - Conversation and session-file sidebar/history
 - New, switch, rename, reveal, and delete conversation flows
-- Streaming assistant text and thinking
-- Markdown and tool cards, including GFM tables, native LaTeX, Mermaid diagrams, and images returned by tools
+- Streaming assistant text and thinking, including streaming-safe Markdown rendering
+- Markdown and tool cards, including heading outlines, GFM tables, native LaTeX, Mermaid diagrams, and images returned by tools
 - Model picker and thinking-level picker
 - Static slash/subcommand completion for commands advertised by omp
 - Stop/abort

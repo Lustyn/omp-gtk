@@ -27,7 +27,8 @@ The application requires GTK 4.22 or newer and libadwaita 1.9 or newer.
 ### A desktop conversation workspace
 
 - Stream assistant text, thinking, tool calls, tool results, usage, cost, and context information.
-- Render GitHub-flavored Markdown, syntax-preserving code blocks, tables, task lists, links, inline and display LaTeX, and Mermaid diagrams.
+- Render streaming-safe GitHub-flavored Markdown, syntax-preserving code blocks, tables, task lists, links, inline and display LaTeX, and Mermaid diagrams as responses arrive.
+- Separate heading sections visually and expose a hoverable outline for the heading-rich message currently in view.
 - Keep tool activity compact by grouping related thinking and tool calls without hiding errors or results.
 - Display images returned by tools.
 

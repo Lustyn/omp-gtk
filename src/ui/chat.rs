@@ -14,6 +14,7 @@ use ratex_svg::{SvgOptions, render_to_svg};
 use ratex_types::{Color, MathStyle};
 
 use super::icons;
+use super::streaming_markdown::mend_streaming_markdown;
 
 #[derive(Clone, Copy)]
 pub enum MessageRole {
@@ -413,10 +414,24 @@ struct MarkdownLink {
     destination: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MarkdownHeading {
+    pub(crate) level: u8,
+    pub(crate) offset: i32,
+    pub(crate) title: String,
+}
+
+struct ActiveHeading {
+    level: u8,
+    offset: i32,
+    title: String,
+}
+
 struct RenderedMarkdown {
     markup: String,
     embedded: Vec<EmbeddedMarkdown>,
     links: Vec<MarkdownLink>,
+    headings: Vec<MarkdownHeading>,
 }
 
 struct MarkdownRenderer {
@@ -431,6 +446,9 @@ struct MarkdownRenderer {
     line_breaks: usize,
     after_block_marker: bool,
     quote_depth: usize,
+    headings: Vec<MarkdownHeading>,
+    active_heading: Option<ActiveHeading>,
+    seen_heading: bool,
 }
 
 impl MarkdownRenderer {
@@ -447,6 +465,9 @@ impl MarkdownRenderer {
             line_breaks: 0,
             after_block_marker: false,
             quote_depth: 0,
+            headings: Vec::new(),
+            active_heading: None,
+            seen_heading: false,
         }
     }
 
@@ -455,11 +476,13 @@ impl MarkdownRenderer {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
             Event::Text(text) => {
+                self.capture_heading_text(&text);
                 if !self.append_captured(&text) {
                     self.text(&text);
                 }
             }
             Event::Code(code) => {
+                self.capture_heading_text(&code);
                 if !self.append_captured(&code) {
                     self.embed(EmbeddedMarkdownContent::InlineCode(code.into_string()));
                 }
@@ -498,7 +521,9 @@ impl MarkdownRenderer {
             }
             Event::Rule => {
                 self.block();
-                self.tag("<span foreground=\"#565d69\">────────────────────────</span>");
+                self.tag("<span foreground=\"#3d424a\">");
+                self.text("────────────────────────");
+                self.tag("</span>");
             }
             Event::TaskListMarker(checked) => {
                 let marker = if checked { "☑ " } else { "☐ " };
@@ -522,19 +547,33 @@ impl MarkdownRenderer {
             }
             Tag::Heading { level, .. } => {
                 self.block();
+                if self.seen_heading {
+                    self.tag("<span foreground=\"#3d424a\">");
+                    self.text("────────────────────────");
+                    self.tag("</span>");
+                    self.breaks(1);
+                }
+                self.seen_heading = true;
                 self.quote_prefix();
+                self.active_heading = Some(ActiveHeading {
+                    level: heading_level(level),
+                    offset: self.text_offset,
+                    title: String::new(),
+                });
                 let size = match level {
                     HeadingLevel::H1 => "xx-large",
                     HeadingLevel::H2 => "x-large",
                     HeadingLevel::H3 => "large",
                     HeadingLevel::H4 | HeadingLevel::H5 | HeadingLevel::H6 => "medium",
                 };
-                self.tag(&format!("<span weight=\"bold\" size=\"{size}\">"));
+                self.tag(&format!(
+                    "<span weight=\"bold\" size=\"{size}\" foreground=\"#febc38\">"
+                ));
             }
             Tag::BlockQuote(_) => {
                 self.block();
                 self.quote_depth += 1;
-                self.tag("<span foreground=\"#aeb4bf\">");
+                self.tag("<span foreground=\"#777d88\">");
                 self.quote_prefix();
                 self.after_block_marker = true;
             }
@@ -587,7 +626,9 @@ impl MarkdownRenderer {
                 }
                 self.quote_prefix();
                 self.text(&"  ".repeat(depth.saturating_sub(1)));
+                self.tag("<span foreground=\"#febc38\">");
                 self.text(&marker);
+                self.tag("</span>");
                 self.after_block_marker = true;
             }
             Tag::FootnoteDefinition(name) => {
@@ -648,9 +689,22 @@ impl MarkdownRenderer {
 
     fn end(&mut self, tag: TagEnd) {
         match tag {
-            TagEnd::Paragraph | TagEnd::Item | TagEnd::HtmlBlock => {}
-            TagEnd::Heading(_) => self.tag("</span>"),
+            TagEnd::Paragraph | TagEnd::HtmlBlock => {}
+            TagEnd::Item => {
+                self.after_block_marker = false;
+            }
+            TagEnd::Heading(_) => {
+                self.tag("</span>");
+                if let Some(heading) = self.active_heading.take() {
+                    self.headings.push(MarkdownHeading {
+                        level: heading.level,
+                        offset: heading.offset,
+                        title: heading.title.trim().to_owned(),
+                    });
+                }
+            }
             TagEnd::BlockQuote(_) => {
+                self.after_block_marker = false;
                 self.tag("</span>");
                 self.quote_depth = self.quote_depth.saturating_sub(1);
             }
@@ -669,7 +723,9 @@ impl MarkdownRenderer {
             TagEnd::List(_) => {
                 self.lists.pop();
             }
-            TagEnd::FootnoteDefinition => {}
+            TagEnd::FootnoteDefinition => {
+                self.after_block_marker = false;
+            }
             TagEnd::DefinitionList => {}
             TagEnd::DefinitionListTitle => self.tag("</b>"),
             TagEnd::DefinitionListDefinition => {}
@@ -713,13 +769,15 @@ impl MarkdownRenderer {
 
     fn block(&mut self) {
         if !self.markup.is_empty() {
-            self.breaks(2);
+            self.breaks(1);
         }
     }
 
     fn quote_prefix(&mut self) {
         if self.quote_depth > 0 {
+            self.tag("<span foreground=\"#3d424a\">");
             self.text(&"│ ".repeat(self.quote_depth));
+            self.tag("</span>");
         }
     }
 
@@ -757,12 +815,29 @@ impl MarkdownRenderer {
         }
     }
 
+    fn capture_heading_text(&mut self, text: &str) {
+        if let Some(heading) = &mut self.active_heading {
+            heading.title.push_str(text);
+        }
+    }
+
     fn embed(&mut self, content: EmbeddedMarkdownContent) {
         self.embedded.push(EmbeddedMarkdown {
             offset: self.text_offset,
             content,
         });
         self.text("\u{fffc}");
+    }
+}
+
+fn heading_level(level: HeadingLevel) -> u8 {
+    match level {
+        HeadingLevel::H1 => 1,
+        HeadingLevel::H2 => 2,
+        HeadingLevel::H3 => 3,
+        HeadingLevel::H4 => 4,
+        HeadingLevel::H5 => 5,
+        HeadingLevel::H6 => 6,
     }
 }
 
@@ -779,7 +854,13 @@ fn render_markdown(markdown: &str) -> RenderedMarkdown {
         markup: renderer.markup,
         embedded: renderer.embedded,
         links: renderer.links,
+        headings: renderer.headings,
     }
+}
+
+fn render_streaming_markdown(markdown: &str) -> RenderedMarkdown {
+    let markdown = mend_streaming_markdown(markdown);
+    render_markdown(&markdown)
 }
 
 fn normalize_omp_math(markdown: &str) -> Cow<'_, str> {
@@ -986,10 +1067,14 @@ pub(crate) struct MessageBody {
     view: gtk::TextView,
     source: Rc<RefCell<String>>,
     links: Rc<RefCell<Vec<MarkdownLink>>>,
+    row: gtk::Box,
+    headings: Rc<RefCell<Vec<MarkdownHeading>>>,
+    heading_observers: Rc<RefCell<Vec<Box<dyn Fn()>>>>,
+    embedded_widgets: Rc<RefCell<Vec<(EmbeddedMarkdownContent, gtk::Widget)>>>,
 }
 
 impl MessageBody {
-    fn new(text: &str, rich: bool) -> Self {
+    fn new(text: &str, rich: bool, row: &gtk::Box) -> Self {
         let view = gtk::TextView::builder()
             .accepts_tab(false)
             .cursor_visible(false)
@@ -1003,6 +1088,10 @@ impl MessageBody {
             view,
             source: Rc::new(RefCell::new(String::new())),
             links: Rc::new(RefCell::new(Vec::new())),
+            row: row.clone(),
+            headings: Rc::new(RefCell::new(Vec::new())),
+            heading_observers: Rc::new(RefCell::new(Vec::new())),
+            embedded_widgets: Rc::new(RefCell::new(Vec::new())),
         };
         wire_markdown_links(&body.view, &body.links);
         if rich {
@@ -1015,42 +1104,196 @@ impl MessageBody {
 
     pub(crate) fn set_text(&self, text: &str) {
         self.source.replace(text.to_owned());
-        let rendered = render_markdown(text);
+        self.install_rendered(render_markdown(text));
+    }
+
+    pub(crate) fn set_streaming_text(&self, text: &str) {
+        self.source.replace(text.to_owned());
+        self.install_rendered(render_streaming_markdown(text));
+    }
+
+    fn install_rendered(&self, rendered: RenderedMarkdown) {
+        let RenderedMarkdown {
+            markup,
+            embedded,
+            links,
+            headings,
+        } = rendered;
+        let mut cached_widgets = self.embedded_widgets.take();
+        for (_, widget) in &cached_widgets {
+            self.view.remove(widget);
+        }
         let buffer = gtk::TextBuffer::new(None::<&gtk::TextTagTable>);
-        buffer.insert_markup(&mut buffer.end_iter(), &rendered.markup);
+        buffer.insert_markup(&mut buffer.end_iter(), &markup);
         self.view.set_buffer(Some(&buffer));
-        for embedded in rendered.embedded {
+        let mut current_widgets = Vec::with_capacity(embedded.len());
+        for embedded in embedded {
             let mut start = buffer.iter_at_offset(embedded.offset);
             let mut end = start;
             end.forward_char();
             buffer.delete(&mut start, &mut end);
             let anchor = gtk::TextChildAnchor::new();
             buffer.insert_child_anchor(&mut start, &anchor);
-            let widget = embedded_markdown_widget(embedded.content);
+            let widget = cached_widgets
+                .iter()
+                .position(|(content, _)| content == &embedded.content)
+                .map(|index| cached_widgets.swap_remove(index).1)
+                .unwrap_or_else(|| embedded_markdown_widget(embedded.content.clone()));
             self.view.add_child_at_anchor(&widget, &anchor);
+            current_widgets.push((embedded.content, widget));
         }
-        self.links.replace(rendered.links);
+        self.embedded_widgets.replace(current_widgets);
+        self.links.replace(links);
+        let headings_changed = *self.headings.borrow() != headings;
+        self.headings.replace(headings);
+        if headings_changed {
+            for observer in self.heading_observers.borrow().iter() {
+                observer();
+            }
+        }
     }
 
-    pub(crate) fn set_streaming_text(&self, text: &str) {
-        self.source.replace(text.to_owned());
-        let buffer = gtk::TextBuffer::new(None::<&gtk::TextTagTable>);
-        buffer.set_text(text);
-        self.view.set_buffer(Some(&buffer));
-        self.links.borrow_mut().clear();
+    pub(crate) fn outline_headings(&self) -> Vec<MarkdownHeading> {
+        let headings = self.headings.borrow();
+        let hierarchical = headings
+            .iter()
+            .map(|heading| heading.level)
+            .min()
+            .zip(headings.iter().map(|heading| heading.level).max())
+            .is_some_and(|(minimum, maximum)| minimum < maximum);
+        if headings.len() >= 3 && hierarchical {
+            headings.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub(crate) fn row(&self) -> &gtk::Box {
+        &self.row
+    }
+
+    pub(crate) fn connect_headings_changed(&self, callback: impl Fn() + 'static) {
+        self.heading_observers.borrow_mut().push(Box::new(callback));
+    }
+
+    pub(crate) fn scroll_to_heading(
+        &self,
+        heading: &MarkdownHeading,
+        scroller: &gtk::ScrolledWindow,
+    ) {
+        let iter = self.view.buffer().iter_at_offset(heading.offset);
+        let location = self.view.iter_location(&iter);
+        let (_, widget_y) = self.view.buffer_to_window_coords(
+            gtk::TextWindowType::Widget,
+            location.x(),
+            location.y(),
+        );
+        if let Some(point) = self
+            .view
+            .compute_point(scroller, &gtk::graphene::Point::new(0.0, widget_y as f32))
+        {
+            let adjustment = scroller.vadjustment();
+            adjustment.set_value(
+                (adjustment.value() + f64::from(point.y()) - 56.0)
+                    .clamp(0.0, (adjustment.upper() - adjustment.page_size()).max(0.0)),
+            );
+        }
+    }
+
+    #[cfg(feature = "ui-stories")]
+    pub(crate) fn add_css_class(&self, class: &str) {
+        self.view.add_css_class(class);
+    }
+}
+
+mod inline_code_anchor {
+    use super::*;
+    use gtk::subclass::prelude::*;
+
+    #[derive(Default)]
+    pub(super) struct InlineCodeAnchor;
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for InlineCodeAnchor {
+        const NAME: &'static str = "OmpInlineCodeAnchor";
+        type Type = super::InlineCodeAnchor;
+        type ParentType = gtk::Widget;
+    }
+
+    impl ObjectImpl for InlineCodeAnchor {
+        fn constructed(&self) {
+            self.parent_constructed();
+
+            let label = gtk::Label::new(None);
+            label.add_css_class("markdown-inline-code");
+            label.set_parent(&*self.obj());
+            self.obj().set_overflow(gtk::Overflow::Visible);
+        }
+
+        fn dispose(&self) {
+            if let Some(label) = self.obj().first_child() {
+                label.unparent();
+            }
+        }
+    }
+
+    impl WidgetImpl for InlineCodeAnchor {
+        fn measure(&self, orientation: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
+            let Some(label) = self.obj().first_child() else {
+                return (0, 0, -1, -1);
+            };
+            label.measure(orientation, for_size)
+        }
+
+        fn size_allocate(&self, width: i32, _height: i32, _baseline: i32) {
+            let Some(label) = self.obj().first_child() else {
+                return;
+            };
+            let (_, natural_height, _, natural_baseline) =
+                label.measure(gtk::Orientation::Vertical, width);
+            // GtkTextLayout bottom-aligns child-anchor boxes to the text baseline.
+            // Preserve the full measured box for line sizing, then shift its
+            // contents by the measured descent so the label baselines coincide.
+            let descent = if natural_baseline >= 0 {
+                natural_height.saturating_sub(natural_baseline)
+            } else {
+                0
+            };
+            let transform = gtk::gsk::Transform::default()
+                .translate(&gtk::graphene::Point::new(0.0, descent as f32));
+            label.allocate(width, natural_height, natural_baseline, Some(transform));
+        }
+
+        fn snapshot(&self, snapshot: &gtk::Snapshot) {
+            if let Some(label) = self.obj().first_child() {
+                self.obj().snapshot_child(&label, snapshot);
+            }
+        }
+    }
+}
+
+glib::wrapper! {
+    struct InlineCodeAnchor(ObjectSubclass<inline_code_anchor::InlineCodeAnchor>)
+        @extends gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
+}
+
+impl InlineCodeAnchor {
+    fn new(text: &str) -> Self {
+        let anchor: Self = glib::Object::new();
+        let label = anchor
+            .first_child()
+            .and_downcast::<gtk::Label>()
+            .expect("inline code anchor must contain a label");
+        label.set_label(text);
+        anchor
     }
 }
 
 fn embedded_markdown_widget(content: EmbeddedMarkdownContent) -> gtk::Widget {
     match content {
-        EmbeddedMarkdownContent::InlineCode(text) => {
-            let label = markdown_code_label(&text, false);
-            label.upcast()
-        }
-        EmbeddedMarkdownContent::CodeBlock(text) => {
-            let label = markdown_code_label(&text, true);
-            label.upcast()
-        }
+        EmbeddedMarkdownContent::InlineCode(text) => InlineCodeAnchor::new(&text).upcast(),
+        EmbeddedMarkdownContent::CodeBlock(text) => markdown_code_block_label(&text).upcast(),
         EmbeddedMarkdownContent::InlineMath(source) => latex_widget(&source, false),
         EmbeddedMarkdownContent::DisplayMath(source) => latex_widget(&source, true),
         EmbeddedMarkdownContent::Table(table) => markdown_table_widget(table).upcast(),
@@ -1058,21 +1301,16 @@ fn embedded_markdown_widget(content: EmbeddedMarkdownContent) -> gtk::Widget {
     }
 }
 
-fn markdown_code_label(text: &str, block: bool) -> gtk::Label {
+fn markdown_code_block_label(text: &str) -> gtk::Label {
     let label = gtk::Label::new(Some(text));
     label.set_xalign(0.0);
-    if block {
-        label.set_valign(gtk::Align::Center);
-        label.set_halign(gtk::Align::Fill);
-        label.set_hexpand(true);
-        label.set_wrap(true);
-        label.set_wrap_mode(gtk::pango::WrapMode::Char);
-        label.set_width_chars(48);
-        label.add_css_class("markdown-code-block");
-    } else {
-        label.set_valign(gtk::Align::BaselineCenter);
-        label.add_css_class("markdown-inline-code");
-    }
+    label.set_valign(gtk::Align::Center);
+    label.set_halign(gtk::Align::Fill);
+    label.set_hexpand(true);
+    label.set_wrap(true);
+    label.set_wrap_mode(gtk::pango::WrapMode::Char);
+    label.set_width_chars(48);
+    label.add_css_class("markdown-code-block");
     label
 }
 
@@ -1232,7 +1470,7 @@ fn svg_picture(
 }
 
 fn rich_render_fallback(text: &str, css_class: &str, tooltip: &str) -> gtk::Widget {
-    let label = markdown_code_label(text, true);
+    let label = markdown_code_block_label(text);
     label.add_css_class(css_class);
     label.set_tooltip_text(Some(tooltip));
     label.upcast()
@@ -1276,7 +1514,7 @@ fn append_message_with_mode(
         }
     }
 
-    let body = MessageBody::new(text, rich);
+    let body = MessageBody::new(text, rich, &row);
     row.append(&author);
     row.append(&body.view);
     messages.append(&row);
@@ -1823,7 +2061,7 @@ fn format_tokens(value: u64) -> String {
 mod tests {
     use super::{
         EmbeddedMarkdownContent, render_latex_svg, render_markdown, render_mermaid_svg,
-        shimmer_markup, thinking_summary,
+        render_streaming_markdown, shimmer_markup, thinking_summary,
     };
     use gtk4::pango;
     use std::time::Duration;
@@ -1838,15 +2076,76 @@ mod tests {
 
         assert_eq!(
             plain_text,
-            "Result\n\nUse bold, italic, and \u{fffc}.\n\n• first\n• ☑ done\n\n│ quoted"
+            "Result\nUse bold, italic, and \u{fffc}.\n• first\n• ☑ done\n│ quoted"
         );
         assert!(rendered.markup.contains("weight=\"bold\""));
+        assert!(rendered.markup.contains("foreground=\"#febc38\""));
+        assert!(rendered.markup.contains("foreground=\"#777d88\""));
         assert!(rendered.markup.contains("<b>bold</b>"));
         assert_eq!(rendered.embedded.len(), 1);
         assert_eq!(
             rendered.embedded[0].content,
             EmbeddedMarkdownContent::InlineCode("code".to_owned())
         );
+    }
+
+    #[test]
+    fn markdown_keeps_adjacent_blocks_on_distinct_compact_lines() {
+        let rendered = render_markdown(
+            "## Heading\nParagraph\n\n> Quote\n\n1. first\n\n```text\ncode\n```\n\n***\n\nAfter",
+        );
+        let (_, plain_text, _) = pango::parse_markup(&rendered.markup, '\0')
+            .expect("renderer must produce valid Pango markup");
+
+        assert_eq!(
+            plain_text,
+            "Heading\nParagraph\n│ Quote\n1. first\n\u{fffc}\n────────────────────────\nAfter"
+        );
+    }
+
+    #[test]
+    fn markdown_separates_only_headings_after_the_first() {
+        let rendered = render_markdown(
+            "# Overview\nIntro\n\n## Design\nDetails\n\n### Parser\nImplementation",
+        );
+        let (_, plain_text, _) = pango::parse_markup(&rendered.markup, '\0')
+            .expect("renderer must produce valid Pango markup");
+
+        assert_eq!(
+            plain_text,
+            "Overview\nIntro\n────────────────────────\nDesign\nDetails\n────────────────────────\nParser\nImplementation"
+        );
+        assert_eq!(
+            rendered
+                .headings
+                .iter()
+                .map(|heading| (heading.level, heading.title.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "Overview"), (2, "Design"), (3, "Parser")]
+        );
+    }
+
+    #[test]
+    fn streaming_markdown_formats_incomplete_inline_and_block_syntax() {
+        let rendered = render_streaming_markdown(
+            "# Live\n\nWriting **formatted text and `inline code\n\n```rust\nfn render() {",
+        );
+        let (_, plain_text, _) = pango::parse_markup(&rendered.markup, '\0')
+            .expect("streaming renderer must produce valid Pango markup");
+
+        assert_eq!(
+            plain_text,
+            "Live\nWriting formatted text and \u{fffc}\n\u{fffc}"
+        );
+        assert!(rendered.markup.contains("<b>formatted text and "));
+        assert!(matches!(
+            &rendered.embedded[0].content,
+            EmbeddedMarkdownContent::InlineCode(code) if code == "inline code"
+        ));
+        assert!(matches!(
+            &rendered.embedded[1].content,
+            EmbeddedMarkdownContent::CodeBlock(code) if code == "fn render() {"
+        ));
     }
 
     #[test]
@@ -1971,7 +2270,7 @@ A=
         }
         let (_, plain_text, _) = pango::parse_markup(&rendered.markup, '\0')
             .expect("renderer must produce valid Pango markup");
-        assert_eq!(plain_text, "\u{fffc}\n\n\u{fffc}");
+        assert_eq!(plain_text, "\u{fffc}\n\u{fffc}");
     }
 
     #[test]

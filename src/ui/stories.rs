@@ -36,7 +36,7 @@ pub(crate) fn find(id: &str) -> Option<Story> {
     STORIES.iter().copied().find(|story| story.id == id)
 }
 
-const STORIES: [Story; 48] = [
+const STORIES: [Story; 50] = [
     Story {
         id: "header/ready",
         title: "Header · Ready",
@@ -92,6 +92,20 @@ const STORIES: [Story; 48] = [
         width: 900,
         height: 720,
         build: conversation_markdown,
+    },
+    Story {
+        id: "conversation/streaming-markdown",
+        title: "Conversation · Streaming Markdown",
+        width: 900,
+        height: 620,
+        build: conversation_streaming_markdown,
+    },
+    Story {
+        id: "conversation/inline-code-alignment",
+        title: "Conversation · Inline code alignment",
+        width: 900,
+        height: 360,
+        build: conversation_inline_code_alignment,
     },
     Story {
         id: "conversation/rich-content-stress",
@@ -531,12 +545,25 @@ fn conversation_markdown() -> gtk::Widget {
 
 Messages support **strong emphasis**, *italics*, `inline code`, and native math such as $E = mc^2$.
 
+## Compact blocks
+This paragraph starts directly after its heading without running into it.
+
+> Quoted guidance stays muted and compact.
+
+- List markers use omp's accent color.
+- Adjacent items stay on separate lines.
+
 $$\frac{-b \pm \sqrt{b^2 - 4ac}}{2a}$$
+
+### Structured output
+Tables and formulas become rich widgets as soon as their Markdown is complete.
 
 | Renderer | Output | Status |
 | :--- | :---: | ---: |
 | LaTeX | Vector formula | Ready |
 | Mermaid | Native SVG | Ready |
+
+## Diagrams and code
 
 ```mermaid
 flowchart LR
@@ -552,6 +579,40 @@ fn render(markdown: &str) {
     println!("{markdown}");
 }
 ```"#,
+    );
+    view.widget().clone()
+}
+fn conversation_streaming_markdown() -> gtk::Widget {
+    let view = ConversationView::main();
+    let source = r#"# Streaming Markdown
+
+Completed blocks stay formatted while the active block grows.
+
+## Live formatting
+The parser keeps **unfinished emphasis readable and renders `inline code
+
+```rust
+fn render_stream(delta: &str) {
+    push(delta);"#;
+    let body = view.append_streaming_message(MessageRole::Assistant, source);
+    body.set_streaming_text(source);
+    view.widget().clone()
+}
+
+fn conversation_inline_code_alignment() -> gtk::Widget {
+    let view = ConversationView::main();
+    let relaxed = view.append_message(
+        MessageRole::Assistant,
+        "Relaxed line height keeps `inline code` on the text baseline.",
+    );
+    relaxed.add_css_class("story-line-height-relaxed");
+    view.append_message(
+        MessageRole::Assistant,
+        "Default line height keeps `inline code` on the text baseline.",
+    );
+    view.append_message(
+        MessageRole::Assistant,
+        "Font metrics, not a fixed offset, position each `code pill`.",
     );
     view.widget().clone()
 }

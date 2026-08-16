@@ -12,6 +12,7 @@ pub(crate) mod sidebar;
 pub(crate) mod sound_settings;
 #[cfg(feature = "ui-stories")]
 pub(crate) mod stories;
+pub(crate) mod streaming_markdown;
 pub(crate) mod todos;
 pub(crate) mod tool_components;
 pub(crate) mod workspace;
