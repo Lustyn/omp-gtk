@@ -22,7 +22,7 @@ Required work:
 - Add composer attachment state independent of the text buffer.
 - Support an attachment button and file chooser.
 - Support pasting image data from the clipboard. Drag-and-drop may use the same ingestion path.
-- Show each pending image as a removable preview with an accessible name.
+- Show each pending image as a removable preview with an accessible name and no opaque strip behind unused preview space.
 - Encode accepted images as RPC `ImageContent` payloads without blocking GTK's main thread.
 - Preserve the draft and attachments when encoding or submission fails.
 - Clear attachments only after the bridge accepts the request.
@@ -83,34 +83,34 @@ Protocol dependency: existing RPC covers steering and follow-up. Dequeue-by-ID a
 
 ### 3. Todos
 
-**Outcome:** the current todo plan is continuously visible and directly manageable without entering textual `/todo` subcommands.
+**Outcome:** todo progress stays visible without consuming conversation space or making the user responsible for managing agent work.
 
 Current state:
 
-- omp includes `todoPhases` in `get_state` and exposes `set_todos`.
-- Native drops `todoPhases` during deserialization.
-- `/todo` is available through the RPC text handler, but its TUI panel and direct interaction are absent.
+- omp includes authoritative `todoPhases` in `get_state`.
+- `/todo` remains available to the agent through the RPC text handler.
+- Native renders a progress rail over the conversation and reveals plan detail on hover, focus, or activation.
 
 Required work:
 
-- Deserialize todo phases, task states, and active-task identity from `get_state`.
-- Add a compact progress summary near the composer or conversation status.
-- Add an expandable panel with phases, ordered tasks, states, and the active task.
-- Support the same observable operations as the todo tool: initialize, append, start, complete, drop, block, unblock, remove, and clear.
-- Keep omp authoritative. Send complete validated phase state through `set_todos`, then reconcile with the returned state or the next state event.
-- Do not infer task completion from tool cards or assistant prose.
+- Deserialize todo phases and every task state from `get_state`.
+- Keep the surface informational: no initialize, append, start, complete, drop, block, unblock, remove, or clear controls.
+- Use omp's bounded walking-window policy: hide completed phases, retain one recently closed task for context, show current open work, and summarize later phases.
+- Keep task states visually and semantically distinct without treating the UI as the source of progress.
+- Replace displayed data only from authoritative omp state. Do not infer task completion from tool cards or assistant prose.
 
 Acceptance criteria:
 
 - Existing todos appear after startup and session switching.
-- Phase order and task state survive a round trip through `set_todos`.
+- A compact rail communicates overall completion without changing conversation or composer layout.
+- Hover, keyboard focus, and activation reveal the bounded plan detail.
+- Completed work disappears except for one recent context row; open work remains ordered and visible.
 - In-progress, blocked, completed, and abandoned tasks are visually and semantically distinct.
-- The summary updates during a turn without rebuilding unrelated conversation widgets.
-- Invalid edits fail visibly and leave the last confirmed state intact.
-- Component stories cover empty, multi-phase, blocked, completed, and long-task states.
-- A production bridge check edits a todo and confirms the resulting `get_state.todoPhases` value.
+- Empty plans do not reserve space.
+- Component stories cover empty, multi-phase, blocked, completed, active, and long-task states.
+- A production bridge check confirms that `get_state.todoPhases` renders without exposing todo mutation actions.
 
-Protocol dependency: none for baseline read/write support. Incremental todo operations would reduce whole-state updates but are not required initially.
+Protocol dependency: none for read-only plan display.
 
 ### 4. Vibe, goal, and loop modes
 
@@ -298,7 +298,7 @@ Parity work should extend rather than replace these working native surfaces:
 - Conversation and session-file sidebar/history
 - New, switch, rename, reveal, and delete conversation flows
 - Streaming assistant text and thinking
-- Markdown and tool cards, including images returned by tools
+- Markdown and tool cards, including GFM tables, native LaTeX, Mermaid diagrams, and images returned by tools
 - Model picker and thinking-level picker
 - Static slash/subcommand completion for commands advertised by omp
 - Stop/abort
