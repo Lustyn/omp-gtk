@@ -175,21 +175,18 @@ Protocol dependency: required. These modes are not currently exposed by `rpc-ui`
 
 Current state:
 
-- Native subscribes to subagent lifecycle/progress/events and shows subagent chips.
-- Users can open a subagent transcript.
-- Native does not provide omp's full runtime roster/tree, unread state, metrics, direct chat/steer, revive, abort/release, or persistent-agent history.
+- Native subscribes to subagent lifecycle/progress/events and shows a right-side parent/child session tree.
+- Users can open live transcripts and restored transcripts discovered from the resumed session file.
+- Native does not provide omp's unread state, direct chat/steer, revive, or abort/release controls.
 - Native does not provide the `/agents` configuration hub for enabling agents or selecting per-agent model, prewalk, and advisor behavior.
 
 #### Runtime hub
 
 Required work:
 
-- Show every registered agent except Main in roster and parent/child tree views.
-- Include status, current or last task, last activity, unread count, model/role, context/cost metrics when available, and child relationships.
-- Open a live transcript from a selected row.
+- Add unread state and any roster metadata not currently exposed by the runtime snapshots.
 - Support direct chat or steering to an agent.
 - Support revive for parked agents and abort/release for active or retained agents with confirmation where destructive.
-- Include persisted historical subagents after restart.
 
 #### Agent configuration hub
 
@@ -211,7 +208,7 @@ Acceptance criteria:
 - Stories cover empty, running tree, unread, parked, failed, long-task, and transcript states.
 - Production bridge checks cover transcript loading plus one supported lifecycle or messaging action.
 
-Protocol dependency: partial. Existing subagent snapshots/events/messages cover the current read-only subset. Roster metadata, unread state, chat, revive, release, metrics, persisted discovery, and configuration operations require additional RPC support.
+Protocol dependency: partial. Existing subagent snapshots/events/messages cover live agents; native reconstructs historical agents from persisted task results and nested transcript files. Unread state, chat, revive, release, and configuration operations still require additional RPC support.
 
 ### 6. Session tree
 
@@ -303,7 +300,7 @@ Parity work should extend rather than replace these working native surfaces:
 - Static slash/subcommand completion for commands advertised by omp
 - Stop/abort
 - Context usage, token rate, cost, and workspace display
-- Subagent chips and read-only transcript view
+- Right-side live and persisted agent tree with read-only transcript views
 - Per-message copy and quote actions
 - Generic extension `select`, `confirm`, `input`, and `editor` dialogs
 - Extension notices, status text, string widgets, editor text updates, and URL launching

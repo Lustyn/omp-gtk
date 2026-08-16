@@ -19,8 +19,7 @@ pub(crate) struct WorkspaceView {
     pub(crate) hide_sidebar_button: gtk::Button,
     pub(crate) history_button: gtk::Button,
     pub(crate) preferences_button: gtk::Button,
-    pub(crate) agent_hub_button: gtk::Button,
-    agent_hub_button_badge: gtk::Label,
+    pub(crate) agent_hub_button: gtk::ToggleButton,
     pub(crate) back_button: gtk::Button,
     pub(crate) content_stack: gtk::Stack,
     pub(crate) agent_hub: AgentHubView,
@@ -66,24 +65,13 @@ pub(crate) fn build(app: &adw::Application, initial_runtime_id: u64) -> Workspac
     title.set_ellipsize(gtk::pango::EllipsizeMode::End);
     title.add_css_class("chat-title");
     let chat_status = ChatStatus::new();
-    let agent_hub_button = gtk::Button::new();
-    agent_hub_button.set_visible(false);
-    agent_hub_button.set_tooltip_text(Some("Open Agent Hub"));
-    agent_hub_button.update_property(&[gtk::accessible::Property::Label("Open Agent Hub")]);
-    agent_hub_button.add_css_class("agent-hub-button");
-    let agent_hub_button_content = gtk::Box::new(gtk::Orientation::Horizontal, 7);
-    agent_hub_button_content.append(&icons::icon(icons::Icon::Users, 15));
-    agent_hub_button_content.append(&gtk::Label::new(Some("Agents")));
-    let agent_hub_button_badge = gtk::Label::new(None);
-    agent_hub_button_badge.set_accessible_role(gtk::AccessibleRole::Presentation);
-    agent_hub_button_badge.add_css_class("agent-hub-button-badge");
-    agent_hub_button_content.append(&agent_hub_button_badge);
-    agent_hub_button.set_child(Some(&agent_hub_button_content));
+    let agent_hub = agent_hub::build();
+    let agent_hub_button = agent_hub.launcher();
     header.append(&show_sidebar_button);
     header.append(&back_button);
     header.append(&assistant_mark);
     header.append(&title);
-    header.append(&agent_hub_button);
+
     header.append(&chat_status.root);
     header.append(&window_controls());
 
@@ -99,8 +87,7 @@ pub(crate) fn build(app: &adw::Application, initial_runtime_id: u64) -> Workspac
         "Starting the local runtime and restoring your workspace.",
         "Establishing a secure local connection",
     );
-    let agent_hub = agent_hub::build();
-    let subagent_conversation = agent_hub.transcript.clone();
+    let subagent_conversation = ConversationView::transcript();
     let conversation_stack = gtk::Stack::new();
     conversation_stack.add_named(
         conversation.widget(),
@@ -110,14 +97,19 @@ pub(crate) fn build(app: &adw::Application, initial_runtime_id: u64) -> Workspac
     content_stack.set_transition_type(gtk::StackTransitionType::Crossfade);
     content_stack.set_transition_duration(180);
     content_stack.add_named(&conversation_stack, Some("chat"));
-    content_stack.add_named(agent_hub.widget(), Some("agent-hub"));
+    content_stack.add_named(subagent_conversation.widget(), Some("subagent"));
     content_stack.set_visible_child_name("chat");
 
     let todos = todos::TodoPanel::new();
+    let side_panes = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    side_panes.set_halign(gtk::Align::End);
+    side_panes.set_valign(gtk::Align::Center);
+    side_panes.append(agent_hub.widget());
+    side_panes.append(&todos.root);
     let conversation_overlay = gtk::Overlay::new();
     conversation_overlay.set_vexpand(true);
     conversation_overlay.set_child(Some(&content_stack));
-    conversation_overlay.add_overlay(&todos.root);
+    conversation_overlay.add_overlay(&side_panes);
     let composer = composer::build();
     let composer_clamp = adw::Clamp::builder()
         .maximum_size(900)
@@ -162,7 +154,6 @@ pub(crate) fn build(app: &adw::Application, initial_runtime_id: u64) -> Workspac
         history_button: sidebar.history,
         preferences_button: sidebar.preferences,
         agent_hub_button,
-        agent_hub_button_badge,
         back_button,
         content_stack,
         agent_hub,
@@ -205,38 +196,7 @@ impl WorkspaceView {
     }
 
     pub(crate) fn set_agent_hub_activity(&self, active: usize, total: usize) {
-        self.agent_hub_button.set_visible(total > 0);
-        if total == 0 {
-            self.agent_hub_button.remove_css_class("active");
-            return;
-        }
-
-        let agent_word = if total == 1 { "agent" } else { "agents" };
-        if active > 0 {
-            self.agent_hub_button.add_css_class("active");
-            self.agent_hub_button_badge
-                .set_text(&format!("{active} active"));
-            self.agent_hub_button.set_tooltip_text(Some(&format!(
-                "Open Agent Hub — {active} active of {total} {agent_word}"
-            )));
-            self.agent_hub_button
-                .update_property(&[gtk::accessible::Property::Label(&format!(
-                    "Open Agent Hub, {active} active, {total} total"
-                ))]);
-        } else {
-            self.agent_hub_button.remove_css_class("active");
-            self.agent_hub_button_badge.set_text(&format!(
-                "{total} {}",
-                if total == 1 { "record" } else { "records" }
-            ));
-            self.agent_hub_button.set_tooltip_text(Some(&format!(
-                "Open Agent Hub — {total} {agent_word} available to inspect"
-            )));
-            self.agent_hub_button
-                .update_property(&[gtk::accessible::Property::Label(&format!(
-                    "Open Agent Hub, {total} {agent_word} available, none active"
-                ))]);
-        }
+        self.agent_hub.set_counts(active, total);
     }
 }
 

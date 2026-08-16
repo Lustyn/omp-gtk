@@ -251,6 +251,10 @@ pub struct SubagentSnapshot {
     pub last_update: u64,
     pub progress: Option<SubagentProgress>,
     pub parent_tool_call_id: Option<String>,
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub historical: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]

@@ -50,29 +50,11 @@ pub(crate) struct ComposerView {
     extension_above: gtk::Box,
     extension_below: gtk::Box,
     extension_status: gtk::Label,
-    subagent_bar: gtk::Box,
-    subagent_count: gtk::Label,
-    subagent_chips: gtk::Box,
 }
 
 pub(crate) fn build() -> ComposerView {
     let composer = gtk::Box::new(gtk::Orientation::Vertical, 4);
     composer.add_css_class("composer");
-
-    let subagent_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    subagent_bar.set_visible(false);
-    subagent_bar.set_margin_top(7);
-    subagent_bar.set_margin_start(10);
-    subagent_bar.set_margin_end(10);
-    subagent_bar.add_css_class("subagent-bar");
-    let agents_icon = icons::icon(icons::Icon::Users, 15);
-    let subagent_count = gtk::Label::new(Some("Agents"));
-    subagent_count.add_css_class("subagent-count");
-    let subagent_chips = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    subagent_chips.set_hexpand(true);
-    subagent_bar.append(&agents_icon);
-    subagent_bar.append(&subagent_count);
-    subagent_bar.append(&subagent_chips);
 
     let input = gtk::TextView::new();
     input.update_property(&[gtk::accessible::Property::Label("Prompt")]);
@@ -229,7 +211,6 @@ pub(crate) fn build() -> ComposerView {
     controls.append(&session_actions);
     controls.append(&stop);
     controls.append(&send);
-    composer.append(&subagent_bar);
     composer.append(&extension_above);
     composer.append(&attachment_strip);
     composer.append(&input_overlay);
@@ -292,9 +273,6 @@ pub(crate) fn build() -> ComposerView {
         extension_above,
         extension_below,
         extension_status,
-        subagent_bar,
-        subagent_count,
-        subagent_chips,
     }
 }
 
@@ -567,24 +545,6 @@ impl ComposerView {
         self.completion.popdown();
     }
 
-    pub(crate) fn clear_subagent_chips(&self) {
-        while let Some(child) = self.subagent_chips.first_child() {
-            self.subagent_chips.remove(&child);
-        }
-    }
-
-    pub(crate) fn append_subagent_chip(&self, chip: &gtk::Button) {
-        self.subagent_chips.append(chip);
-    }
-
-    pub(crate) fn set_subagents_visible(&self, visible: bool) {
-        self.subagent_bar.set_visible(visible);
-    }
-
-    pub(crate) fn set_subagent_count(&self, text: &str) {
-        self.subagent_count.set_text(text);
-    }
-
     pub(crate) fn set_extension_status(&self, text: &str) {
         self.extension_status.set_text(text);
         self.extension_status.set_visible(!text.is_empty());
@@ -751,36 +711,6 @@ fn thinking_description(level: &str) -> &'static str {
         "max" => "Maximum reasoning the model supports",
         _ => "Uses this model's recommended reasoning depth",
     }
-}
-
-pub fn subagent_chip(name: &str, status: &str, active: bool) -> gtk::Button {
-    let button = gtk::Button::new();
-    button.add_css_class("subagent-chip");
-    if active {
-        button.add_css_class("subagent-chip-active");
-    } else {
-        button.add_css_class("subagent-chip-done");
-    }
-    let content = gtk::Box::new(gtk::Orientation::Horizontal, 5);
-    let spinner = gtk::Spinner::new();
-    spinner.set_visible(active);
-    if active {
-        spinner.start();
-    }
-    let icon = icons::icon(icons::Icon::Users, 14);
-    icon.set_visible(!active);
-    let label = gtk::Label::new(Some(name));
-    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    label.set_max_width_chars(18);
-    let status = gtk::Label::new(Some(status));
-    status.add_css_class("subagent-chip-status");
-    content.append(&spinner);
-    content.append(&icon);
-    content.append(&label);
-    content.append(&status);
-    button.set_child(Some(&content));
-    button.set_tooltip_text(Some("Open subagent transcript"));
-    button
 }
 
 #[cfg(test)]

@@ -899,140 +899,95 @@ popover.command-popover > contents {
     background: #0b0e12;
 }
 
-.subagent-bar {
-    padding: 5px 3px 6px;
-    border-bottom: 1px solid #2a2f38;
-    color: #929aa7;
+.agent-hub-surface {
+    margin-right: 12px;
 }
 
-.subagent-count {
-    font-size: 11px;
-    font-weight: 700;
-}
-
-.subagent-chip {
-    min-height: 27px;
-    padding: 2px 8px;
-    border: 1px solid #343b47;
-    border-radius: 999px;
-    background: #20242c;
-    color: #d5dae2;
-    box-shadow: none;
-    font-size: 11px;
-}
-
-.subagent-chip:hover {
-    background: #292f3a;
-}
-
-.subagent-chip-active {
-    border-color: #4a6487;
-    background: #202938;
-}
-
-.subagent-chip-done {
-    color: #9aa2ae;
-}
-
-.subagent-chip-status {
-    color: #7f8997;
-    font-size: 10px;
-}
-
-.agent-hub-button {
-    min-height: 30px;
-    padding: 3px 9px;
-    border: 1px solid #343b47;
-    border-radius: 8px;
-    background: #1d222a;
-    color: #cbd2dc;
-    box-shadow: none;
-}
-
-.agent-hub-button:hover {
-    background: #292f3a;
-}
-
-.agent-hub-button.active {
-    border-color: #405d4a;
-    background: #1c2821;
-}
-
-.agent-hub-button-badge {
-    padding: 1px 6px;
-    border-radius: 999px;
-    background: #2a303a;
-    color: #aeb6c2;
-    font-size: 10px;
-    font-weight: 700;
-}
-
-.agent-hub-button.active .agent-hub-button-badge {
-    background: #294033;
-    color: #a8d4b4;
-}
-
-.agent-hub {
-    background: #0f1217;
-}
-
-.agent-hub-summary {
-    min-height: 56px;
-    padding: 0 16px;
-    border-bottom: 1px solid #292f38;
+.agent-hub-launcher {
+    min-height: 34px;
+    padding: 0 10px;
+    color: #b8c0cb;
     background: #15191f;
+    border: 1px solid #303640;
+    border-radius: 9px;
 }
 
-.agent-hub-summary-icon {
+.agent-hub-launcher:hover,
+.agent-hub-launcher:checked {
+    color: #e2e6ec;
+    background: #242a33;
+    border-color: #485464;
+}
+
+.agent-hub-launcher.active {
+    color: #c4ead0;
+    border-color: #365643;
+}
+
+.agent-hub-launcher-count {
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.agent-hub-panel {
+    background: #111419;
+    border: 1px solid #303640;
+    border-radius: 11px;
+    box-shadow: 0 8px 24px alpha(#000000, 0.35);
+}
+
+.agent-hub-header {
+    padding: 11px 12px 10px;
+    border-bottom: 1px solid #292f38;
+}
+
+.agent-hub-header-icon {
     color: #8fa9cc;
 }
 
-.agent-hub-summary-title {
-    color: #e0e4eb;
-    font-size: 15px;
-    font-weight: 700;
+.agent-hub-title {
+    color: #e1e5eb;
+    font-size: 13px;
+    font-weight: 650;
 }
 
-.agent-hub-summary-subtitle {
-    color: #7f8997;
+.agent-hub-subtitle,
+.agent-hub-total-count {
+    color: #798390;
     font-size: 10px;
 }
 
-.agent-hub-active-count,
-.agent-hub-total-count {
-    padding: 3px 8px;
-    border-radius: 999px;
-    font-size: 11px;
-    font-weight: 700;
-}
-
 .agent-hub-active-count {
-    background: #203128;
-    color: #91c6a0;
+    color: #82c99a;
+    font-size: 10px;
+    font-weight: 650;
 }
 
 .agent-hub-active-count.inactive {
-    background: #252a33;
-    color: #84909f;
+    color: #798390;
 }
 
-.agent-hub-total-count {
-    background: #252a33;
-    color: #aab2bf;
-}
-
-.agent-hub-roster-scroll {
-    border-right: 1px solid #292f38;
-    background: #13171c;
+.agent-hub-roster-scroll,
+.agent-hub-roster-scroll > viewport,
+.agent-hub-roster-scroll > undershoot,
+.agent-hub-roster-scroll > overshoot,
+.agent-hub-roster,
+.agent-hub-roster row {
+    background: transparent;
 }
 
 .agent-hub-roster {
-    background: transparent;
+    padding: 5px;
 }
 
 .agent-hub-row {
-    border-bottom: 1px solid #252a31;
-    background: transparent;
+    margin: 1px 0;
+    border-radius: 8px;
+}
+
+.agent-hub-session-row:not(:first-child) {
+    margin-top: 5px;
+    border-top: 1px solid #252a32;
 }
 
 .agent-hub-row:hover {
@@ -1040,8 +995,8 @@ popover.command-popover > contents {
 }
 
 .agent-hub-row:selected {
-    background: #202938;
-    box-shadow: inset 3px 0 #79a5e3;
+    background: #202935;
+    box-shadow: inset 2px 0 #79a5e3;
 }
 
 .agent-hub-row:focus {
@@ -1049,141 +1004,116 @@ popover.command-popover > contents {
 }
 
 .agent-hub-row:selected:focus {
-    box-shadow: inset 3px 0 #79a5e3, inset 0 0 0 2px #4a6487;
+    box-shadow: inset 2px 0 #79a5e3, inset 0 0 0 2px #4a6487;
 }
 
-.agent-hub-tree-branch {
-    color: #667384;
-    font-size: 14px;
+.agent-hub-row-action {
+    padding: 7px 6px;
+    background: transparent;
+    border: 0;
+    border-radius: 7px;
+}
+
+.agent-hub-row-action:hover,
+.agent-hub-row-action:focus {
+    background: transparent;
+    box-shadow: none;
+}
+
+.agent-hub-expander {
+    min-width: 26px;
+    min-height: 26px;
+    padding: 0;
+    margin-top: 7px;
+    color: #7f8998;
+    background: transparent;
+    border: 0;
+    border-radius: 6px;
+}
+
+.agent-hub-expander:hover,
+.agent-hub-expander:checked {
+    color: #c8ced6;
+    background: #29303a;
 }
 
 .agent-hub-status-dot {
     font-size: 9px;
 }
 
-.agent-hub-agent-name,
-.agent-hub-detail-name {
-    color: #e2e6ec;
-    font-weight: 700;
+.agent-hub-agent-name {
+    color: #dde2e8;
+    font-size: 12px;
+    font-weight: 650;
 }
 
-.agent-hub-agent-status,
-.agent-hub-detail-status {
-    padding: 2px 7px;
+.agent-hub-agent-status {
+    padding: 1px 6px;
     border-radius: 999px;
-    font-size: 10px;
-    font-weight: 700;
+    font-size: 9px;
+    font-weight: 650;
 }
 
 .agent-hub-agent-task {
-    color: #c1c8d2;
-    font-size: 12px;
+    color: #aeb6c1;
+    font-size: 11px;
 }
 
 .agent-hub-agent-metadata {
-    color: #7f8997;
-    font-size: 11px;
-}
-
-.agent-hub-detail-header {
-    padding: 14px 18px 13px;
-    border-bottom: 1px solid #292f38;
-    background: #15191f;
-}
-
-.agent-hub-detail-name {
-    font-size: 17px;
-}
-
-.agent-hub-detail-context {
-    color: #c2c9d2;
-}
-
-.agent-hub-detail-field {
-    min-height: 37px;
-}
-
-.agent-hub-detail-caption,
-.agent-hub-transcript-heading {
-    color: #727d8c;
+    color: #737d8a;
     font-size: 9px;
-    font-weight: 700;
-    letter-spacing: 0.08em;
-}
-
-.agent-hub-detail-task,
-.agent-hub-detail-activity,
-.agent-hub-detail-runtime,
-.agent-hub-detail-metrics {
-    color: #b9c1cc;
-    font-size: 11px;
-}
-
-.agent-hub-detail-task {
-    color: #d4d9e1;
-    font-size: 12px;
-    font-weight: 600;
-}
-
-.agent-hub-transcript-heading {
-    padding: 10px 18px 0;
 }
 
 .agent-hub-empty-title {
-    color: #d4d9e1;
-    font-weight: 700;
+    color: #c4cad3;
+    font-size: 13px;
+    font-weight: 600;
 }
 
 .agent-hub-empty-help {
-    color: #7f8997;
-    font-size: 12px;
+    color: #747e8b;
+    font-size: 11px;
 }
 
-.agent-hub .agent-status-running {
+.agent-hub-surface .agent-status-running {
     color: #76c893;
 }
 
-.agent-hub-agent-status.agent-status-running,
-.agent-hub-detail-status.agent-status-running {
+.agent-hub-agent-status.agent-status-running {
     background: #203128;
 }
 
-.agent-hub .agent-status-pending {
+.agent-hub-surface .agent-status-pending {
     color: #d1b56f;
 }
 
-.agent-hub-agent-status.agent-status-pending,
-.agent-hub-detail-status.agent-status-pending {
+.agent-hub-agent-status.agent-status-pending {
     background: #302a1e;
 }
 
-.agent-hub .agent-status-completed {
+.agent-hub-surface .agent-status-completed {
     color: #9aa5b3;
 }
 
-.agent-hub-agent-status.agent-status-completed,
-.agent-hub-detail-status.agent-status-completed {
+.agent-hub-agent-status.agent-status-completed {
     background: #252a33;
 }
 
-.agent-hub .agent-status-failed {
+.agent-hub-surface .agent-status-failed {
     color: #e07b88;
 }
 
-.agent-hub-agent-status.agent-status-failed,
-.agent-hub-detail-status.agent-status-failed {
+.agent-hub-agent-status.agent-status-failed {
     background: #351f25;
 }
 
-.agent-hub .agent-status-aborted,
-.agent-hub .agent-status-unknown {
+.agent-hub-surface .agent-status-aborted,
+.agent-hub-surface .agent-status-unknown {
     color: #aa96a1;
 }
 
 .agent-hub-agent-status.agent-status-aborted,
-.agent-hub-detail-status.agent-status-aborted,
-.agent-hub-agent-status.agent-status-unknown,
-.agent-hub-detail-status.agent-status-unknown {
+.agent-hub-agent-status.agent-status-unknown {
     background: #2d252c;
 }
 

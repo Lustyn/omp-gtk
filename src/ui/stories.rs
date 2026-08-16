@@ -1,6 +1,7 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::SystemTime;
 
 use gtk::prelude::*;
@@ -646,10 +647,6 @@ fn composer_running_draft() -> gtk::Widget {
     view.set_thinking_sensitive(true);
     view.set_thinking_label("High");
     view.set_text("Run the accessibility review after this turn");
-    view.append_subagent_chip(&composer::subagent_chip("Designer", "Working", true));
-    view.append_subagent_chip(&composer::subagent_chip("Reviewer", "Done", false));
-    view.set_subagent_count("1 active · 2 total");
-    view.set_subagents_visible(true);
     view.set_primary_action(true, true);
     view.widget().clone()
 }
@@ -947,43 +944,43 @@ fn agent_hub_tree() -> gtk::Widget {
 }
 
 fn agent_hub_terminal() -> gtk::Widget {
-    agent_hub_story(
-        vec![
-            hub_snapshot(
-                "CompletedReviewer",
-                0,
-                "reviewer",
-                "completed",
-                "Review the projection",
-                Some(json!({
-                    "id": "CompletedReviewer",
-                    "index": 0,
-                    "agent": "reviewer",
-                    "agentSource": "project",
-                    "status": "completed",
-                    "task": "Review the projection",
-                    "recentTools": [],
-                    "recentOutput": [],
-                    "toolCount": 8,
-                    "requests": 5,
-                    "tokens": 24600,
-                    "cost": 0.084,
-                    "durationMs": 132000,
-                    "resolvedModel": "openai-codex/gpt-5.6-sol"
-                })),
-            ),
-            hub_snapshot(
-                "StoppedWorker",
-                1,
-                "task",
-                "aborted",
-                "Explore an obsolete approach",
-                None,
-            ),
-        ],
-        Some("CompletedReviewer"),
-        true,
-    )
+    let mut snapshots = vec![
+        hub_snapshot(
+            "CompletedReviewer",
+            0,
+            "reviewer",
+            "completed",
+            "Review the projection",
+            Some(json!({
+                "id": "CompletedReviewer",
+                "index": 0,
+                "agent": "reviewer",
+                "agentSource": "project",
+                "status": "completed",
+                "task": "Review the projection",
+                "recentTools": [],
+                "recentOutput": [],
+                "toolCount": 8,
+                "requests": 5,
+                "tokens": 24600,
+                "cost": 0.084,
+                "durationMs": 132000,
+                "resolvedModel": "openai-codex/gpt-5.6-sol"
+            })),
+        ),
+        hub_snapshot(
+            "StoppedWorker",
+            1,
+            "task",
+            "aborted",
+            "Explore an obsolete approach",
+            None,
+        ),
+    ];
+    for snapshot in &mut snapshots {
+        snapshot.historical = true;
+    }
+    agent_hub_story(snapshots, Some("CompletedReviewer"), true)
 }
 
 fn agent_hub_failure() -> gtk::Widget {
@@ -1093,51 +1090,130 @@ fn agent_hub_story(
     state.apply_snapshot(snapshots);
     let view = agent_hub::build();
     view.set_counts(state.active_count(), state.len());
-    let mut rendered = Vec::new();
-    for row in state.rows() {
-        let row = agent_hub::agent_row(&row);
-        view.append_row(&row);
-        rendered.push(row);
-    }
-    if let Some(id) = selected
-        && let Some(agent) = state.get(id)
-    {
-        view.show_agent(agent);
-        view.select_id(id, &rendered);
-        if transcript && agent.is_terminal() {
-            view.transcript.append_message(
-                MessageRole::User,
-                "Review the implementation and call out any remaining risks.",
-            );
-            view.transcript.append_thinking(
-                "I’ll inspect the final behavior, focusing on state transitions and accessible navigation.",
-                false,
-            );
-            view.transcript.append_message(
-                MessageRole::Assistant,
-                "Review complete. The final transcript remains available after the agent has finished.",
-            );
-        } else if transcript {
-            view.transcript.append_message(
-                MessageRole::User,
-                "Load the selected agent transcript and keep it current.",
-            );
-            view.transcript.append_thinking(
-                "I’ll read the authoritative transcript cursor, then request another slice when an event arrives.",
-                false,
-            );
-            view.transcript.append_message(
-                MessageRole::Assistant,
-                "The initial transcript is loaded. New completed messages will append without duplicating earlier entries.",
-            );
-        } else {
-            view.transcript.append_notice(
-                "Transcript messages have not been loaded in this story.",
-                false,
-            );
+
+    let pairs = state
+        .rows()
+        .into_iter()
+        .map(|tree_row| {
+            let rendered = agent_hub::agent_row(&tree_row, true);
+            view.append_row(&rendered);
+            (tree_row, rendered)
+        })
+        .collect::<Vec<_>>();
+    let pairs = Rc::new(pairs);
+
+    let session_title_text = if transcript {
+        selected
+            .and_then(|id| state.get(id))
+            .map(|agent| format!("Agent · {}", agent.display_name()))
+            .unwrap_or_else(|| "Agent transcript".to_owned())
+    } else {
+        "Main conversation".to_owned()
+    };
+    let session_title = gtk::Label::new(Some(&session_title_text));
+    session_title.set_xalign(0.0);
+    session_title.set_margin_top(18);
+    session_title.set_margin_start(22);
+    session_title.add_css_class("chat-title");
+
+    for (tree_row, rendered) in pairs.iter() {
+        let id = tree_row.agent.id.clone();
+        let name = tree_row.agent.display_name();
+        let title = session_title.clone();
+        let view_for_open = view.clone();
+        let pairs_for_open = pairs.clone();
+        rendered.open.connect_clicked(move |_| {
+            title.set_text(&format!("Agent · {name}"));
+            let rows = pairs_for_open
+                .iter()
+                .map(|(_, row)| row.clone())
+                .collect::<Vec<_>>();
+            view_for_open.select_id(&id, &rows);
+        });
+
+        if let Some(expander) = &rendered.expander {
+            let pairs_for_toggle = pairs.clone();
+            expander.connect_toggled(move |_| {
+                for (candidate, candidate_row) in pairs_for_toggle.iter() {
+                    let mut parent = candidate.parent_id.as_deref();
+                    let mut visible = true;
+                    while let Some(parent_id) = parent {
+                        let Some((parent_tree, parent_row)) = pairs_for_toggle
+                            .iter()
+                            .find(|(tree, _)| tree.agent.id == parent_id)
+                        else {
+                            break;
+                        };
+                        if parent_row
+                            .expander
+                            .as_ref()
+                            .is_some_and(|expander| !expander.is_active())
+                        {
+                            visible = false;
+                            break;
+                        }
+                        parent = parent_tree.parent_id.as_deref();
+                    }
+                    candidate_row.root.set_visible(visible);
+                }
+            });
         }
     }
-    view.widget().clone()
+
+    if let Some(id) = selected {
+        let rows = pairs.iter().map(|(_, row)| row.clone()).collect::<Vec<_>>();
+        view.select_id(id, &rows);
+    }
+    view.set_revealed(!state.is_empty());
+
+    let center = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    center.append(&session_title);
+    if transcript {
+        let transcript_view = ConversationView::transcript();
+        transcript_view.append_message(
+            MessageRole::User,
+            "Load the selected agent transcript and keep it current.",
+        );
+        transcript_view.append_thinking(
+            "I’ll read the authoritative transcript cursor, then request another slice when an event arrives.",
+            false,
+        );
+        transcript_view.append_message(
+            MessageRole::Assistant,
+            "The initial transcript is loaded. New completed messages append without duplicating earlier entries.",
+        );
+        center.append(transcript_view.widget());
+    } else {
+        let placeholder = gtk::Label::new(Some(
+            "Agent transcripts open here without replacing the right-side session tree.",
+        ));
+        placeholder.set_wrap(true);
+        placeholder.set_halign(gtk::Align::Center);
+        placeholder.set_valign(gtk::Align::Center);
+        placeholder.set_vexpand(true);
+        placeholder.add_css_class("conversation-hero-detail");
+        center.append(&placeholder);
+    }
+
+    let todo = todos::TodoPanel::new();
+    todo.set_phases(&[TodoPhase {
+        name: "Implementation".to_owned(),
+        tasks: vec![TodoItem {
+            content: "Overhaul the agent hub side pane".to_owned(),
+            status: TodoStatus::InProgress,
+            blocker: None,
+        }],
+    }]);
+    let side_panes = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    side_panes.set_halign(gtk::Align::End);
+    side_panes.set_valign(gtk::Align::Center);
+    side_panes.append(view.widget());
+    side_panes.append(&todo.root);
+
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&center));
+    overlay.add_overlay(&side_panes);
+    workspace_story(overlay.upcast_ref())
 }
 
 fn hub_snapshot(

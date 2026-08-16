@@ -167,6 +167,7 @@ pub(crate) fn build(app: &adw::Application) {
         tool_groups_by_call_id: RefCell::new(HashMap::new()),
         agent_hub: RefCell::new(AgentHubState::default()),
         agent_hub_rows: RefCell::new(Vec::new()),
+        collapsed_agents: RefCell::new(HashSet::new()),
         subagent_transcript: RefCell::new(None),
         subagent_active_tool_group: RefCell::new(None),
         subagent_tool_groups_by_call_id: RefCell::new(HashMap::new()),
@@ -183,6 +184,7 @@ pub(crate) fn build(app: &adw::Application) {
         conversation_view_lru: RefCell::new(VecDeque::from([initial_runtime_id])),
         unread_runtimes: RefCell::new(HashSet::new()),
         current_session_file: RefCell::new(None),
+        hydrated_agent_session: RefCell::new(None),
         current_session_title: RefCell::new("New conversation".to_owned()),
         pending_session_notice: RefCell::new(None),
         branch_picker: RefCell::new(None),
@@ -481,6 +483,7 @@ struct AppController {
     tool_groups_by_call_id: RefCell<HashMap<String, ToolActivityGroup>>,
     agent_hub: RefCell<AgentHubState>,
     agent_hub_rows: RefCell<Vec<agent_hub_ui::AgentHubRow>>,
+    collapsed_agents: RefCell<HashSet<String>>,
     subagent_transcript: RefCell<Option<SubagentTranscriptState>>,
     subagent_active_tool_group: RefCell<Option<ToolActivityGroup>>,
     subagent_tool_groups_by_call_id: RefCell<HashMap<String, ToolActivityGroup>>,
@@ -489,6 +492,7 @@ struct AppController {
     conversation_views: RefCell<HashMap<u64, WarmConversation>>,
     conversation_view_lru: RefCell<VecDeque<u64>>,
     current_session_file: RefCell<Option<PathBuf>>,
+    hydrated_agent_session: RefCell<Option<PathBuf>>,
     current_session_title: RefCell<String>,
     pending_session_notice: RefCell<Option<String>>,
     branch_picker: RefCell<Option<session_actions::BranchPickerDialog>>,
@@ -673,9 +677,11 @@ impl AppController {
         });
 
         let weak = Rc::downgrade(self);
-        self.ui.agent_hub_button.connect_clicked(move |_| {
-            if let Some(controller) = weak.upgrade() {
-                controller.open_agent_hub();
+        self.ui.agent_hub_button.connect_toggled(move |button| {
+            if button.is_active()
+                && let Some(controller) = weak.upgrade()
+            {
+                controller.refresh_agent_surfaces();
             }
         });
 
@@ -1605,6 +1611,7 @@ impl AppController {
             .as_deref()
             .and_then(session_catalog::read_session_title);
         self.current_session_file.replace(session_file.clone());
+        self.restore_persisted_subagents();
         let resolved = session_catalog::authoritative_title(
             state.session_name.as_deref(),
             disk_title.as_deref(),
@@ -2913,62 +2920,42 @@ impl AppController {
                 .as_deref()
                 .and_then(|id| hub.get(id))
                 .cloned();
-            (hub.rows(), hub.active_count(), hub.len(), selected)
+            (
+                hub.visible_rows(&self.collapsed_agents.borrow()),
+                hub.active_count(),
+                hub.len(),
+                selected,
+            )
         };
 
         self.ui.agent_hub.clear_rows();
         let mut rendered_rows = Vec::with_capacity(tree_rows.len());
         for row in &tree_rows {
-            let rendered = agent_hub_ui::agent_row(row);
+            let expanded = !self.collapsed_agents.borrow().contains(&row.agent.id);
+            let rendered = agent_hub_ui::agent_row(row, expanded);
             let id = rendered.id.clone();
             let weak = Rc::downgrade(self);
-            rendered.root.connect_activate(move |_| {
+            rendered.open.connect_clicked(move |_| {
                 if let Some(controller) = weak.upgrade() {
                     controller.open_subagent_view(&id);
                 }
             });
+            if let Some(expander) = &rendered.expander {
+                let id = rendered.id.clone();
+                let weak = Rc::downgrade(self);
+                expander.connect_toggled(move |button| {
+                    if let Some(controller) = weak.upgrade() {
+                        controller.set_agent_expanded(&id, button.is_active());
+                    }
+                });
+            }
             self.ui.agent_hub.append_row(&rendered);
             rendered_rows.push(rendered);
         }
         self.agent_hub_rows.replace(rendered_rows);
         self.ui.agent_hub.set_counts(active_count, total_count);
 
-        self.ui.composer.clear_subagent_chips();
-        let mut chip_agents = tree_rows
-            .iter()
-            .map(|row| row.agent.clone())
-            .collect::<Vec<_>>();
-        chip_agents.sort_by(|left, right| {
-            right
-                .is_active()
-                .cmp(&left.is_active())
-                .then_with(|| left.index.cmp(&right.index))
-        });
-        for agent in chip_agents {
-            let status = title_case(&agent.status);
-            let chip = composer::subagent_chip(&agent.display_name(), &status, agent.is_active());
-            let tooltip = match (agent.current_task(), agent.current_activity()) {
-                (Some(task), Some(activity)) => format!("{task}\n{activity}"),
-                (Some(task), None) => task.to_owned(),
-                (None, Some(activity)) => activity,
-                (None, None) => "No task or activity metadata reported".to_owned(),
-            };
-            chip.set_tooltip_text(Some(&tooltip));
-            let id = agent.id.clone();
-            let weak = Rc::downgrade(self);
-            chip.connect_clicked(move |_| {
-                if let Some(controller) = weak.upgrade() {
-                    controller.open_subagent_view(&id);
-                }
-            });
-            self.ui.composer.append_subagent_chip(&chip);
-        }
-        self.ui
-            .composer
-            .set_subagents_visible(!self.agent_hub.borrow().is_empty());
-
         if let Some(agent) = selected {
-            self.ui.agent_hub.show_agent(&agent);
             self.ui
                 .agent_hub
                 .select_id(&agent.id, &self.agent_hub_rows.borrow());
@@ -2976,11 +2963,11 @@ impl AppController {
             self.active_subagent.borrow_mut().take();
             self.subagent_transcript.borrow_mut().take();
             self.clear_subagent_tool_groups();
-            self.ui.agent_hub.show_placeholder();
+            self.ui.agent_hub.unselect_all();
         }
         self.update_activity_counts();
         if total_count == 0
-            && self.ui.content_stack.visible_child_name().as_deref() == Some("agent-hub")
+            && self.ui.content_stack.visible_child_name().as_deref() == Some("subagent")
         {
             self.close_subagent_view();
         }
@@ -2988,14 +2975,18 @@ impl AppController {
 
     fn open_agent_hub(self: &Rc<Self>) {
         self.refresh_agent_surfaces();
-        if self.agent_hub.borrow().is_empty() {
-            return;
+        if !self.agent_hub.borrow().is_empty() {
+            self.ui.agent_hub.set_revealed(true);
         }
-        self.ui.title.set_text("Agent Hub");
-        self.ui.back_button.set_visible(true);
-        self.ui.composer.set_session_actions_visible(false);
-        self.ui.composer_clamp.set_visible(false);
-        self.ui.content_stack.set_visible_child_name("agent-hub");
+    }
+
+    fn set_agent_expanded(self: &Rc<Self>, id: &str, expanded: bool) {
+        if expanded {
+            self.collapsed_agents.borrow_mut().remove(id);
+        } else {
+            self.collapsed_agents.borrow_mut().insert(id.to_owned());
+        }
+        self.refresh_agent_surfaces();
     }
 
     fn open_subagent_view(self: &Rc<Self>, id: &str) {
@@ -3003,8 +2994,11 @@ impl AppController {
             return;
         };
         self.open_agent_hub();
+        self.ui.content_stack.set_visible_child_name("subagent");
+        self.ui.back_button.set_visible(true);
+        self.ui.composer.set_session_actions_visible(false);
+        self.ui.composer_clamp.set_visible(false);
         if self.active_subagent.borrow().as_deref() == Some(id) {
-            self.ui.agent_hub.show_agent(&agent);
             self.ui
                 .agent_hub
                 .select_id(id, &self.agent_hub_rows.borrow());
@@ -3019,13 +3013,12 @@ impl AppController {
             &format!("Loading {}’s transcript…", agent.display_name()),
             false,
         );
-        self.ui.agent_hub.show_agent(&agent);
         self.ui
             .agent_hub
             .select_id(id, &self.agent_hub_rows.borrow());
         self.ui
             .title
-            .set_text(&format!("Agent Hub · {}", agent.display_name()));
+            .set_text(&format!("Agent · {}", agent.display_name()));
         self.subagent_transcript
             .replace(Some(SubagentTranscriptState {
                 id: id.to_owned(),
@@ -3038,6 +3031,24 @@ impl AppController {
     }
 
     fn request_subagent_transcript(&self) {
+        let historical_session =
+            self.subagent_transcript
+                .borrow()
+                .as_ref()
+                .and_then(|transcript| {
+                    self.agent_hub
+                        .borrow()
+                        .get(&transcript.id)
+                        .filter(|agent| agent.historical)
+                        .and_then(|agent| agent.session_file.as_deref())
+                        .map(PathBuf::from)
+                        .map(|path| (transcript.id.clone(), path))
+                });
+        if let Some((id, path)) = historical_session {
+            self.load_persisted_subagent_transcript(&id, &path);
+            return;
+        }
+
         let Some(client) = self.active_client() else {
             self.ui
                 .subagent_conversation
@@ -3067,6 +3078,40 @@ impl AppController {
             }
             Err(error) => self.subagent_transcript_failed(None, &error.to_string()),
         }
+    }
+
+    fn load_persisted_subagent_transcript(&self, id: &str, path: &Path) {
+        let messages = match session_catalog::read_session_messages(path) {
+            Ok(messages) => messages,
+            Err(error) => {
+                self.subagent_transcript_failed(
+                    None,
+                    &format!("Could not read the saved agent transcript: {error}"),
+                );
+                return;
+            }
+        };
+        {
+            let mut transcript = self.subagent_transcript.borrow_mut();
+            let Some(transcript) = transcript.as_mut().filter(|transcript| transcript.id == id)
+            else {
+                return;
+            };
+            transcript.request_id = None;
+            transcript.pending_refresh = false;
+            transcript.has_content = !messages.is_empty();
+        }
+        self.ui.subagent_conversation.clear();
+        self.clear_subagent_tool_groups();
+        if messages.is_empty() {
+            self.ui.subagent_conversation.append_notice(
+                "This saved agent has not produced transcript messages.",
+                false,
+            );
+        } else {
+            self.append_subagent_messages(&messages);
+        }
+        self.ui.subagent_conversation.scroll_to_bottom();
     }
 
     fn apply_subagent_transcript(
@@ -3276,6 +3321,7 @@ impl AppController {
         self.active_subagent.borrow_mut().take();
         self.subagent_transcript.borrow_mut().take();
         self.clear_subagent_tool_groups();
+        self.ui.agent_hub.unselect_all();
         self.ui.content_stack.set_visible_child_name("chat");
         self.ui.back_button.set_visible(false);
         self.ui.composer_clamp.set_visible(true);
@@ -3283,18 +3329,37 @@ impl AppController {
         self.update_send_state();
     }
 
+    fn restore_persisted_subagents(self: &Rc<Self>) {
+        let Some(path) = self.current_session_file.borrow().clone() else {
+            self.hydrated_agent_session.borrow_mut().take();
+            return;
+        };
+        if self.hydrated_agent_session.borrow().as_deref() == Some(path.as_path()) {
+            return;
+        }
+        self.hydrated_agent_session.replace(Some(path.clone()));
+        let Ok(agents) = session_catalog::read_session_subagents(&path) else {
+            return;
+        };
+        if agents.is_empty() {
+            return;
+        }
+        self.agent_hub.borrow_mut().apply_snapshot(agents);
+        self.refresh_agent_surfaces();
+    }
+
     fn clear_subagents(&self) {
         self.agent_hub.borrow_mut().clear();
         self.agent_hub_rows.borrow_mut().clear();
+        self.collapsed_agents.borrow_mut().clear();
+        self.hydrated_agent_session.borrow_mut().take();
         self.active_subagent.borrow_mut().take();
         self.subagent_transcript.borrow_mut().take();
         self.clear_subagent_tool_groups();
         self.ui.agent_hub.clear_rows();
         self.ui.agent_hub.set_counts(0, 0);
-        self.ui.agent_hub.show_placeholder();
-        self.ui.composer.clear_subagent_chips();
-        self.ui.composer.set_subagents_visible(false);
-        if self.ui.content_stack.visible_child_name().as_deref() == Some("agent-hub") {
+        self.ui.agent_hub.unselect_all();
+        if self.ui.content_stack.visible_child_name().as_deref() == Some("subagent") {
             self.ui.content_stack.set_visible_child_name("chat");
             self.ui.back_button.set_visible(false);
             self.ui.composer_clamp.set_visible(true);
@@ -3309,10 +3374,7 @@ impl AppController {
             (hub.active_count(), hub.len())
         };
         self.ui.set_agent_hub_activity(active_agents, total_agents);
-        self.ui
-            .composer
-            .set_subagent_count(&format!("{active_agents} active · {total_agents} total"));
-        self.ui.agent_hub.set_counts(active_agents, total_agents);
+
         let running_sessions = self
             .runtimes
             .borrow()
@@ -4155,14 +4217,6 @@ fn completion_row(completion: &CommandCompletion) -> gtk::ListBoxRow {
     content.append(&description);
     row.set_child(Some(&content));
     row
-}
-
-fn title_case(value: &str) -> String {
-    let mut characters = value.chars();
-    match characters.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
-        None => String::new(),
-    }
 }
 
 fn compact_path(path: &Path) -> String {

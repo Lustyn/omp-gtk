@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
-use crate::bridge::protocol::{message_role, message_text};
+use crate::bridge::protocol::{SubagentProgress, SubagentSnapshot, message_role, message_text};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionEntry {
@@ -186,9 +186,34 @@ pub fn read_session_title(path: &Path) -> Option<String> {
 }
 
 pub fn read_session_messages(path: &Path) -> io::Result<Vec<Value>> {
+    Ok(read_session_branch(path)?
+        .into_iter()
+        .filter_map(|entry| {
+            (entry.get("type").and_then(Value::as_str) == Some("message"))
+                .then(|| entry.get("message").cloned())
+                .flatten()
+        })
+        .collect())
+}
+
+pub fn read_session_subagents(path: &Path) -> io::Result<Vec<SubagentSnapshot>> {
+    let mut snapshots = Vec::new();
+    let mut seen_files = HashSet::new();
+    let mut seen_agents = HashSet::new();
+    read_persisted_subagents(
+        path,
+        None,
+        &mut seen_files,
+        &mut seen_agents,
+        &mut snapshots,
+    )?;
+    Ok(snapshots)
+}
+
+fn read_session_branch(path: &Path) -> io::Result<Vec<Value>> {
     struct BranchEntry {
         parent_id: Option<String>,
-        message: Option<Value>,
+        entry: Value,
     }
 
     let file = File::open(path)?;
@@ -204,34 +229,283 @@ pub fn read_session_messages(path: &Path) -> io::Result<Vec<Value>> {
         if entry.get("type").and_then(Value::as_str) == Some("session") {
             continue;
         }
-        let Some(id) = entry.get("id").and_then(Value::as_str) else {
+        let Some(id) = entry
+            .get("id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+        else {
             continue;
         };
         let parent_id = entry
             .get("parentId")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
-        let message = (entry.get("type").and_then(Value::as_str) == Some("message"))
-            .then(|| entry.get("message").cloned())
-            .flatten();
-        entries.insert(id.to_owned(), BranchEntry { parent_id, message });
-        leaf_id = Some(id.to_owned());
+        entries.insert(id.clone(), BranchEntry { parent_id, entry });
+        leaf_id = Some(id);
     }
 
     let mut branch = Vec::new();
     let mut seen = HashSet::new();
     let mut cursor = leaf_id;
     while let Some(id) = cursor.filter(|id| seen.insert(id.clone())) {
-        let Some(entry) = entries.get(&id) else {
+        let Some(entry) = entries.remove(&id) else {
             break;
         };
-        if let Some(message) = entry.message.clone() {
-            branch.push(message);
-        }
-        cursor = entry.parent_id.clone();
+        branch.push(entry.entry);
+        cursor = entry.parent_id;
     }
     branch.reverse();
     Ok(branch)
+}
+
+fn read_persisted_subagents(
+    path: &Path,
+    parent_id: Option<&str>,
+    seen_files: &mut HashSet<PathBuf>,
+    seen_agents: &mut HashSet<String>,
+    output: &mut Vec<SubagentSnapshot>,
+) -> io::Result<()> {
+    if !seen_files.insert(path.to_owned()) {
+        return Ok(());
+    }
+
+    let branch = read_session_branch(path)?;
+    let mut agents = HashMap::<String, SubagentSnapshot>::new();
+    let mut order = Vec::new();
+    for entry in &branch {
+        let timestamp = entry
+            .pointer("/message/timestamp")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        match entry.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                let Some(message) = entry.get("message") else {
+                    continue;
+                };
+                if message_role(message) != Some("toolResult") {
+                    continue;
+                }
+                let tool_name = message
+                    .get("toolName")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let Some(details) = message.get("details") else {
+                    continue;
+                };
+                if tool_name == "task" {
+                    for progress in details
+                        .get("progress")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        let Ok(progress) =
+                            serde_json::from_value::<SubagentProgress>(progress.clone())
+                        else {
+                            continue;
+                        };
+                        let id = progress.id.clone();
+                        if !agents.contains_key(&id) {
+                            order.push(id.clone());
+                        }
+                        agents.insert(
+                            id.clone(),
+                            snapshot_from_progress(
+                                progress,
+                                parent_id,
+                                message
+                                    .get("toolCallId")
+                                    .and_then(Value::as_str)
+                                    .map(ToOwned::to_owned),
+                                subagent_session_file(path, &id),
+                                timestamp,
+                            ),
+                        );
+                    }
+                } else if tool_name == "hub" {
+                    for job in details
+                        .get("jobs")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        apply_persisted_job(
+                            &mut agents,
+                            &mut order,
+                            job,
+                            None,
+                            None,
+                            parent_id,
+                            path,
+                            timestamp,
+                        );
+                    }
+                }
+            }
+            Some("custom_message")
+                if entry.get("customType").and_then(Value::as_str) == Some("async-result") =>
+            {
+                let content = entry.get("content").and_then(Value::as_str);
+                for job in entry
+                    .pointer("/details/jobs")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    apply_persisted_job(
+                        &mut agents,
+                        &mut order,
+                        job,
+                        Some("completed"),
+                        content,
+                        parent_id,
+                        path,
+                        timestamp,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for id in order {
+        let Some(mut snapshot) = agents.remove(&id) else {
+            continue;
+        };
+        if matches!(snapshot.status.as_str(), "pending" | "running" | "started") {
+            snapshot.status = "completed".to_owned();
+            if let Some(progress) = snapshot.progress.as_mut() {
+                progress.status = snapshot.status.clone();
+            }
+        }
+        let transcript = snapshot.session_file.clone().map(PathBuf::from);
+        if seen_agents.insert(snapshot.id.clone()) {
+            output.push(snapshot);
+        }
+        if let Some(transcript) = transcript {
+            let _ =
+                read_persisted_subagents(&transcript, Some(&id), seen_files, seen_agents, output);
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_from_progress(
+    progress: SubagentProgress,
+    parent_id: Option<&str>,
+    parent_tool_call_id: Option<String>,
+    session_file: Option<PathBuf>,
+    last_update: u64,
+) -> SubagentSnapshot {
+    SubagentSnapshot {
+        id: progress.id.clone(),
+        index: progress.index,
+        agent: progress.agent.clone(),
+        agent_source: progress.agent_source.clone(),
+        description: progress.description.clone(),
+        status: progress.status.clone(),
+        task: (!progress.task.trim().is_empty()).then(|| progress.task.clone()),
+        assignment: progress.assignment.clone(),
+        session_file: session_file.map(|path| path.to_string_lossy().into_owned()),
+        last_update,
+        progress: Some(progress),
+        parent_tool_call_id,
+        parent_id: parent_id.map(ToOwned::to_owned),
+        historical: true,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_persisted_job(
+    agents: &mut HashMap<String, SubagentSnapshot>,
+    order: &mut Vec<String>,
+    job: &Value,
+    default_status: Option<&str>,
+    content: Option<&str>,
+    parent_id: Option<&str>,
+    path: &Path,
+    last_update: u64,
+) {
+    let Some(id) = job
+        .get("id")
+        .or_else(|| job.get("jobId"))
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+    let status = job
+        .get("status")
+        .and_then(Value::as_str)
+        .or_else(|| persisted_result_status(content, id))
+        .or(default_status)
+        .unwrap_or("completed");
+    if let Some(snapshot) = agents.get_mut(id) {
+        snapshot.status = status.to_owned();
+        snapshot.last_update = snapshot.last_update.max(last_update);
+        if let Some(progress) = snapshot.progress.as_mut() {
+            progress.status = status.to_owned();
+            if let Some(duration) = job.get("durationMs").and_then(Value::as_u64) {
+                progress.duration_ms = duration;
+            }
+            if let Some(model) = job.get("resolvedModel").and_then(Value::as_str) {
+                progress.resolved_model = Some(model.to_owned());
+            }
+        }
+        return;
+    }
+
+    let index = order.len();
+    let agent = job
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("subagent");
+    let task = job.get("label").and_then(Value::as_str).unwrap_or(id);
+    let progress = serde_json::from_value::<SubagentProgress>(serde_json::json!({
+        "id": id,
+        "index": index,
+        "agent": agent,
+        "status": status,
+        "task": task,
+        "durationMs": job.get("durationMs").and_then(Value::as_u64).unwrap_or_default(),
+        "resolvedModel": job.get("resolvedModel").and_then(Value::as_str),
+    }))
+    .expect("persisted job projection is valid");
+    order.push(id.to_owned());
+    agents.insert(
+        id.to_owned(),
+        snapshot_from_progress(
+            progress,
+            parent_id,
+            None,
+            subagent_session_file(path, id),
+            last_update,
+        ),
+    );
+}
+
+fn persisted_result_status<'a>(content: Option<&'a str>, id: &str) -> Option<&'a str> {
+    let content = content?;
+    let marker = format!("<task-result id=\"{id}\"");
+    let result = content.split_once(&marker)?.1;
+    let status = result.split_once("status=\"")?.1.split_once('"')?.0;
+    Some(if status.starts_with("failed") {
+        "failed"
+    } else if status.starts_with("aborted") {
+        "aborted"
+    } else {
+        "completed"
+    })
+}
+
+fn subagent_session_file(parent: &Path, id: &str) -> Option<PathBuf> {
+    fs::read_dir(parent.with_extension(""))
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
+                && path.file_stem().and_then(|stem| stem.to_str()) == Some(id)
+        })
 }
 
 fn read_session_metadata(path: &Path) -> SessionMetadata {
@@ -343,13 +617,14 @@ pub fn delete_session_files(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
     use std::fs;
     use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        authoritative_title, discover_all_sessions, read_session_messages, read_session_title,
-        recent_workspaces, session_entry,
+        authoritative_title, discover_all_sessions, read_session_messages, read_session_subagents,
+        read_session_title, recent_workspaces, session_entry,
     };
 
     #[test]
@@ -444,6 +719,99 @@ mod tests {
         assert_eq!(texts, ["First prompt", "First answer", "Second prompt"]);
 
         fs::remove_dir_all(directory).expect("remove transcript fixture directory");
+    }
+    #[test]
+    fn restores_nested_agents_and_terminal_statuses_from_session_files() {
+        let directory = fixture_directory("subagent-hydration");
+        let path = directory.join("session.jsonl");
+        let artifacts = path.with_extension("");
+        fs::create_dir(&artifacts).expect("create session artifacts");
+        let parent_transcript = artifacts.join("ParentAgent.jsonl");
+        let parent_artifacts = parent_transcript.with_extension("");
+        fs::create_dir(&parent_artifacts).expect("create parent agent artifacts");
+        let child_transcript = parent_artifacts.join("ChildScout.jsonl");
+
+        let parent_spawn = json!({
+            "type": "message",
+            "id": "spawn-parent",
+            "parentId": null,
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "task-parent",
+                "toolName": "task",
+                "timestamp": 100,
+                "details": {
+                    "progress": [{
+                        "id": "ParentAgent",
+                        "index": 0,
+                        "agent": "task",
+                        "status": "pending",
+                        "task": "Coordinate persisted work"
+                    }]
+                }
+            }
+        });
+        let parent_done = json!({
+            "type": "custom_message",
+            "customType": "async-result",
+            "id": "done-parent",
+            "parentId": "spawn-parent",
+            "content": "<task-result id=\"ParentAgent\" agent=\"task\" status=\"completed\">done</task-result>",
+            "details": {"jobs": [{"jobId": "ParentAgent", "type": "task", "durationMs": 4200}]}
+        });
+        fs::write(&path, format!("{parent_spawn}\n{parent_done}\n")).expect("write parent session");
+
+        let child_spawn = json!({
+            "type": "message",
+            "id": "spawn-child",
+            "parentId": null,
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "task-child",
+                "toolName": "task",
+                "timestamp": 200,
+                "details": {
+                    "progress": [{
+                        "id": "ChildScout",
+                        "index": 0,
+                        "agent": "scout",
+                        "status": "running",
+                        "task": "Inspect persisted metadata"
+                    }]
+                }
+            }
+        });
+        let child_done = json!({
+            "type": "custom_message",
+            "customType": "async-result",
+            "id": "done-child",
+            "parentId": "spawn-child",
+            "content": "<task-result id=\"ChildScout\" agent=\"scout\" status=\"failed (exit 1)\">failed</task-result>",
+            "details": {"jobs": [{"jobId": "ChildScout", "type": "scout", "durationMs": 900}]}
+        });
+        fs::write(&parent_transcript, format!("{child_spawn}\n{child_done}\n"))
+            .expect("write parent transcript");
+        fs::write(
+            &child_transcript,
+            "{\"type\":\"message\",\"id\":\"child-message\",\"parentId\":null,\"message\":{\"role\":\"assistant\",\"content\":\"Persisted result\"}}\n",
+        )
+        .expect("write child transcript");
+
+        let agents = read_session_subagents(&path).expect("restore persisted agents");
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0].id, "ParentAgent");
+        assert_eq!(agents[0].status, "completed");
+        assert!(agents[0].historical);
+        assert_eq!(
+            agents[0].session_file.as_deref(),
+            parent_transcript.to_str()
+        );
+        assert_eq!(agents[1].id, "ChildScout");
+        assert_eq!(agents[1].status, "failed");
+        assert_eq!(agents[1].parent_id.as_deref(), Some("ParentAgent"));
+        assert_eq!(agents[1].session_file.as_deref(), child_transcript.to_str());
+
+        fs::remove_dir_all(directory).expect("remove subagent hydration fixture");
     }
 
     #[test]

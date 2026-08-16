@@ -16,6 +16,8 @@ pub(crate) struct AgentRecord {
     pub(crate) assignment: Option<String>,
     pub(crate) session_file: Option<String>,
     pub(crate) parent_tool_call_id: Option<String>,
+    pub(crate) parent_id: Option<String>,
+    pub(crate) historical: bool,
     pub(crate) last_update: u64,
     pub(crate) progress: Option<SubagentProgress>,
     order: usize,
@@ -73,6 +75,7 @@ pub(crate) struct AgentTreeRow {
     pub(crate) agent: AgentRecord,
     pub(crate) depth: usize,
     pub(crate) parent_id: Option<String>,
+    pub(crate) has_children: bool,
 }
 
 #[derive(Debug, Default)]
@@ -135,6 +138,8 @@ impl AgentHubState {
                     assignment: snapshot.assignment,
                     session_file: snapshot.session_file,
                     parent_tool_call_id: snapshot.parent_tool_call_id,
+                    parent_id: snapshot.parent_id,
+                    historical: snapshot.historical,
                     last_update: snapshot.last_update,
                     progress: snapshot.progress,
                     order,
@@ -213,6 +218,8 @@ impl AgentHubState {
                     .as_ref()
                     .and_then(|agent| agent.parent_tool_call_id.clone())
             }),
+            parent_id: existing.as_ref().and_then(|agent| agent.parent_id.clone()),
+            historical: false,
             last_update: existing.as_ref().map_or(0, |agent| agent.last_update),
             progress,
             order,
@@ -223,6 +230,14 @@ impl AgentHubState {
     }
 
     pub(crate) fn rows(&self) -> Vec<AgentTreeRow> {
+        self.project_rows(&HashSet::new())
+    }
+
+    pub(crate) fn visible_rows(&self, collapsed: &HashSet<String>) -> Vec<AgentTreeRow> {
+        self.project_rows(collapsed)
+    }
+
+    fn project_rows(&self, collapsed: &HashSet<String>) -> Vec<AgentTreeRow> {
         let mut children = HashMap::<Option<String>, Vec<&AgentRecord>>::new();
         for agent in self.agents.values() {
             let parent = self
@@ -240,14 +255,32 @@ impl AgentHubState {
         let mut visited = HashSet::new();
         let roots = children.remove(&None).unwrap_or_default();
         for root in roots {
-            append_tree(root, 0, None, &children, &mut visited, &mut rows);
+            append_tree(
+                root,
+                0,
+                None,
+                true,
+                &children,
+                collapsed,
+                &mut visited,
+                &mut rows,
+            );
         }
 
         let mut leftovers = self.agents.values().collect::<Vec<_>>();
         leftovers.sort_by_key(|agent| (agent.index, agent.order));
         for agent in leftovers {
             if !visited.contains(&agent.id) {
-                append_tree(agent, 0, None, &children, &mut visited, &mut rows);
+                append_tree(
+                    agent,
+                    0,
+                    None,
+                    true,
+                    &children,
+                    collapsed,
+                    &mut visited,
+                    &mut rows,
+                );
             }
         }
         rows
@@ -263,6 +296,15 @@ impl AgentHubState {
         self.parent_by_id.retain(|child, parent| {
             self.agents.contains_key(child) && self.agents.contains_key(parent) && child != parent
         });
+        for agent in self.agents.values() {
+            if let Some(parent) = agent
+                .parent_id
+                .as_ref()
+                .filter(|parent| self.agents.contains_key(*parent) && *parent != &agent.id)
+            {
+                self.parent_by_id.insert(agent.id.clone(), parent.clone());
+            }
+        }
         for parent in self.agents.values() {
             let Some(details) = parent
                 .progress
@@ -285,25 +327,34 @@ fn append_tree(
     agent: &AgentRecord,
     depth: usize,
     parent_id: Option<String>,
+    visible: bool,
     children: &HashMap<Option<String>, Vec<&AgentRecord>>,
+    collapsed: &HashSet<String>,
     visited: &mut HashSet<String>,
     rows: &mut Vec<AgentTreeRow>,
 ) {
     if !visited.insert(agent.id.clone()) {
         return;
     }
-    rows.push(AgentTreeRow {
-        agent: agent.clone(),
-        depth,
-        parent_id,
-    });
-    if let Some(descendants) = children.get(&Some(agent.id.clone())) {
+    let descendants = children.get(&Some(agent.id.clone()));
+    if visible {
+        rows.push(AgentTreeRow {
+            agent: agent.clone(),
+            depth,
+            parent_id: parent_id.clone(),
+            has_children: descendants.is_some_and(|descendants| !descendants.is_empty()),
+        });
+    }
+    let descendants_visible = visible && !collapsed.contains(&agent.id);
+    if let Some(descendants) = descendants {
         for child in descendants {
             append_tree(
                 child,
                 depth + 1,
                 Some(agent.id.clone()),
+                descendants_visible,
                 children,
+                collapsed,
                 visited,
                 rows,
             );
@@ -347,6 +398,7 @@ fn looks_like_uuid(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use std::collections::HashSet;
 
     use super::AgentHubState;
     use crate::bridge::protocol::RpcEvent;
@@ -459,6 +511,13 @@ mod tests {
         assert_eq!(rows[1].agent.id, "Child");
         assert_eq!(rows[1].depth, 1);
         assert_eq!(rows[1].parent_id.as_deref(), Some("Parent"));
+        assert!(rows[0].has_children);
+        assert!(!rows[1].has_children);
+
+        let collapsed = HashSet::from(["Parent".to_owned()]);
+        let visible_rows = hub.visible_rows(&collapsed);
+        assert_eq!(visible_rows.len(), 1);
+        assert_eq!(visible_rows[0].agent.id, "Parent");
     }
 
     #[test]
