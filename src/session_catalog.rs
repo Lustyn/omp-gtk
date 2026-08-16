@@ -5,6 +5,8 @@ use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use gtk4::glib;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::bridge::protocol::{SubagentProgress, SubagentSnapshot, message_role, message_text};
@@ -19,6 +21,76 @@ pub struct SessionEntry {
     pub current: bool,
     pub running: bool,
     pub runtime_id: Option<u64>,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct PersistedRecentSessions {
+    #[serde(default)]
+    sessions: Vec<PathBuf>,
+}
+
+pub fn load_recent_sessions() -> Vec<SessionEntry> {
+    let path = recent_sessions_path();
+    match load_recent_sessions_from(&path) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!(
+                "Could not load recent sessions from {}: {error}",
+                path.display()
+            );
+            Vec::new()
+        }
+    }
+}
+
+pub fn save_recent_sessions(entries: &[SessionEntry]) -> Result<(), String> {
+    save_recent_sessions_to(&recent_sessions_path(), entries)
+}
+
+fn recent_sessions_path() -> PathBuf {
+    glib::user_config_dir()
+        .join("omp-gtk")
+        .join("recent-sessions.json")
+}
+
+fn load_recent_sessions_from(path: &Path) -> Result<Vec<SessionEntry>, String> {
+    let contents = match fs::read(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("Could not read {}: {error}", path.display())),
+    };
+    let persisted = serde_json::from_slice::<PersistedRecentSessions>(&contents)
+        .map_err(|error| format!("Could not decode {}: {error}", path.display()))?;
+    let mut seen = HashSet::new();
+    Ok(persisted
+        .sessions
+        .into_iter()
+        .filter(|session| session.is_file() && seen.insert(session.clone()))
+        .map(|session| session_entry(Some(&session), "", false, None))
+        .collect())
+}
+
+fn save_recent_sessions_to(path: &Path, entries: &[SessionEntry]) -> Result<(), String> {
+    let mut seen = HashSet::new();
+    let sessions = entries
+        .iter()
+        .filter_map(|entry| entry.path.as_ref())
+        .filter(|session| seen.insert((*session).clone()))
+        .cloned()
+        .collect();
+    let persisted = PersistedRecentSessions { sessions };
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Recent sessions path has no parent directory".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Could not create {}: {error}", parent.display()))?;
+    let temporary = path.with_extension("json.tmp");
+    let contents = serde_json::to_vec_pretty(&persisted)
+        .map_err(|error| format!("Could not encode recent sessions: {error}"))?;
+    fs::write(&temporary, contents)
+        .map_err(|error| format!("Could not write {}: {error}", temporary.display()))?;
+    fs::rename(&temporary, path)
+        .map_err(|error| format!("Could not replace {}: {error}", path.display()))
 }
 
 pub fn session_entry(
@@ -623,8 +695,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        authoritative_title, discover_all_sessions, read_session_messages, read_session_subagents,
-        read_session_title, recent_workspaces, session_entry,
+        authoritative_title, discover_all_sessions, load_recent_sessions_from,
+        read_session_messages, read_session_subagents, read_session_title, recent_workspaces,
+        save_recent_sessions_to, session_entry,
     };
 
     #[test]
@@ -856,6 +929,49 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("remove history fixture directory");
+    }
+
+    #[test]
+    fn recent_sessions_survive_restart_in_list_order() {
+        let root = fixture_directory("recent-sessions");
+        let first = root.join("first.jsonl");
+        let second = root.join("second.jsonl");
+        let store = root.join("config/recent-sessions.json");
+        write_session(&first, "First session", "/work/one", "First request");
+        write_session(&second, "Second session", "/work/two", "Second request");
+        let entries = vec![
+            session_entry(Some(&second), "", false, None),
+            session_entry(Some(&first), "", false, None),
+            session_entry(Some(&second), "", false, None),
+            session_entry(None, "Unsaved", false, None),
+        ];
+
+        save_recent_sessions_to(&store, &entries).expect("save recent sessions");
+        let restored = load_recent_sessions_from(&store).expect("restore recent sessions");
+
+        assert_eq!(
+            restored
+                .iter()
+                .filter_map(|entry| entry.path.as_deref())
+                .collect::<Vec<_>>(),
+            [second.as_path(), first.as_path()]
+        );
+        assert_eq!(
+            restored
+                .iter()
+                .map(|entry| entry.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Second session", "First session"]
+        );
+        assert!(restored.iter().all(|entry| !entry.current));
+        assert!(restored.iter().all(|entry| entry.runtime_id.is_none()));
+
+        fs::remove_file(&second).expect("remove stale recent session");
+        let restored = load_recent_sessions_from(&store).expect("restore existing sessions");
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].path.as_deref(), Some(first.as_path()));
+
+        fs::remove_dir_all(root).expect("remove recent sessions fixture directory");
     }
 
     #[test]

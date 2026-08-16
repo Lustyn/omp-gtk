@@ -101,6 +101,16 @@ fn touch_bounded_lru(order: &mut VecDeque<u64>, value: u64, limit: usize) -> Vec
     }
     evicted
 }
+fn identifies_same_session(left: &SessionEntry, right: &SessionEntry) -> bool {
+    left.runtime_id
+        .zip(right.runtime_id)
+        .is_some_and(|(left, right)| left == right)
+        || left
+            .path
+            .as_ref()
+            .zip(right.path.as_ref())
+            .is_some_and(|(left, right)| left == right)
+}
 fn messages_need_hydration(
     cached: Option<&[Value]>,
     view_hydrated: bool,
@@ -145,6 +155,7 @@ pub(crate) fn build(app: &adw::Application) {
     present_action.connect_activate(move |_, _| window.present());
     app.add_action(&present_action);
 
+    let recent_sessions = session_catalog::load_recent_sessions();
     let controller = Rc::new(AppController {
         ui,
         alerts,
@@ -172,7 +183,7 @@ pub(crate) fn build(app: &adw::Application) {
         subagent_active_tool_group: RefCell::new(None),
         subagent_tool_groups_by_call_id: RefCell::new(HashMap::new()),
         session_rows: RefCell::new(Vec::new()),
-        active_sessions: RefCell::new(Vec::new()),
+        active_sessions: RefCell::new(recent_sessions),
         conversation_views: RefCell::new(HashMap::from([(
             initial_runtime_id,
             WarmConversation {
@@ -208,6 +219,7 @@ pub(crate) fn build(app: &adw::Application) {
     });
 
     controller.wire_interactions();
+    controller.render_session_sidebar(controller.active_sessions.borrow().clone());
     controller.set_window_status(WindowStatus::Ready);
     if let (Some(runtime_id), Some(events)) = (active_runtime, events) {
         AppController::run_event_loop(&controller, runtime_id, events);
@@ -423,7 +435,7 @@ fn update_current_session(entries: &mut Vec<SessionEntry>, mut current: SessionE
     }
     if let Some(position) = entries
         .iter()
-        .position(|entry| entry.runtime_id == current.runtime_id)
+        .position(|entry| identifies_same_session(entry, &current))
     {
         current.created_at = entries[position].created_at;
         entries[position] = current;
@@ -978,6 +990,8 @@ impl AppController {
             runtime.workspace = refreshed.cwd.clone();
         }
         *entry = refreshed;
+        drop(entries);
+        self.persist_recent_sessions();
     }
 
     fn handle_runtime_event(self: &Rc<Self>, runtime_id: u64, event: RpcEvent) {
@@ -1763,6 +1777,12 @@ impl AppController {
         self.render_session_sidebar(entries);
     }
 
+    fn persist_recent_sessions(&self) {
+        if let Err(error) = session_catalog::save_recent_sessions(&self.active_sessions.borrow()) {
+            eprintln!("Could not save recent sessions: {error}");
+        }
+    }
+
     fn refresh_session_sidebar(self: &Rc<Self>) {
         let runtime_id = self.active_runtime.get();
         let running = runtime_id
@@ -1791,6 +1811,7 @@ impl AppController {
         update_current_session(&mut entries, current);
         let rendered = entries.clone();
         drop(entries);
+        self.persist_recent_sessions();
         self.render_session_sidebar(rendered);
     }
 
@@ -1872,6 +1893,7 @@ impl AppController {
         }
         let rendered = entries.clone();
         drop(entries);
+        self.persist_recent_sessions();
         self.render_session_sidebar(rendered);
     }
 
@@ -2272,7 +2294,8 @@ impl AppController {
                 opened.runtime_id = Some(runtime_id);
                 opened.current = true;
                 opened.running = false;
-                insert_session_by_creation(&mut self.active_sessions.borrow_mut(), opened.clone());
+                update_current_session(&mut self.active_sessions.borrow_mut(), opened.clone());
+                self.persist_recent_sessions();
                 self.activate_runtime(runtime_id, &opened);
             }
             Err(error) => self.show_error(&format!("Could not start omp: {error}")),
@@ -2290,7 +2313,8 @@ impl AppController {
         }
         self.active_sessions
             .borrow_mut()
-            .retain(|active| active.runtime_id != entry.runtime_id);
+            .retain(|active| !identifies_same_session(active, entry));
+        self.persist_recent_sessions();
         let next = entry
             .current
             .then(|| self.active_sessions.borrow().first().cloned())
@@ -2356,6 +2380,7 @@ impl AppController {
                 self.active_sessions
                     .borrow_mut()
                     .retain(|entry| entry.path.as_deref() != Some(path));
+                self.persist_recent_sessions();
                 self.render_session_sidebar(self.active_sessions.borrow().clone());
             }
             Err(error) => self.show_error(&format!("Could not delete conversation: {error}")),
@@ -4274,10 +4299,11 @@ mod tests {
     use super::{
         ComposerKeyAction, DeliveryModes, SubmissionAction, SubmissionIntent, ToolResultSource,
         WARM_SESSION_VIEW_LIMIT, cloned_or_insert_with, completion_is_unread, composer_key_action,
-        delivery_preference_updates, gdk, has_visible_text, insert_session_by_creation,
-        is_hidden_resume_message, is_resume_shortcut, messages_need_hydration,
-        reorder_session_entries, session_actions_are_relevant, should_finish_hydrated_tool_group,
-        should_send_delivery_preference_updates, touch_bounded_lru, update_current_session,
+        delivery_preference_updates, gdk, has_visible_text, identifies_same_session,
+        insert_session_by_creation, is_hidden_resume_message, is_resume_shortcut,
+        messages_need_hydration, reorder_session_entries, session_actions_are_relevant,
+        should_finish_hydrated_tool_group, should_send_delivery_preference_updates,
+        touch_bounded_lru, update_current_session,
     };
     use crate::alerts::Preferences;
     use crate::bridge::protocol::{InterruptMode, QueueMode, SessionState};
@@ -4420,6 +4446,7 @@ mod tests {
         assert!(!session_actions_are_relevant(
             true, true, false, false, false, false, true,
         ));
+
         assert!(!session_actions_are_relevant(
             true, true, true, true, false, false, true,
         ));
@@ -4443,6 +4470,47 @@ mod tests {
             entries[2].created_at,
             SystemTime::UNIX_EPOCH + Duration::from_secs(10)
         );
+    }
+
+    #[test]
+    fn restored_session_is_reused_when_the_runtime_reports_its_path() {
+        let path = std::path::Path::new("/tmp/omp-restored-session.jsonl");
+        let mut restored = session_entry(Some(path), "Restored", false, None);
+        restored.created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let mut current = session_entry(Some(path), "Current", true, None);
+        current.runtime_id = Some(1);
+
+        let mut entries = vec![restored];
+        update_current_session(&mut entries, current);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].runtime_id, Some(1));
+        assert!(entries[0].current);
+        assert_eq!(
+            entries[0].created_at,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn closing_one_restored_session_keeps_the_other_cold_sessions() {
+        let first = session_entry(
+            Some(std::path::Path::new("/tmp/omp-first-session.jsonl")),
+            "First",
+            false,
+            None,
+        );
+        let second = session_entry(
+            Some(std::path::Path::new("/tmp/omp-second-session.jsonl")),
+            "Second",
+            false,
+            None,
+        );
+        let mut entries = vec![first.clone(), second.clone()];
+
+        entries.retain(|entry| !identifies_same_session(entry, &first));
+
+        assert_eq!(entries, [second]);
     }
 
     #[test]
