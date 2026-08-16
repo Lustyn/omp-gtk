@@ -19,6 +19,7 @@ pub(crate) struct AgentHubView {
     detail_status: gtk::Label,
     detail_task: gtk::Label,
     detail_activity: gtk::Label,
+    detail_runtime: gtk::Label,
     detail_metrics: gtk::Label,
     pub(crate) transcript: ConversationView,
 }
@@ -36,16 +37,24 @@ pub(crate) fn build() -> AgentHubView {
 
     let summary = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     summary.add_css_class("agent-hub-summary");
-    summary.append(&icons::icon(icons::Icon::Users, 18));
-    let summary_title = gtk::Label::new(Some("Runtime agents"));
-    summary_title.set_hexpand(true);
+    let summary_icon = icons::icon(icons::Icon::Users, 18);
+    summary_icon.add_css_class("agent-hub-summary-icon");
+    summary.append(&summary_icon);
+    let summary_copy = gtk::Box::new(gtk::Orientation::Vertical, 1);
+    summary_copy.set_hexpand(true);
+    let summary_title = gtk::Label::new(Some("Agent activity"));
     summary_title.set_xalign(0.0);
     summary_title.add_css_class("agent-hub-summary-title");
+    let summary_subtitle = gtk::Label::new(Some("Live work and recent agent transcripts"));
+    summary_subtitle.set_xalign(0.0);
+    summary_subtitle.add_css_class("agent-hub-summary-subtitle");
+    summary_copy.append(&summary_title);
+    summary_copy.append(&summary_subtitle);
     let active_count = gtk::Label::new(Some("0 active"));
     active_count.add_css_class("agent-hub-active-count");
-    let total_count = gtk::Label::new(Some("0 total"));
+    let total_count = gtk::Label::new(Some("0 agents"));
     total_count.add_css_class("agent-hub-total-count");
-    summary.append(&summary_title);
+    summary.append(&summary_copy);
     summary.append(&active_count);
     summary.append(&total_count);
 
@@ -83,18 +92,21 @@ pub(crate) fn build() -> AgentHubView {
     placeholder.set_valign(gtk::Align::Center);
     placeholder.set_halign(gtk::Align::Center);
     placeholder.append(&icons::icon(icons::Icon::MessageSquare, 28));
-    let placeholder_title = gtk::Label::new(Some("Select an agent"));
+    let placeholder_title = gtk::Label::new(Some("Choose an agent"));
     placeholder_title.add_css_class("agent-hub-empty-title");
     let placeholder_help = gtk::Label::new(Some(
-        "Choose a roster row to inspect its authoritative live transcript.",
+        "Select an agent to review its current task, runtime activity, and transcript.",
     ));
+    placeholder_help.set_wrap(true);
+    placeholder_help.set_justify(gtk::Justification::Center);
+    placeholder_help.set_max_width_chars(42);
     placeholder_help.add_css_class("agent-hub-empty-help");
     placeholder.append(&placeholder_title);
     placeholder.append(&placeholder_help);
 
     let detail = gtk::Box::new(gtk::Orientation::Vertical, 0);
     detail.add_css_class("agent-hub-detail");
-    let detail_header = gtk::Box::new(gtk::Orientation::Vertical, 5);
+    let detail_header = gtk::Box::new(gtk::Orientation::Vertical, 11);
     detail_header.add_css_class("agent-hub-detail-header");
     let heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     let detail_name = gtk::Label::new(None);
@@ -106,15 +118,30 @@ pub(crate) fn build() -> AgentHubView {
     detail_status.add_css_class("agent-hub-detail-status");
     heading.append(&detail_name);
     heading.append(&detail_status);
-    let detail_task = detail_label("agent-hub-detail-task");
-    let detail_activity = detail_label("agent-hub-detail-activity");
-    let detail_metrics = detail_label("agent-hub-detail-metrics");
+
+    let context = gtk::Grid::new();
+    context.set_column_spacing(18);
+    context.set_row_spacing(9);
+    context.set_column_homogeneous(true);
+    context.add_css_class("agent-hub-detail-context");
+    let (task_field, detail_task) = detail_field("CURRENT TASK", "agent-hub-detail-task");
+    let (activity_field, detail_activity) =
+        detail_field("LATEST ACTIVITY", "agent-hub-detail-activity");
+    let (runtime_field, detail_runtime) = detail_field("RUNTIME", "agent-hub-detail-runtime");
+    let (metrics_field, detail_metrics) = detail_field("USAGE", "agent-hub-detail-metrics");
+    context.attach(&task_field, 0, 0, 1, 1);
+    context.attach(&activity_field, 1, 0, 1, 1);
+    context.attach(&runtime_field, 0, 1, 1, 1);
+    context.attach(&metrics_field, 1, 1, 1, 1);
     detail_header.append(&heading);
-    detail_header.append(&detail_task);
-    detail_header.append(&detail_activity);
-    detail_header.append(&detail_metrics);
+    detail_header.append(&context);
+
+    let transcript_heading = gtk::Label::new(Some("TRANSCRIPT"));
+    transcript_heading.set_xalign(0.0);
+    transcript_heading.add_css_class("agent-hub-transcript-heading");
     let transcript = ConversationView::transcript();
     detail.append(&detail_header);
+    detail.append(&transcript_heading);
     detail.append(transcript.widget());
 
     let detail_stack = gtk::Stack::new();
@@ -145,6 +172,7 @@ pub(crate) fn build() -> AgentHubView {
         detail_status,
         detail_task,
         detail_activity,
+        detail_runtime,
         detail_metrics,
         transcript,
     }
@@ -167,10 +195,17 @@ impl AgentHubView {
 
     pub(crate) fn set_counts(&self, active: usize, total: usize) {
         self.active_count.set_text(&format!("{active} active"));
-        self.total_count.set_text(&format!("{total} total"));
-        self.root.update_property(&[gtk::accessible::Property::Label(&format!(
-            "Runtime agent hub, {active} active, {total} total"
-        ))]);
+        if active == 0 {
+            self.active_count.add_css_class("inactive");
+        } else {
+            self.active_count.remove_css_class("inactive");
+        }
+        self.total_count
+            .set_text(&format!("{total} {}", plural(total, "agent", "agents")));
+        self.root
+            .update_property(&[gtk::accessible::Property::Label(&format!(
+                "Agent Hub, {active} active, {total} total"
+            ))]);
     }
 
     pub(crate) fn show_placeholder(&self) {
@@ -184,21 +219,17 @@ impl AgentHubView {
         self.detail_status.set_text(status_label(&agent.status));
         self.detail_status
             .set_css_classes(&["agent-hub-detail-status", status_class(&agent.status)]);
-        self.detail_task.set_text(
-            agent
-                .current_task()
-                .map(|task| format!("Task · {task}"))
-                .as_deref()
-                .unwrap_or("No task metadata reported"),
-        );
-        self.detail_activity.set_text(
-            agent
-                .current_activity()
-                .map(|activity| format!("Activity · {activity}"))
-                .as_deref()
-                .unwrap_or("No current activity reported"),
-        );
-        self.detail_metrics.set_text(&detail_metrics(agent));
+        let task = agent.current_task().unwrap_or_else(|| {
+            if agent.is_active() {
+                "Waiting for task details"
+            } else {
+                "Task details were not reported"
+            }
+        });
+        set_detail_value(&self.detail_task, task);
+        set_detail_value(&self.detail_activity, &activity_summary(agent));
+        set_detail_value(&self.detail_runtime, &runtime_summary(agent));
+        set_detail_value(&self.detail_metrics, &usage_summary(agent));
         self.detail_stack.set_visible_child_name("transcript");
     }
 
@@ -222,7 +253,7 @@ pub(crate) fn agent_row(row: &AgentTreeRow) -> AgentHubRow {
     content.set_margin_start(12 + i32::try_from(row.depth.min(8)).unwrap_or(8) * 20);
     content.set_margin_end(10);
     if row.depth > 0 {
-        let branch = gtk::Label::new(Some("└"));
+        let branch = gtk::Label::new(Some("↳"));
         branch.set_accessible_role(gtk::AccessibleRole::Presentation);
         branch.add_css_class("agent-hub-tree-branch");
         content.append(&branch);
@@ -247,13 +278,21 @@ pub(crate) fn agent_row(row: &AgentTreeRow) -> AgentHubRow {
     heading.append(&name);
     heading.append(&status);
 
-    let task = gtk::Label::new(Some(agent.current_task().unwrap_or("No task metadata reported")));
+    let task = gtk::Label::new(Some(agent.current_task().unwrap_or_else(|| {
+        if agent.is_active() {
+            "Waiting for task details"
+        } else {
+            "Task details were not reported"
+        }
+    })));
     task.set_xalign(0.0);
     task.set_ellipsize(gtk::pango::EllipsizeMode::End);
     task.add_css_class("agent-hub-agent-task");
-    let metadata = gtk::Label::new(Some(&row_metadata(agent)));
+    let metadata_text = row_metadata(agent);
+    let metadata = gtk::Label::new(Some(&metadata_text));
     metadata.set_xalign(0.0);
     metadata.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    metadata.set_tooltip_text(Some(&metadata_text));
     metadata.add_css_class("agent-hub-agent-metadata");
     text.append(&heading);
     text.append(&task);
@@ -261,23 +300,18 @@ pub(crate) fn agent_row(row: &AgentTreeRow) -> AgentHubRow {
     content.append(&text);
     root.set_child(Some(&content));
 
-    let parent = row
-        .parent_id
-        .as_deref()
-        .map(|parent| format!(", child of {parent}"))
-        .unwrap_or_default();
-    let activity = agent
-        .current_activity()
-        .map(|activity| format!(", {activity}"))
-        .unwrap_or_default();
+    let hierarchy = if row.parent_id.is_some() {
+        format!(", nested agent at level {}", row.depth + 1)
+    } else {
+        String::new()
+    };
     root.update_property(&[gtk::accessible::Property::Label(&format!(
-        "Agent {}, id {}, {}{}, task: {}{}",
+        "{}, {}{}; task: {}; {}",
         agent.display_name(),
-        agent.id,
         status_label(&agent.status),
-        parent,
+        hierarchy,
         agent.current_task().unwrap_or("not reported"),
-        activity
+        metadata_text
     ))]);
 
     AgentHubRow {
@@ -286,12 +320,24 @@ pub(crate) fn agent_row(row: &AgentTreeRow) -> AgentHubRow {
     }
 }
 
-fn detail_label(css_class: &str) -> gtk::Label {
-    let label = gtk::Label::new(None);
-    label.set_xalign(0.0);
-    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    label.add_css_class(css_class);
-    label
+fn detail_field(caption: &str, css_class: &str) -> (gtk::Box, gtk::Label) {
+    let field = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    field.add_css_class("agent-hub-detail-field");
+    let caption = gtk::Label::new(Some(caption));
+    caption.set_xalign(0.0);
+    caption.add_css_class("agent-hub-detail-caption");
+    let value = gtk::Label::new(None);
+    value.set_xalign(0.0);
+    value.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    value.add_css_class(css_class);
+    field.append(&caption);
+    field.append(&value);
+    (field, value)
+}
+
+fn set_detail_value(label: &gtk::Label, value: &str) {
+    label.set_text(value);
+    label.set_tooltip_text(Some(value));
 }
 
 fn status_label(status: &str) -> &str {
@@ -317,49 +363,69 @@ fn status_class(status: &str) -> &'static str {
 }
 
 fn row_metadata(agent: &AgentRecord) -> String {
-    let mut parts = vec![agent.agent.clone()];
-    if let Some(source) = agent.agent_source.as_deref() {
-        parts.push(source.to_owned());
-    }
-    if let Some(parent_tool_call_id) = agent.parent_tool_call_id.as_deref() {
-        parts.push(format!("task call {parent_tool_call_id}"));
-    }
+    let mut parts = vec![role_label(&agent.agent)];
     if let Some(activity) = agent.current_activity() {
         parts.push(activity);
-    } else if let Some(updated) = relative_update(agent.last_update) {
+    }
+    if let Some(updated) = relative_update(agent.last_update) {
         parts.push(updated);
     }
     parts.join(" · ")
 }
 
-fn detail_metrics(agent: &AgentRecord) -> String {
-    let mut parts = Vec::new();
-    parts.push(format!("ID {}", agent.id));
-    if let Some(parent_tool_call_id) = agent.parent_tool_call_id.as_deref() {
-        parts.push(format!("Parent task call {parent_tool_call_id}"));
+fn activity_summary(agent: &AgentRecord) -> String {
+    if let Some(activity) = agent.current_activity() {
+        activity
+    } else if agent.status == "pending" {
+        "Waiting to start".to_owned()
+    } else if agent.is_terminal() {
+        "No final activity was reported".to_owned()
+    } else {
+        "Working · activity details not reported".to_owned()
     }
+}
+
+fn runtime_summary(agent: &AgentRecord) -> String {
+    let role = role_label(&agent.agent);
+    let model = agent
+        .progress
+        .as_ref()
+        .and_then(|progress| {
+            progress
+                .resolved_model
+                .as_deref()
+                .map(|model| {
+                    if progress.resolved_model_is_fallback {
+                        format!("{model} (fallback)")
+                    } else {
+                        model.to_owned()
+                    }
+                })
+                .or_else(|| {
+                    progress
+                        .model_role
+                        .as_deref()
+                        .map(|model_role| format!("{model_role} model role"))
+                })
+        })
+        .unwrap_or_else(|| "Model not reported".to_owned());
+    format!("{role} · {model}")
+}
+
+fn usage_summary(agent: &AgentRecord) -> String {
+    let mut parts = Vec::new();
     if let Some(progress) = agent.progress.as_ref() {
-        if let Some(model) = progress.resolved_model.as_deref() {
-            let suffix = if progress.resolved_model_is_fallback {
-                " (fallback)"
-            } else {
-                ""
-            };
-            parts.push(format!("Model {model}{suffix}"));
-        } else if let Some(role) = progress.model_role.as_deref() {
-            parts.push(format!("Role {role}"));
-        }
         if progress.tokens > 0 {
             parts.push(format!("{} tokens", compact_number(progress.tokens)));
         }
         if let Some(context) = progress.context_tokens {
             match progress.context_window {
                 Some(window) if window > 0 => parts.push(format!(
-                    "context {}/{}",
+                    "{} / {} context",
                     compact_number(context),
                     compact_number(window)
                 )),
-                _ => parts.push(format!("context {}", compact_number(context))),
+                _ => parts.push(format!("{} context", compact_number(context))),
             }
         }
         if progress.cost > 0.0 {
@@ -369,20 +435,49 @@ fn detail_metrics(agent: &AgentRecord) -> String {
             parts.push(format_duration(progress.duration_ms));
         }
         if progress.requests > 0 {
-            parts.push(format!("{} requests", progress.requests));
+            parts.push(format!(
+                "{} {}",
+                progress.requests,
+                plural(progress.requests as usize, "request", "requests")
+            ));
         }
         if progress.tool_count > 0 {
-            parts.push(format!("{} tools", progress.tool_count));
+            parts.push(format!(
+                "{} {}",
+                progress.tool_count,
+                plural(progress.tool_count as usize, "tool", "tools")
+            ));
         }
+    }
+    if parts.is_empty() {
+        parts.push("Usage metrics not reported".to_owned());
     }
     if let Some(updated) = relative_update(agent.last_update) {
         parts.push(updated);
     }
-    if parts.is_empty() {
-        "No model or usage metrics reported".to_owned()
-    } else {
-        parts.join(" · ")
+    parts.join(" · ")
+}
+
+fn role_label(role: &str) -> String {
+    match role.trim() {
+        "" | "subagent" => "General-purpose agent".to_owned(),
+        "task" => "Task agent".to_owned(),
+        "scout" => "Scout".to_owned(),
+        "reviewer" => "Reviewer".to_owned(),
+        "librarian" => "Researcher".to_owned(),
+        role => {
+            let words = role.replace(|character: char| character == '-' || character == '_', " ");
+            let mut chars = words.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                None => "Agent".to_owned(),
+            }
+        }
     }
+}
+
+fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
+    if count == 1 { singular } else { plural }
 }
 
 fn compact_number(value: u64) -> String {
