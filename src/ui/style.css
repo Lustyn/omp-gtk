@@ -211,6 +211,7 @@ textview.message-body {
     color: inherit;
     font-size: 15px;
     line-height: 1.32;
+    min-height: 20px;
 }
 
 

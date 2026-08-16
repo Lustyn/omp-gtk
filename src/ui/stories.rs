@@ -36,7 +36,7 @@ pub(crate) fn find(id: &str) -> Option<Story> {
     STORIES.iter().copied().find(|story| story.id == id)
 }
 
-const STORIES: [Story; 53] = [
+const STORIES: [Story; 54] = [
     Story {
         id: "header/ready",
         title: "Header · Ready",
@@ -106,6 +106,13 @@ const STORIES: [Story; 53] = [
         width: 900,
         height: 520,
         build: conversation_attention_kind,
+    },
+    Story {
+        id: "conversation/plain-text",
+        title: "Conversation · Plain text",
+        width: 900,
+        height: 520,
+        build: conversation_plain_text,
     },
     Story {
         id: "conversation/streaming-markdown",
@@ -651,6 +658,19 @@ fn conversation_attention_kind() -> gtk::Widget {
 **2 → Safety.** Ordinary **strong emphasis** keeps the standard text color.
 
 **3 → Next action.** Deploy the tested revision, then watch the first production request."#,
+    );
+    view.widget().clone()
+}
+
+fn conversation_plain_text() -> gtk::Widget {
+    let view = ConversationView::main();
+    view.append_message(
+        MessageRole::User,
+        "Explain why ordinary messages sometimes disappear until another widget changes size.",
+    );
+    view.append_message(
+        MessageRole::Assistant,
+        "This response intentionally contains no Markdown formatting.\n\nThe second paragraph must remain visible before any composer or attachment resize occurs.",
     );
     view.widget().clone()
 }
