@@ -717,6 +717,9 @@ flowchart LR
     D --> C
     G --> C
     W --> C
+    style A1 fill:#ffcc00,color:#ffff00,stroke:#ffcc00
+    style A2 fill:#050505,color:#111111,stroke:#050505
+    linkStyle 6 stroke:#111111,color:#111111
 ```
 
 $$

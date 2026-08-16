@@ -6,6 +6,7 @@ pub(crate) mod conversation;
 #[cfg(feature = "ui-stories")]
 pub(crate) mod gallery;
 pub(crate) mod icons;
+pub(crate) mod mermaid;
 pub(crate) mod model_picker;
 pub(crate) mod session_actions;
 pub(crate) mod sidebar;

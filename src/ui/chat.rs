@@ -14,6 +14,7 @@ use ratex_svg::{SvgOptions, render_to_svg};
 use ratex_types::{Color, MathStyle};
 
 use super::icons;
+use super::mermaid;
 use super::streaming_markdown::mend_streaming_markdown;
 
 #[derive(Clone, Copy)]
@@ -1579,10 +1580,11 @@ fn mermaid_widget(source: &str) -> gtk::Widget {
 }
 
 fn render_mermaid_svg(source: &str) -> Result<String, String> {
-    let parsed = mermaid_rs_renderer::parse_mermaid(source).map_err(|error| error.to_string())?;
-    let mut theme = mermaid_rs_renderer::Theme::dark();
-    theme.background = "none".to_owned();
-    let config = mermaid_rs_renderer::LayoutConfig::default();
+    let mut parsed =
+        mermaid_rs_renderer::parse_mermaid(source).map_err(|error| error.to_string())?;
+    let theme = mermaid::theme();
+    let config = mermaid::layout_config();
+    mermaid::enforce_contrast(&mut parsed.graph, &theme, &config);
     let layout = mermaid_rs_renderer::compute_layout(&parsed.graph, &theme, &config);
     let dimensions = mermaid_rs_renderer::measure_svg_dimensions(&layout, &config, None);
     let scale = (720.0 / dimensions.width.max(1.0))
