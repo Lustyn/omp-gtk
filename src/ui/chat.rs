@@ -1257,6 +1257,25 @@ impl MessageBody {
     pub(crate) fn connect_headings_changed(&self, callback: impl Fn() + 'static) {
         self.heading_observers.borrow_mut().push(Box::new(callback));
     }
+    pub(crate) fn heading_y_in(
+        &self,
+        heading: &MarkdownHeading,
+        relative_to: &impl IsA<gtk::Widget>,
+    ) -> Option<f64> {
+        let iter = self.view.buffer().iter_at_offset(heading.offset);
+        let location = self.view.iter_location(&iter);
+        let (_, widget_y) = self.view.buffer_to_window_coords(
+            gtk::TextWindowType::Widget,
+            location.x(),
+            location.y(),
+        );
+        self.view
+            .compute_point(
+                relative_to,
+                &gtk::graphene::Point::new(0.0, widget_y as f32),
+            )
+            .map(|point| f64::from(point.y()))
+    }
 
     pub(crate) fn scroll_to_heading(
         &self,

@@ -36,7 +36,7 @@ pub(crate) fn find(id: &str) -> Option<Story> {
     STORIES.iter().copied().find(|story| story.id == id)
 }
 
-const STORIES: [Story; 54] = [
+const STORIES: [Story; 55] = [
     Story {
         id: "header/ready",
         title: "Header · Ready",
@@ -92,6 +92,13 @@ const STORIES: [Story; 54] = [
         width: 900,
         height: 720,
         build: conversation_outline_track,
+    },
+    Story {
+        id: "conversation/outline-card",
+        title: "Conversation · Expanded outline card",
+        width: 900,
+        height: 720,
+        build: conversation_outline_card,
     },
     Story {
         id: "conversation/markdown",
@@ -566,10 +573,24 @@ fn conversation_tool_use() -> gtk::Widget {
     view.widget().clone()
 }
 fn conversation_outline_track() -> gtk::Widget {
+    conversation_outline(false)
+}
+
+fn conversation_outline_card() -> gtk::Widget {
+    conversation_outline(true)
+}
+
+fn conversation_outline(revealed: bool) -> gtk::Widget {
     let view = ConversationView::main();
     view.append_message(
         MessageRole::Assistant,
         r#"# Deployment guide
+
+## Validate the release candidate
+Confirm the artifact came from the expected revision and passed the focused checks.
+
+## Freeze deployment inputs
+Keep the selected build, configuration, and release notes together.
 
 ## Prepare the release workspace
 Confirm the selected branch, review pending changes, and keep the release inputs together.
@@ -592,9 +613,16 @@ Exercise the primary workflow, error state, and recovery path against the live b
 ## Review runtime health
 Check resource usage and recent errors after traffic reaches the updated process.
 
+## Exercise the rollback path
+Verify that the retained inputs are sufficient to restore the previous build.
+
+## Publish release notes
+Record user-visible changes and link the deployed revision.
+
 ## Complete the release
-Record the deployed revision and retain the rollback inputs until the release is stable."#,
+Retain the rollback inputs until the release is stable."#,
     );
+    view.set_outline_revealed(revealed);
     view.widget().clone()
 }
 

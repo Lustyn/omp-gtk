@@ -21,42 +21,64 @@ pub(crate) struct ConversationView {
     outline: Rc<ConversationOutline>,
 }
 
+const OUTLINE_VIEWPORT_LEAD: f64 = 64.0;
+
+fn active_heading_index(heading_positions: &[f64], viewport_marker: f64) -> usize {
+    heading_positions
+        .iter()
+        .rposition(|position| *position <= viewport_marker)
+        .unwrap_or(0)
+}
+
 struct ConversationOutline {
     root: gtk::Box,
     revealer: gtk::Revealer,
     list: gtk::Box,
-    pointer: gtk::Scale,
+    list_scroll: gtk::ScrolledWindow,
+    rail: gtk::ToggleButton,
+    progress: gtk::ProgressBar,
+    count: gtk::Label,
     scroller: glib::WeakRef<gtk::ScrolledWindow>,
     items: glib::WeakRef<gtk::Box>,
     messages: RefCell<Vec<MessageBody>>,
+    active_message: Cell<Option<usize>>,
+    active_heading: Cell<usize>,
+    heading_buttons: RefCell<Vec<gtk::Button>>,
+    rebuild_pending: Cell<bool>,
 }
 
 impl ConversationOutline {
     fn new(items: &gtk::Box, scroller: &gtk::ScrolledWindow) -> Rc<Self> {
         let root = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        // The workspace's todo and agent rails own the right overlay edge.
+        // Keeping this compact rail on the left prevents competing hover cards.
         root.set_halign(gtk::Align::Start);
         root.set_valign(gtk::Align::Center);
+        root.set_margin_start(0);
         root.set_visible(false);
         root.add_css_class("message-outline-surface");
 
-        let adjustment = scroller.vadjustment();
-        let track = gtk::Scale::with_range(gtk::Orientation::Vertical, 0.0, 1.0, 0.01);
-        track.set_draw_value(false);
-        track.set_size_request(-1, 144);
-        track.set_valign(gtk::Align::Center);
-        track.set_tooltip_text(Some("Hover to show the outline for the message in view"));
-        track.update_property(&[gtk::accessible::Property::Label(
-            "Message outline and scroll position",
-        )]);
-        track.add_css_class("message-outline-track");
-        let adjustment_for_track = adjustment.clone();
-        track.connect_value_changed(move |track| {
-            let limit = (adjustment_for_track.upper() - adjustment_for_track.page_size()).max(0.0);
-            adjustment_for_track.set_value(track.value() * limit);
-        });
+        let progress = gtk::ProgressBar::new();
+        progress.set_orientation(gtk::Orientation::Vertical);
+        progress.set_inverted(false);
+        progress.set_valign(gtk::Align::Fill);
+        progress.set_vexpand(true);
+        progress.add_css_class("message-outline-rail-progress");
+        let count = gtk::Label::new(None);
+        count.add_css_class("message-outline-rail-count");
+        let rail_content = gtk::Box::new(gtk::Orientation::Vertical, 5);
+        rail_content.append(&super::icons::icon(super::icons::Icon::TableOfContents, 13));
+        rail_content.append(&progress);
+        rail_content.append(&count);
+
+        let rail = gtk::ToggleButton::new();
+        rail.set_child(Some(&rail_content));
+        rail.set_tooltip_text(Some("Hover to show nearby headings"));
+        rail.add_css_class("message-outline-rail");
+        root.append(&rail);
 
         let pane = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        pane.set_size_request(360, -1);
+        pane.set_size_request(320, -1);
         pane.add_css_class("message-outline-pane");
 
         let header = gtk::Box::new(gtk::Orientation::Horizontal, 7);
@@ -70,25 +92,31 @@ impl ConversationOutline {
 
         let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
         list.add_css_class("message-outline-list");
-        let scroll = gtk::ScrolledWindow::builder()
+        let list_scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vscrollbar_policy(gtk::PolicyType::Automatic)
-            .max_content_height(420)
+            .max_content_height(300)
             .propagate_natural_height(true)
             .child(&list)
             .build();
-        scroll.add_css_class("message-outline-scroll");
+        list_scroll.add_css_class("message-outline-scroll");
 
         pane.append(&header);
-        pane.append(&scroll);
+        pane.append(&list_scroll);
 
         let revealer = gtk::Revealer::new();
         revealer.set_transition_type(gtk::RevealerTransitionType::SlideRight);
-        revealer.set_transition_duration(160);
+        revealer.set_transition_duration(180);
         revealer.set_child(Some(&pane));
-        root.append(&track);
         root.append(&revealer);
 
+        let pinned = Rc::new(Cell::new(false));
+        let revealer_for_toggle = revealer.clone();
+        let pinned_for_toggle = pinned.clone();
+        rail.connect_toggled(move |button| {
+            pinned_for_toggle.set(button.is_active());
+            revealer_for_toggle.set_reveal_child(button.is_active());
+        });
         let hovered = Rc::new(Cell::new(false));
         let focused = Rc::new(Cell::new(false));
         let motion = gtk::EventControllerMotion::new();
@@ -100,10 +128,11 @@ impl ConversationOutline {
         });
         let hovered_for_leave = hovered.clone();
         let focused_for_leave = focused.clone();
+        let pinned_for_leave = pinned.clone();
         let revealer_for_leave = revealer.clone();
         motion.connect_leave(move |_| {
             hovered_for_leave.set(false);
-            if !focused_for_leave.get() {
+            if !focused_for_leave.get() && !pinned_for_leave.get() {
                 revealer_for_leave.set_reveal_child(false);
             }
         });
@@ -118,41 +147,67 @@ impl ConversationOutline {
         });
         let focused_for_leave = focused;
         let hovered_for_focus_leave = hovered;
+        let pinned_for_focus_leave = pinned;
         let revealer_for_focus_leave = revealer.clone();
         focus.connect_leave(move |_| {
             focused_for_leave.set(false);
-            if !hovered_for_focus_leave.get() {
+            if !hovered_for_focus_leave.get() && !pinned_for_focus_leave.get() {
                 revealer_for_focus_leave.set_reveal_child(false);
             }
         });
         root.add_controller(focus);
 
-        Rc::new(Self {
+        let outline = Rc::new(Self {
             root,
             revealer,
             list,
-            pointer: track,
+            list_scroll,
+            rail,
+            progress,
+            count,
             scroller: scroller.downgrade(),
             items: items.downgrade(),
             messages: RefCell::new(Vec::new()),
-        })
+            active_message: Cell::new(None),
+            active_heading: Cell::new(0),
+            heading_buttons: RefCell::new(Vec::new()),
+            rebuild_pending: Cell::new(true),
+        });
+        let weak = Rc::downgrade(&outline);
+        outline
+            .revealer
+            .connect_child_revealed_notify(move |revealer| {
+                if revealer.is_child_revealed()
+                    && let Some(outline) = weak.upgrade()
+                {
+                    outline.reveal_heading(outline.active_heading.get());
+                }
+            });
+        outline
     }
 
     fn track(self: &Rc<Self>, body: MessageBody) {
         self.messages.borrow_mut().push(body.clone());
+        self.rebuild_pending.set(true);
         let weak = Rc::downgrade(self);
         body.connect_headings_changed(move || {
             if let Some(outline) = weak.upgrade() {
+                outline.rebuild_pending.set(true);
                 outline.schedule_refresh();
             }
         });
-        self.refresh();
+        self.schedule_refresh();
     }
 
     fn clear(&self) {
         self.messages.borrow_mut().clear();
+        self.active_message.set(None);
+        self.active_heading.set(0);
+        self.heading_buttons.borrow_mut().clear();
+        self.rail.set_active(false);
         self.revealer.set_reveal_child(false);
         self.root.set_visible(false);
+        self.rebuild_pending.set(true);
     }
 
     fn schedule_refresh(self: &Rc<Self>) {
@@ -164,18 +219,6 @@ impl ConversationOutline {
         });
     }
 
-    fn update_pointer(&self, adjustment: &gtk::Adjustment) {
-        let limit = (adjustment.upper() - adjustment.page_size()).max(0.0);
-        let position = if limit > 0.0 {
-            (adjustment.value() / limit).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        if (self.pointer.value() - position).abs() > f64::EPSILON {
-            self.pointer.set_value(position);
-        }
-    }
-
     fn refresh(&self) {
         let (Some(scroller), Some(items)) = (self.scroller.upgrade(), self.items.upgrade()) else {
             return;
@@ -183,12 +226,12 @@ impl ConversationOutline {
         let adjustment = scroller.vadjustment();
         let viewport_start = adjustment.value();
         let viewport_end = viewport_start + adjustment.page_size();
-        self.update_pointer(&adjustment);
         let active = self
             .messages
             .borrow()
             .iter()
-            .filter_map(|body| {
+            .enumerate()
+            .filter_map(|(message_index, body)| {
                 let headings = body.outline_headings();
                 if headings.is_empty() {
                     return None;
@@ -202,30 +245,119 @@ impl ConversationOutline {
                         ((y + height).min(viewport_end) - y.max(viewport_start)).max(0.0)
                     })
                     .unwrap_or_default();
-                Some((overlap, body.clone(), headings))
+                (overlap > 0.0).then_some((overlap, message_index, body.clone(), headings))
             })
             .max_by(|left, right| left.0.total_cmp(&right.0));
 
-        let Some((_, body, headings)) = active else {
+        let Some((_, message_index, body, headings)) = active else {
+            self.active_message.set(None);
+            self.rail.set_active(false);
             self.revealer.set_reveal_child(false);
             self.root.set_visible(false);
             return;
         };
-        while let Some(child) = self.list.first_child() {
-            self.list.remove(&child);
+
+        let rebuild =
+            self.active_message.get() != Some(message_index) || self.rebuild_pending.replace(false);
+        if rebuild {
+            while let Some(child) = self.list.first_child() {
+                self.list.remove(&child);
+            }
+            self.heading_buttons.borrow_mut().clear();
+            let minimum_level = headings
+                .iter()
+                .map(|heading| heading.level)
+                .min()
+                .unwrap_or(1);
+            for heading in &headings {
+                let button = self.append_heading(&body, heading, minimum_level);
+                self.list.append(&button);
+                self.heading_buttons.borrow_mut().push(button);
+            }
+            self.active_message.set(Some(message_index));
         }
-        let minimum_level = headings
+
+        let positions = headings
             .iter()
-            .map(|heading| heading.level)
-            .min()
-            .unwrap_or(1);
-        for heading in headings {
-            self.append_heading(&body, &heading, minimum_level);
-        }
+            .map(|heading| body.heading_y_in(heading, &items).unwrap_or(f64::INFINITY))
+            .collect::<Vec<_>>();
+        let heading_index =
+            active_heading_index(&positions, viewport_start + OUTLINE_VIEWPORT_LEAD);
+        self.update_heading_progress(heading_index, &headings, rebuild);
         self.root.set_visible(true);
     }
 
-    fn append_heading(&self, body: &MessageBody, heading: &MarkdownHeading, minimum_level: u8) {
+    fn update_heading_progress(
+        &self,
+        heading_index: usize,
+        headings: &[MarkdownHeading],
+        force_reveal: bool,
+    ) {
+        let heading_index = heading_index.min(headings.len().saturating_sub(1));
+        let changed = self.active_heading.replace(heading_index) != heading_index;
+        let fraction = if headings.is_empty() {
+            0.0
+        } else {
+            (heading_index + 1) as f64 / headings.len() as f64
+        };
+        self.progress.set_fraction(fraction);
+        self.count
+            .set_label(&format!("{}/{}", heading_index + 1, headings.len()));
+        let title = headings
+            .get(heading_index)
+            .map(|heading| heading.title.as_str())
+            .unwrap_or("Unknown heading");
+        self.rail
+            .update_property(&[gtk::accessible::Property::Label(&format!(
+                "Message outline, heading {} of {}: {title}",
+                heading_index + 1,
+                headings.len()
+            ))]);
+        for (index, button) in self.heading_buttons.borrow().iter().enumerate() {
+            if index == heading_index {
+                button.add_css_class("current");
+            } else {
+                button.remove_css_class("current");
+            }
+        }
+        if changed || force_reveal {
+            self.reveal_heading(heading_index);
+        }
+    }
+
+    fn reveal_heading(&self, heading_index: usize) {
+        let Some(button) = self.heading_buttons.borrow().get(heading_index).cloned() else {
+            return;
+        };
+        let list = self.list.clone();
+        let scroll = self.list_scroll.clone();
+        glib::idle_add_local_once(move || {
+            let Some(bounds) = button.compute_bounds(&list) else {
+                return;
+            };
+            let adjustment = scroll.vadjustment();
+            let top = f64::from(bounds.y());
+            let bottom = top + f64::from(bounds.height());
+            let viewport_top = adjustment.value();
+            let viewport_bottom = viewport_top + adjustment.page_size();
+            let target = if top < viewport_top {
+                top
+            } else if bottom > viewport_bottom {
+                bottom - adjustment.page_size()
+            } else {
+                viewport_top
+            };
+            let limit = (adjustment.upper() - adjustment.page_size()).max(0.0);
+            adjustment.set_value(target.clamp(0.0, limit));
+        });
+    }
+
+    fn append_heading(
+        &self,
+        body: &MessageBody,
+        heading: &MarkdownHeading,
+        minimum_level: u8,
+    ) -> gtk::Button {
         let button = gtk::Button::new();
         button.set_halign(gtk::Align::Fill);
         button.add_css_class("message-outline-entry");
@@ -234,8 +366,8 @@ impl ConversationOutline {
         label.set_hexpand(true);
         label.set_wrap(true);
         label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-        label.set_max_width_chars(42);
-        label.set_margin_start(i32::from(heading.level.saturating_sub(minimum_level)) * 14);
+        label.set_max_width_chars(36);
+        label.set_margin_start(i32::from(heading.level.saturating_sub(minimum_level)) * 12);
         button.set_child(Some(&label));
         button.update_property(&[gtk::accessible::Property::Label(&format!(
             "Jump to {}",
@@ -249,7 +381,7 @@ impl ConversationOutline {
                 body.scroll_to_heading(&heading, &scroller);
             }
         });
-        self.list.append(&button);
+        button
     }
 }
 
@@ -264,7 +396,13 @@ impl ConversationView {
 
     #[cfg(feature = "ui-stories")]
     pub(crate) fn set_outline_revealed(&self, revealed: bool) {
-        self.outline.revealer.set_reveal_child(revealed);
+        self.outline.rail.set_active(revealed);
+        let outline_for_scroll = self.outline.clone();
+        self.scroller
+            .vadjustment()
+            .connect_value_changed(move |_| outline_for_scroll.refresh());
+        let outline = self.outline.clone();
+        glib::idle_add_local_once(move || outline.refresh());
     }
 
     fn new(spacing: i32, margin_top: i32, margin_bottom: i32, with_empty_state: bool) -> Self {
@@ -444,5 +582,23 @@ impl ConversationView {
                 (adjustment_after_layout.upper() - adjustment_after_layout.page_size()).max(0.0),
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::active_heading_index;
+
+    #[test]
+    fn heading_tracker_starts_at_the_first_heading_before_it_reaches_the_viewport() {
+        assert_eq!(active_heading_index(&[120.0, 240.0, 360.0], 40.0), 0);
+    }
+
+    #[test]
+    fn heading_tracker_uses_the_last_heading_above_the_viewport_marker() {
+        let positions = [40.0, 180.0, 320.0, 460.0];
+
+        assert_eq!(active_heading_index(&positions, 319.0), 1);
+        assert_eq!(active_heading_index(&positions, 900.0), 3);
     }
 }

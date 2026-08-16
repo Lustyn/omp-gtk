@@ -130,11 +130,17 @@ paned > separator {
 }
 
 .message-outline-surface {
-    border-right: 1px solid #22262d;
-    background: #0b0d10;
+    margin: 12px 0;
 }
 
-.message-outline-pane,
+.message-outline-pane {
+    margin: 1px 1px 1px 6px;
+    border: 1px solid #303641;
+    border-radius: 10px;
+    background: #0b0d10;
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.3);
+}
+
 .message-outline-pane .message-outline-scroll,
 .message-outline-pane .message-outline-scroll > viewport,
 .message-outline-pane .message-outline-scroll > undershoot,
@@ -145,36 +151,48 @@ paned > separator {
     background: transparent;
 }
 
-.message-outline-track {
-    min-width: 24px;
-    min-height: 144px;
-    padding: 7px 8px;
-    background: transparent;
+.message-outline-rail {
+    min-width: 20px;
+    min-height: 124px;
+    padding: 7px 4px;
+    border: 1px solid #303641;
+    border-radius: 10px;
+    background: rgba(22, 26, 32, 0.94);
+    color: #8f98a5;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.24);
 }
 
-.message-outline-track trough {
+.message-outline-rail:hover,
+.message-outline-rail:checked {
+    border-color: #465162;
+    background: #1b2028;
+    color: #c5ccd6;
+}
+
+.message-outline-rail-progress trough {
     min-width: 4px;
+    min-height: 66px;
     border: 0;
-    border-radius: 999px;
-    background: #272d36;
+    border-radius: 4px;
+    background: #2a3039;
 }
 
-.message-outline-track slider {
-    min-width: 8px;
-    min-height: 24px;
-    margin: -2px;
-    border-radius: 999px;
-    background: #f4c867;
+.message-outline-rail-progress progress {
+    min-width: 4px;
+    border-radius: 4px;
+    background: #d7b45f;
 }
 
-.message-outline-track:hover slider {
-    background: #ffda7d;
+.message-outline-rail-count {
+    color: #8f98a5;
+    font-size: 9px;
+    font-weight: 700;
 }
 
 .message-outline-header {
-    min-height: 34px;
-    padding: 6px 12px;
-    border-bottom: 1px solid #22262d;
+    min-height: 28px;
+    padding: 4px 10px;
+    border-bottom: 1px solid #252b34;
     color: #858d99;
 }
 
@@ -185,23 +203,29 @@ paned > separator {
 }
 
 .message-outline-list {
-    padding: 8px 10px 12px;
+    padding: 7px 8px 9px;
 }
 
 .message-outline-entry {
-    min-height: 32px;
-    padding: 6px 8px;
+    min-height: 29px;
+    padding: 5px 8px;
     border: 0;
-    border-radius: 0;
-    color: #dce0e7;
-    font-size: 13px;
+    border-radius: 6px;
+    color: #aeb5c0;
+    font-size: 12px;
     font-weight: 500;
 }
 
 .message-outline-entry:hover,
 .message-outline-entry:focus {
-    background: transparent;
-    color: #f4c867;
+    background: #1a1f27;
+    color: #e9edf3;
+}
+
+.message-outline-entry.current {
+    background: #20252d;
+    color: #f1cf79;
+    font-weight: 650;
 }
 
 textview.message-body {
