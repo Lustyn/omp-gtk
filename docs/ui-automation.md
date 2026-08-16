@@ -19,16 +19,16 @@ Only production-app automation requires an existing graphical Linux session with
 Launch the application from the repository root:
 
 ```bash
-target/debug/omp-native
+target/debug/omp-gtk
 ```
 
-`omp-native` starts `omp --mode rpc-ui`. Set `OMP_BIN` only when a specific installed `omp` executable must be exercised:
+`omp-gtk` starts `omp --mode rpc-ui`. Set `OMP_BIN` only when a specific installed `omp` executable must be exercised:
 
 ```bash
-OMP_BIN=/path/to/omp target/debug/omp-native
+OMP_BIN=/path/to/omp target/debug/omp-gtk
 ```
 
-Close any existing `omp-native` windows before launching a separate test process. `dev.omp.Native` is a single-instance GTK application, so a second invocation can activate the existing process and exit immediately.
+Close any existing `omp-gtk` windows before launching a separate test process. `dev.omp.Gtk` is a single-instance GTK application, so a second invocation can activate the existing process and exit immediately.
 
 ## Component gallery
 
@@ -40,7 +40,7 @@ target/debug/ui-gallery --list
 target/debug/ui-gallery --story composer/running
 ```
 
-The gallery uses the separate `dev.omp.Native.UiGallery` application ID and does not start `omp --mode rpc-ui`. Direct stories print `UI_STORY_READY <story-id>` after their window is mapped. `--snapshot <path>` renders the component itself through GSK and exits; the story canvas chrome is not included.
+The gallery uses the separate `dev.omp.Gtk.UiGallery` application ID and does not start `omp --mode rpc-ui`. Direct stories print `UI_STORY_READY <story-id>` after their window is mapped. `--snapshot <path>` renders the component itself through GSK and exits; the story canvas chrome is not included.
 
 The automation wrapper builds the gallery. `inspect` and `exercise` create an isolated D-Bus session and virtual KWin framebuffer, so semantic AT-SPI checks never open, move, or focus a desktop window:
 
@@ -96,7 +96,7 @@ from tools.ui_automation import (
 )
 ```
 
-The helpers accept an `app_name` argument when automation targets an application other than `omp-native`. Generated screenshots are verification artifacts; add only intentional reference images to Git.
+The helpers accept an `app_name` argument when automation targets an application other than `omp-gtk`. Generated screenshots are verification artifacts; add only intentional reference images to Git.
 
 
 ## Inspect the accessible tree

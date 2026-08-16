@@ -9,7 +9,7 @@ use libadwaita as adw;
 
 use super::stories::{self, Story};
 
-const GALLERY_APP_ID: &str = "dev.omp.Native.UiGallery";
+const GALLERY_APP_ID: &str = "dev.omp.Gtk.UiGallery";
 
 #[derive(Clone)]
 enum Mode {
@@ -69,7 +69,7 @@ pub(crate) fn run() -> glib::ExitCode {
     }
 
     crate::initialize_gtk();
-    glib::set_application_name("omp-native-ui-gallery");
+    glib::set_application_name("omp-gtk-ui-gallery");
     let application = adw::Application::builder()
         .application_id(GALLERY_APP_ID)
         .flags(gio::ApplicationFlags::NON_UNIQUE)

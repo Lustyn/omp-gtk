@@ -1,8 +1,10 @@
 [package]
-name = "omp-native"
+name = "omp-gtk"
 version = "0.1.0"
-description = "Native desktop client for Oh My Pi"
+description = "Native GTK desktop frontend for omp"
 edition = "2024"
+license = "MIT"
+readme = "README.md"
 
 [dependencies]
 async-channel = "2.5.0"

@@ -399,7 +399,7 @@ fn header(state: &str) -> gtk::Widget {
     }
     row.append(&title);
     row.append(&status.root);
-    let telemetry = TelemetryWidgets::new("~/code/omp-native");
+    let telemetry = TelemetryWidgets::new("~/code/omp-gtk");
     telemetry.set_context(14_200, 272_000, 5.2);
     telemetry.set_cost(0.024);
     telemetry.set_throughput((state == "working").then_some(86.4));
@@ -418,8 +418,8 @@ fn sidebar_sessions() -> gtk::Widget {
         SessionEntry {
             path: Some(PathBuf::from("/tmp/current.jsonl")),
             title: "Refactor native component architecture".to_owned(),
-            subtitle: "omp-native · 42 messages · Just now".to_owned(),
-            cwd: Some(PathBuf::from("/home/agent/code/omp-native")),
+            subtitle: "omp-gtk · 42 messages · Just now".to_owned(),
+            cwd: Some(PathBuf::from("/home/agent/code/omp-gtk")),
             created_at: SystemTime::UNIX_EPOCH,
             current: true,
             running: false,
@@ -428,8 +428,8 @@ fn sidebar_sessions() -> gtk::Widget {
         SessionEntry {
             path: Some(PathBuf::from("/tmp/accessibility.jsonl")),
             title: "Improve accessible component selectors".to_owned(),
-            subtitle: "omp-native · 16 messages · 18m ago".to_owned(),
-            cwd: Some(PathBuf::from("/home/agent/code/omp-native")),
+            subtitle: "omp-gtk · 16 messages · 18m ago".to_owned(),
+            cwd: Some(PathBuf::from("/home/agent/code/omp-gtk")),
             created_at: SystemTime::UNIX_EPOCH,
             current: false,
             running: true,
@@ -461,7 +461,7 @@ fn conversation_empty() -> gtk::Widget {
     let selected_view = view.clone();
     view.show_workspace_onboarding(
         &[
-            PathBuf::from("/home/agent/code/omp-native"),
+            PathBuf::from("/home/agent/code/omp-gtk"),
             PathBuf::from("/home/agent/code/desktop-client"),
             PathBuf::from("/home/agent/code/service-api"),
         ],

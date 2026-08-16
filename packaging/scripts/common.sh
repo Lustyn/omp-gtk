@@ -3,10 +3,11 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DIST_DIR="${DIST_DIR:-/dist}"
-TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/omp-native-target}"
-BINARY="$TARGET_DIR/release/omp-native"
-DESKTOP_FILE="$ROOT_DIR/packaging/dev.omp.Native.desktop"
+TARGET_DIR="${CARGO_TARGET_DIR:-/tmp/omp-gtk-target}"
+BINARY="$TARGET_DIR/release/omp-gtk"
+DESKTOP_FILE="$ROOT_DIR/packaging/dev.omp.Gtk.desktop"
 ICON_FILE="$ROOT_DIR/src/assets/omp.svg"
+LICENSE_FILE="$ROOT_DIR/LICENSE"
 
 PACKAGE_VERSION="$(
     cargo metadata --locked --no-deps --format-version 1 --manifest-path "$ROOT_DIR/Cargo.toml" |
@@ -18,7 +19,7 @@ PACKAGE_DESCRIPTION="$(
 )"
 
 build_release() {
-    mkdir -p "$DIST_DIR" "${CARGO_HOME:-/tmp/omp-native-cargo}" "$TARGET_DIR"
+    mkdir -p "$DIST_DIR" "${CARGO_HOME:-/tmp/omp-gtk-cargo}" "$TARGET_DIR"
     export CARGO_TARGET_DIR="$TARGET_DIR"
     export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(stat -c %Y "$ROOT_DIR/Cargo.lock")}"
     cargo build --locked --release --manifest-path "$ROOT_DIR/Cargo.toml"
@@ -26,7 +27,7 @@ build_release() {
 
 install_payload() {
     local root="$1"
-    install -Dm755 "$BINARY" "$root/usr/bin/omp-native"
-    install -Dm644 "$DESKTOP_FILE" "$root/usr/share/applications/dev.omp.Native.desktop"
-    install -Dm644 "$ICON_FILE" "$root/usr/share/icons/hicolor/scalable/apps/dev.omp.Native.svg"
+    install -Dm755 "$BINARY" "$root/usr/bin/omp-gtk"
+    install -Dm644 "$DESKTOP_FILE" "$root/usr/share/applications/dev.omp.Gtk.desktop"
+    install -Dm644 "$ICON_FILE" "$root/usr/share/icons/hicolor/scalable/apps/dev.omp.Gtk.svg"
 }

@@ -6,30 +6,33 @@ build_release
 
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
-install -m755 "$BINARY" "$WORK_DIR/omp-native"
-install -m644 "$DESKTOP_FILE" "$WORK_DIR/dev.omp.Native.desktop"
-install -m644 "$ICON_FILE" "$WORK_DIR/dev.omp.Native.svg"
+install -m755 "$BINARY" "$WORK_DIR/omp-gtk"
+install -m644 "$DESKTOP_FILE" "$WORK_DIR/dev.omp.Gtk.desktop"
+install -m644 "$ICON_FILE" "$WORK_DIR/dev.omp.Gtk.svg"
+install -m644 "$LICENSE_FILE" "$WORK_DIR/LICENSE"
 
 ARCH_VERSION="${PACKAGE_VERSION//-/.}"
 ARCH="$(uname -m)"
 cat >"$WORK_DIR/PKGBUILD" <<EOF
-pkgname=omp-native
+pkgname=omp-gtk
 pkgver=$ARCH_VERSION
 pkgrel=1
 pkgdesc='$PACKAGE_DESCRIPTION'
 arch=('$ARCH')
-license=('LicenseRef-Unknown')
+license=('MIT')
 depends=('alsa-lib' 'gtk4>=4.22' 'libadwaita>=1.9' 'fontconfig')
 options=('!debug')
-source=('omp-native' 'dev.omp.Native.desktop' 'dev.omp.Native.svg')
-sha256sums=('SKIP' 'SKIP' 'SKIP')
+source=('omp-gtk' 'dev.omp.Gtk.desktop' 'dev.omp.Gtk.svg' 'LICENSE')
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP')
 
 package() {
-    install -Dm755 "\$srcdir/omp-native" "\$pkgdir/usr/bin/omp-native"
-    install -Dm644 "\$srcdir/dev.omp.Native.desktop" \
-        "\$pkgdir/usr/share/applications/dev.omp.Native.desktop"
-    install -Dm644 "\$srcdir/dev.omp.Native.svg" \
-        "\$pkgdir/usr/share/icons/hicolor/scalable/apps/dev.omp.Native.svg"
+    install -Dm755 "\$srcdir/omp-gtk" "\$pkgdir/usr/bin/omp-gtk"
+    install -Dm644 "\$srcdir/dev.omp.Gtk.desktop" \
+        "\$pkgdir/usr/share/applications/dev.omp.Gtk.desktop"
+    install -Dm644 "\$srcdir/dev.omp.Gtk.svg" \
+        "\$pkgdir/usr/share/icons/hicolor/scalable/apps/dev.omp.Gtk.svg"
+    install -Dm644 "\$srcdir/LICENSE" \
+        "\$pkgdir/usr/share/licenses/omp-gtk/LICENSE"
 }
 EOF
 

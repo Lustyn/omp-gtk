@@ -11,7 +11,7 @@ use crate::alerts::managed_packs_dir;
 
 const REGISTRY_URL: &str = "https://peonping.github.io/registry/index.json";
 const GITHUB_RAW_ROOT: &str = "https://raw.githubusercontent.com/";
-const USER_AGENT: &str = "omp-native/0.1";
+const USER_AGENT: &str = "omp-gtk/0.1";
 const MAX_REGISTRY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 const MAX_SOUND_BYTES: usize = 1024 * 1024;

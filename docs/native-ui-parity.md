@@ -1,6 +1,6 @@
 # Native UI feature parity priorities
 
-This document tracks user-facing omp features that are missing or incomplete in the native frontend. The reference implementation is the interactive UI in `~/code/oh-my-pi/packages/coding-agent/src/modes`; the native app communicates with it through `omp --mode rpc-ui`.
+This document tracks user-facing omp features that are missing or incomplete in the native frontend. The native app communicates with omp through `omp --mode rpc-ui`; the interactive omp UI remains the parity reference.
 
 Priority reflects user impact, not implementation difficulty. The six highest-priority areas below should be completed before the remaining parity backlog.
 

@@ -523,7 +523,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock is after the Unix epoch")
             .as_nanos();
-        let directory = std::env::temp_dir().join(format!("omp-native-bridge-{name}-{nonce}"));
+        let directory = std::env::temp_dir().join(format!("omp-gtk-bridge-{name}-{nonce}"));
         fs::create_dir_all(&directory).expect("create fixture directory");
         directory
     }

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const BUILTIN_PACK_ID: &str = "builtin";
-const BUILTIN_SOUND_RESOURCE: &str = "/dev/omp/Native/sounds/confirmation-001.ogg";
+const BUILTIN_SOUND_RESOURCE: &str = "/dev/omp/Gtk/sounds/confirmation-001.ogg";
 const NOTIFICATION_ID: &str = "agent-status";
 const SOUND_DEBOUNCE: Duration = Duration::from_millis(500);
 
@@ -471,7 +471,7 @@ pub(crate) fn window_title(status: WindowStatus, session_title: &str) -> String 
 }
 
 pub(crate) fn managed_packs_dir() -> PathBuf {
-    glib::user_data_dir().join("omp-native").join("sound-packs")
+    glib::user_data_dir().join("omp-gtk").join("sound-packs")
 }
 
 fn enabled() -> bool {
@@ -484,7 +484,7 @@ fn default_volume() -> f64 {
 
 fn preferences_path() -> PathBuf {
     glib::user_config_dir()
-        .join("omp-native")
+        .join("omp-gtk")
         .join("preferences.json")
 }
 
@@ -704,7 +704,7 @@ mod tests {
             .unwrap_or_default()
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "omp-native-sound-pack-{}-{nonce}",
+            "omp-gtk-sound-pack-{}-{nonce}",
             std::process::id()
         ));
         fs::create_dir_all(root.join("sounds")).expect("create sound fixture");

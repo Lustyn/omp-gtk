@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <gresources>
-  <gresource prefix="/dev/omp/Native/icons/scalable/apps">
-    <file alias="dev.omp.Native.svg">omp.svg</file>
+  <gresource prefix="/dev/omp/Gtk/icons/scalable/apps">
+    <file alias="dev.omp.Gtk.svg">omp.svg</file>
   </gresource>
   <!-- CC0 confirmation sound by Kenney, sourced from soundcn. -->
-  <gresource prefix="/dev/omp/Native/sounds">
+  <gresource prefix="/dev/omp/Gtk/sounds">
     <file>confirmation-001.ogg</file>
   </gresource>
 </gresources>

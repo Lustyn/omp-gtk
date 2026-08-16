@@ -1,4 +1,4 @@
-"""Reusable AT-SPI and screenshot helpers for omp-native desktop UI checks."""
+"""Reusable AT-SPI and screenshot helpers for omp-gtk desktop UI checks."""
 
 from pathlib import Path
 import subprocess
@@ -36,7 +36,7 @@ def wait_for(probe, timeout=5.0, interval=0.05):
     raise TimeoutError(f"UI condition was not met within {timeout:.1f}s{detail}")
 
 
-def application(name="omp-native", timeout=10.0):
+def application(name="omp-gtk", timeout=10.0):
     """Wait for and return an AT-SPI application node by exact name."""
     desktop = pyatspi.Registry.getDesktop(0)
     return wait_for(
@@ -45,7 +45,7 @@ def application(name="omp-native", timeout=10.0):
     )
 
 
-def find_node(*, root=None, app_name="omp-native", role=None, name=None, contains=None,
+def find_node(*, root=None, app_name="omp-gtk", role=None, name=None, contains=None,
               showing=True, timeout=5.0):
     """Wait for one accessible node matching role and accessible name."""
     search_root = root or application(app_name, timeout=timeout)
@@ -90,7 +90,7 @@ def replace_text(node, text):
         raise RuntimeError(f"AT-SPI text replacement was rejected for {node.name!r}")
 
 
-def visible_names(root=None, app_name="omp-native", role=None):
+def visible_names(root=None, app_name="omp-gtk", role=None):
     """Return accessible names for currently visible nodes."""
     search_root = root or application(app_name)
     result = []

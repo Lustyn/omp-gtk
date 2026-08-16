@@ -1,3 +1,3 @@
 fn main() -> gtk4::glib::ExitCode {
-    omp_native::run()
+    omp_gtk::run()
 }

@@ -37,13 +37,13 @@ fi
 
 mkdir -p "$DIST_DIR"
 SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(stat -c %Y "$ROOT_DIR/Cargo.lock")}"
-CACHE_DIR="${PACKAGING_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/omp-native/packaging}"
+CACHE_DIR="${PACKAGING_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/omp-gtk/packaging}"
 mkdir -p "$CACHE_DIR/cargo"
 CACHE_DIR="$(realpath "$CACHE_DIR")"
 RUN_OPTIONS=(
     --rm
     --user "$(id -u):$(id -g)"
-    --env HOME=/tmp/omp-native-home
+    --env HOME=/tmp/omp-gtk-home
     --env CARGO_HOME=/cache/cargo
     --env SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH"
     --volume "$ROOT_DIR:/workspace:ro"
@@ -55,7 +55,7 @@ if [[ "$(basename "$RUNTIME")" == podman ]]; then
 fi
 
 for distro in "${TARGETS[@]}"; do
-    image="omp-native-package-$distro"
+    image="omp-gtk-package-$distro"
     case "$distro" in
         ubuntu) package_script=package-deb.sh ;;
         fedora) package_script=package-rpm.sh ;;

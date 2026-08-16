@@ -514,7 +514,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock before Unix epoch")
             .as_nanos();
-        let directory = std::env::temp_dir().join(format!("omp-native-{name}-{nonce}"));
+        let directory = std::env::temp_dir().join(format!("omp-gtk-{name}-{nonce}"));
         fs::create_dir(&directory).expect("create fixture directory");
         directory
     }

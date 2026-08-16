@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=omp-gtk
+Comment=Native GTK desktop frontend for omp
+Exec=omp-gtk
+Icon=dev.omp.Gtk
+Terminal=false
+Categories=Development;
+StartupNotify=true

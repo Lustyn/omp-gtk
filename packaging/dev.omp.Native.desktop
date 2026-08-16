@@ -1,9 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=Oh My Pi
-Comment=Native desktop client for Oh My Pi
-Exec=omp-native
-Icon=dev.omp.Native
-Terminal=false
-Categories=Development;
-StartupNotify=true

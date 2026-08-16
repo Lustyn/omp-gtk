@@ -12,7 +12,7 @@ use gtk::prelude::*;
 use gtk4 as gtk;
 use libadwaita as adw;
 
-pub const APP_ID: &str = "dev.omp.Native";
+pub const APP_ID: &str = "dev.omp.Gtk";
 
 pub fn run() -> glib::ExitCode {
     initialize_gtk();
@@ -28,12 +28,12 @@ pub fn run_ui_gallery() -> glib::ExitCode {
 }
 
 pub(crate) fn initialize_gtk() {
-    gtk::gio::resources_register_include!("omp-native.gresource")
+    gtk::gio::resources_register_include!("omp-gtk.gresource")
         .expect("Failed to register application resources");
     gtk::init().expect("GTK initialization failed");
 
     let display = gtk::gdk::Display::default().expect("Failed to connect to a display");
-    gtk::IconTheme::for_display(&display).add_resource_path("/dev/omp/Native/icons");
+    gtk::IconTheme::for_display(&display).add_resource_path("/dev/omp/Gtk/icons");
     gtk::Window::set_default_icon_name(APP_ID);
 
     if let Some(settings) = gtk::Settings::default() {
