@@ -36,7 +36,7 @@ pub(crate) fn find(id: &str) -> Option<Story> {
     STORIES.iter().copied().find(|story| story.id == id)
 }
 
-const STORIES: [Story; 52] = [
+const STORIES: [Story; 53] = [
     Story {
         id: "header/ready",
         title: "Header · Ready",
@@ -99,6 +99,13 @@ const STORIES: [Story; 52] = [
         width: 900,
         height: 720,
         build: conversation_markdown,
+    },
+    Story {
+        id: "conversation/attention-kind",
+        title: "Conversation · Attention-kind",
+        width: 900,
+        height: 520,
+        build: conversation_attention_kind,
     },
     Story {
         id: "conversation/streaming-markdown",
@@ -630,6 +637,21 @@ fn render(markdown: &str) {
 ```"#,
     );
     view.set_outline_revealed(true);
+    view.widget().clone()
+}
+
+fn conversation_attention_kind() -> gtk::Widget {
+    let view = ConversationView::main();
+    view.append_message(
+        MessageRole::Assistant,
+        r#"**→ The release is ready.** All focused checks passed, and the deployment can proceed.
+
+**1 → Scope.** The renderer colors only attention-kind lead-ins at the start of a paragraph.
+
+**2 → Safety.** Ordinary **strong emphasis** keeps the standard text color.
+
+**3 → Next action.** Deploy the tested revision, then watch the first production request."#,
+    );
     view.widget().clone()
 }
 fn conversation_streaming_markdown() -> gtk::Widget {

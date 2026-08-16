@@ -451,6 +451,15 @@ struct MarkdownRenderer {
     active_heading: Option<ActiveHeading>,
     explicit_rule_before_next_block: bool,
     seen_heading: bool,
+    at_paragraph_start: bool,
+    leading_strong: Option<LeadingStrong>,
+}
+
+#[derive(Clone, Copy)]
+enum LeadingStrong {
+    Candidate,
+    Attention,
+    Plain,
 }
 
 impl MarkdownRenderer {
@@ -471,17 +480,22 @@ impl MarkdownRenderer {
             active_heading: None,
             explicit_rule_before_next_block: false,
             seen_heading: false,
+            at_paragraph_start: false,
+            leading_strong: None,
         }
     }
 
     fn render(mut self, event: Event<'_>) -> Self {
+        if !matches!(&event, Event::Start(_) | Event::End(_)) {
+            self.at_paragraph_start = false;
+        }
         match event {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
             Event::Text(text) => {
                 self.capture_heading_text(&text);
                 if !self.append_captured(&text) {
-                    self.text(&text);
+                    self.inline_text(&text);
                 }
             }
             Event::Code(code) => {
@@ -539,8 +553,15 @@ impl MarkdownRenderer {
     }
 
     fn start(&mut self, tag: Tag<'_>) {
+        let starts_paragraph = matches!(&tag, Tag::Paragraph);
+        let leading_strong =
+            matches!(&tag, Tag::Strong) && self.at_paragraph_start && self.table.is_none();
+        if !starts_paragraph {
+            self.at_paragraph_start = false;
+        }
         match tag {
             Tag::Paragraph => {
+                self.at_paragraph_start = true;
                 self.explicit_rule_before_next_block = false;
                 if self.after_block_marker {
                     self.after_block_marker = false;
@@ -672,7 +693,12 @@ impl MarkdownRenderer {
                 }
             }
             Tag::Emphasis if self.table.is_none() => self.tag("<i>"),
-            Tag::Strong if self.table.is_none() => self.tag("<b>"),
+            Tag::Strong if self.table.is_none() => {
+                self.tag("<b>");
+                if leading_strong {
+                    self.leading_strong = Some(LeadingStrong::Candidate);
+                }
+            }
             Tag::Strikethrough if self.table.is_none() => {
                 self.tag("<span strikethrough=\"true\">");
             }
@@ -756,7 +782,10 @@ impl MarkdownRenderer {
             }
             TagEnd::TableRow | TagEnd::TableCell => {}
             TagEnd::Emphasis if self.table.is_none() => self.tag("</i>"),
-            TagEnd::Strong if self.table.is_none() => self.tag("</b>"),
+            TagEnd::Strong if self.table.is_none() => {
+                self.leading_strong = None;
+                self.tag("</b>");
+            }
             TagEnd::Strikethrough if self.table.is_none() => self.tag("</span>"),
             TagEnd::Superscript if self.table.is_none() => self.tag("</sup>"),
             TagEnd::Subscript if self.table.is_none() => self.tag("</sub>"),
@@ -818,6 +847,28 @@ impl MarkdownRenderer {
             .count();
     }
 
+    fn inline_text(&mut self, text: &str) {
+        let style = match self.leading_strong {
+            Some(LeadingStrong::Candidate) if is_attention_kind_lead(text) => {
+                self.leading_strong = Some(LeadingStrong::Attention);
+                LeadingStrong::Attention
+            }
+            Some(LeadingStrong::Candidate) => {
+                self.leading_strong = Some(LeadingStrong::Plain);
+                LeadingStrong::Plain
+            }
+            Some(style) => style,
+            None => LeadingStrong::Plain,
+        };
+        if matches!(style, LeadingStrong::Attention) {
+            self.tag("<span foreground=\"#79a5e3\">");
+            self.text(text);
+            self.tag("</span>");
+        } else {
+            self.text(text);
+        }
+    }
+
     fn append_captured(&mut self, text: &str) -> bool {
         if let Some(table) = &mut self.table {
             table.append(text);
@@ -854,6 +905,21 @@ fn heading_level(level: HeadingLevel) -> u8 {
         HeadingLevel::H5 => 5,
         HeadingLevel::H6 => 6,
     }
+}
+
+fn is_attention_kind_lead(text: &str) -> bool {
+    let text = text.trim_start();
+    if text.starts_with('→') {
+        return true;
+    }
+    let Some(arrow) = text.find('→') else {
+        return false;
+    };
+    let prefix = &text[..arrow];
+    let number = prefix.trim_end();
+    !number.is_empty()
+        && number.bytes().all(|byte| byte.is_ascii_digit())
+        && number.len() < prefix.len()
 }
 
 fn render_markdown(markdown: &str) -> RenderedMarkdown {
@@ -2171,6 +2237,43 @@ mod tests {
         assert_eq!(
             rendered.embedded[0].content,
             EmbeddedMarkdownContent::InlineCode("code".to_owned())
+        );
+    }
+
+    #[test]
+    fn markdown_colors_attention_kind_leads_only() {
+        let rendered = render_markdown(
+            "**→ Bottom line.** Supporting detail.\n\n\
+             **1 →** First point.\n\n\
+             Plain **→ bold, but not a lead.**\n\n\
+             `code` **→ also not a lead.**",
+        );
+        let (_, plain_text, _) = pango::parse_markup(&rendered.markup, '\0')
+            .expect("attention-kind renderer must produce valid Pango markup");
+
+        assert_eq!(
+            plain_text,
+            "→ Bottom line. Supporting detail.\n1 → First point.\nPlain → bold, but not a lead.\n\u{fffc} → also not a lead."
+        );
+        assert!(
+            rendered
+                .markup
+                .contains("<b><span foreground=\"#79a5e3\">→ Bottom line.</span></b>")
+        );
+        assert!(
+            rendered
+                .markup
+                .contains("<b><span foreground=\"#79a5e3\">1 →</span></b>")
+        );
+        assert!(
+            rendered
+                .markup
+                .contains("Plain <b>→ bold, but not a lead.</b>")
+        );
+        assert!(
+            rendered
+                .markup
+                .contains("\u{fffc} <b>→ also not a lead.</b>")
         );
     }
 
