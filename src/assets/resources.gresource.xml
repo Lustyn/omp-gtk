@@ -3,6 +3,10 @@
   <gresource prefix="/dev/omp/Gtk/icons/scalable/apps">
     <file alias="dev.omp.Gtk.svg">omp.svg</file>
   </gresource>
+  <gresource prefix="/dev/omp/Gtk/icons/scalable/actions">
+    <file alias="omp-messages-symbolic.svg">messages-symbolic.svg</file>
+    <file alias="omp-sounds-symbolic.svg">sounds-symbolic.svg</file>
+  </gresource>
   <!-- CC0 confirmation sound by Kenney, sourced from soundcn. -->
   <gresource prefix="/dev/omp/Gtk/sounds">
     <file>confirmation-001.ogg</file>

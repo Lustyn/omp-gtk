@@ -1144,6 +1144,8 @@ fn safe_link(destination: &str) -> bool {
         .unwrap_or(false)
 }
 
+type HeadingObserver = Box<dyn Fn()>;
+
 #[derive(Clone)]
 pub(crate) struct MessageBody {
     view: gtk::TextView,
@@ -1151,7 +1153,7 @@ pub(crate) struct MessageBody {
     links: Rc<RefCell<Vec<MarkdownLink>>>,
     row: gtk::Box,
     headings: Rc<RefCell<Vec<MarkdownHeading>>>,
-    heading_observers: Rc<RefCell<Vec<Box<dyn Fn()>>>>,
+    heading_observers: Rc<RefCell<Vec<HeadingObserver>>>,
     embedded_widgets: Rc<RefCell<Vec<(EmbeddedMarkdownContent, gtk::Widget)>>>,
 }
 

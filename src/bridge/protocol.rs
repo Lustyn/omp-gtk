@@ -364,7 +364,7 @@ pub enum RpcEvent {
     ToolStart(ToolStart),
     ToolUpdate(ToolUpdate),
     ToolEnd(ToolEnd),
-    Subagent(SubagentUpdate),
+    Subagent(Box<SubagentUpdate>),
     CommandOutput(String),
     PromptResult(bool),
     SessionInfo { title: Option<String> },
@@ -452,13 +452,17 @@ pub fn decode_event(value: Value) -> RpcEvent {
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
         }),
-        "subagent_lifecycle" => {
-            RpcEvent::Subagent(decode_subagent(SubagentUpdateKind::Lifecycle, value))
+        "subagent_lifecycle" => RpcEvent::Subagent(Box::new(decode_subagent(
+            SubagentUpdateKind::Lifecycle,
+            value,
+        ))),
+        "subagent_progress" => RpcEvent::Subagent(Box::new(decode_subagent(
+            SubagentUpdateKind::Progress,
+            value,
+        ))),
+        "subagent_event" => {
+            RpcEvent::Subagent(Box::new(decode_subagent(SubagentUpdateKind::Event, value)))
         }
-        "subagent_progress" => {
-            RpcEvent::Subagent(decode_subagent(SubagentUpdateKind::Progress, value))
-        }
-        "subagent_event" => RpcEvent::Subagent(decode_subagent(SubagentUpdateKind::Event, value)),
         "notice" => RpcEvent::Notice {
             level: string_field(&value, "level").unwrap_or_else(|| "info".to_owned()),
             message: string_field(&value, "message").unwrap_or_default(),

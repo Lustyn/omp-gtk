@@ -153,9 +153,7 @@ impl AgentHubState {
     pub(crate) fn apply_update(&mut self, update: SubagentUpdate) -> Option<String> {
         let id = update.id.clone()?;
         if update.kind == SubagentUpdateKind::Event {
-            if update.activity_event.is_none() {
-                return None;
-            }
+            update.activity_event.as_ref()?;
             return self.agents.contains_key(&id).then_some(id);
         }
 
@@ -251,39 +249,25 @@ impl AgentHubState {
             siblings.sort_by_key(|agent| (agent.index, agent.order));
         }
 
-        let mut rows = Vec::with_capacity(self.agents.len());
-        let mut visited = HashSet::new();
         let roots = children.remove(&None).unwrap_or_default();
+        let mut projection = TreeProjection {
+            children: &children,
+            collapsed,
+            visited: HashSet::new(),
+            rows: Vec::with_capacity(self.agents.len()),
+        };
         for root in roots {
-            append_tree(
-                root,
-                0,
-                None,
-                true,
-                &children,
-                collapsed,
-                &mut visited,
-                &mut rows,
-            );
+            projection.append(root, 0, None, true);
         }
 
         let mut leftovers = self.agents.values().collect::<Vec<_>>();
         leftovers.sort_by_key(|agent| (agent.index, agent.order));
         for agent in leftovers {
-            if !visited.contains(&agent.id) {
-                append_tree(
-                    agent,
-                    0,
-                    None,
-                    true,
-                    &children,
-                    collapsed,
-                    &mut visited,
-                    &mut rows,
-                );
+            if !projection.visited.contains(&agent.id) {
+                projection.append(agent, 0, None, true);
             }
         }
-        rows
+        projection.rows
     }
 
     fn take_order(&mut self) -> usize {
@@ -323,41 +307,43 @@ impl AgentHubState {
     }
 }
 
-fn append_tree(
-    agent: &AgentRecord,
-    depth: usize,
-    parent_id: Option<String>,
-    visible: bool,
-    children: &HashMap<Option<String>, Vec<&AgentRecord>>,
-    collapsed: &HashSet<String>,
-    visited: &mut HashSet<String>,
-    rows: &mut Vec<AgentTreeRow>,
-) {
-    if !visited.insert(agent.id.clone()) {
-        return;
-    }
-    let descendants = children.get(&Some(agent.id.clone()));
-    if visible {
-        rows.push(AgentTreeRow {
-            agent: agent.clone(),
-            depth,
-            parent_id: parent_id.clone(),
-            has_children: descendants.is_some_and(|descendants| !descendants.is_empty()),
-        });
-    }
-    let descendants_visible = visible && !collapsed.contains(&agent.id);
-    if let Some(descendants) = descendants {
-        for child in descendants {
-            append_tree(
-                child,
-                depth + 1,
-                Some(agent.id.clone()),
-                descendants_visible,
-                children,
-                collapsed,
-                visited,
-                rows,
-            );
+struct TreeProjection<'a> {
+    children: &'a HashMap<Option<String>, Vec<&'a AgentRecord>>,
+    collapsed: &'a HashSet<String>,
+    visited: HashSet<String>,
+    rows: Vec<AgentTreeRow>,
+}
+
+impl TreeProjection<'_> {
+    fn append(
+        &mut self,
+        agent: &AgentRecord,
+        depth: usize,
+        parent_id: Option<String>,
+        visible: bool,
+    ) {
+        if !self.visited.insert(agent.id.clone()) {
+            return;
+        }
+        let descendants = self.children.get(&Some(agent.id.clone()));
+        if visible {
+            self.rows.push(AgentTreeRow {
+                agent: agent.clone(),
+                depth,
+                parent_id,
+                has_children: descendants.is_some_and(|descendants| !descendants.is_empty()),
+            });
+        }
+        let descendants_visible = visible && !self.collapsed.contains(&agent.id);
+        if let Some(descendants) = descendants {
+            for child in descendants {
+                self.append(
+                    child,
+                    depth + 1,
+                    Some(agent.id.clone()),
+                    descendants_visible,
+                );
+            }
         }
     }
 }
@@ -475,7 +461,7 @@ mod tests {
         })) else {
             panic!("expected subagent event");
         };
-        assert_eq!(hub.apply_update(event).as_deref(), Some("Worker"));
+        assert_eq!(hub.apply_update(*event).as_deref(), Some("Worker"));
         assert_eq!(hub.get("Worker").unwrap().status, "running");
     }
 
@@ -538,7 +524,7 @@ mod tests {
         })) else {
             panic!("expected progress event");
         };
-        hub.apply_update(update);
+        hub.apply_update(*update);
 
         let agent = hub.get("Builder").unwrap();
         assert_eq!(agent.session_file.as_deref(), Some("/tmp/builder.jsonl"));

@@ -278,8 +278,7 @@ fn collapsed_tasks(tasks: &[TodoItem], cap: usize) -> (Vec<&TodoItem>, usize) {
         .collect::<Vec<_>>();
     let mut visible = tasks
         .iter()
-        .filter(|task| task.status.is_closed())
-        .next_back()
+        .rfind(|task| task.status.is_closed())
         .into_iter()
         .collect::<Vec<_>>();
     visible.extend(open.iter().take(cap).copied());

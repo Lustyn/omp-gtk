@@ -6,13 +6,14 @@ use std::time::SystemTime;
 
 use gtk::prelude::*;
 use gtk4 as gtk;
+use libadwaita as adw;
 use serde_json::json;
 
 use super::chat::{ChatStatus, MessageRole, TelemetryWidgets};
 use super::conversation::ConversationView;
 use super::model_picker::ModelPickerView;
 use super::tool_components::ToolActivityGroup;
-use super::{agent_hub, composer, session_actions, sidebar, todos};
+use super::{agent_hub, composer, session_actions, sidebar, sound_settings, todos};
 use crate::agent_hub::AgentHubState;
 use crate::bridge::protocol::{
     BranchMessage, ModelSummary, ModelThinking, SubagentSnapshot, TodoItem, TodoPhase, TodoStatus,
@@ -36,7 +37,7 @@ pub(crate) fn find(id: &str) -> Option<Story> {
     STORIES.iter().copied().find(|story| story.id == id)
 }
 
-const STORIES: [Story; 55] = [
+const STORIES: [Story; 56] = [
     Story {
         id: "header/ready",
         title: "Header · Ready",
@@ -57,6 +58,13 @@ const STORIES: [Story; 55] = [
         width: 320,
         height: 700,
         build: sidebar_sessions,
+    },
+    Story {
+        id: "settings/navigation",
+        title: "Settings · Navigation",
+        width: 480,
+        height: 220,
+        build: settings_navigation,
     },
     Story {
         id: "conversation/empty",
@@ -504,6 +512,36 @@ fn sidebar_sessions() -> gtk::Widget {
         view.list.append(&session.row);
     }
     view.root.upcast()
+}
+
+fn settings_navigation() -> gtk::Widget {
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 16);
+    root.set_margin_top(24);
+    root.set_margin_bottom(24);
+    root.set_margin_start(24);
+    root.set_margin_end(24);
+
+    let stack = adw::ViewStack::new();
+    let messages = gtk::Label::new(Some("Message delivery"));
+    stack.add_titled_with_icon(
+        &messages,
+        Some("messages"),
+        "Messages",
+        sound_settings::MESSAGES_ICON_NAME,
+    );
+    let sounds = gtk::Label::new(Some("Event sounds"));
+    stack.add_titled_with_icon(
+        &sounds,
+        Some("sounds"),
+        "Sounds",
+        sound_settings::SOUNDS_ICON_NAME,
+    );
+
+    let switcher = adw::ViewSwitcher::new();
+    switcher.set_stack(Some(&stack));
+    root.append(&switcher);
+    root.append(&stack);
+    root.upcast()
 }
 
 fn conversation_empty() -> gtk::Widget {

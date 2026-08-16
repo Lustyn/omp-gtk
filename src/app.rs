@@ -1144,10 +1144,9 @@ impl AppController {
                     | RpcEvent::ToolEnd(_)
             )
             && let Some(conversation) = self.conversation_views.borrow_mut().get_mut(&runtime_id)
+            && conversation.hydrated
         {
-            if conversation.hydrated {
-                conversation.deferred_events.push_back(event.clone());
-            }
+            conversation.deferred_events.push_back(event.clone());
         }
 
         if self.active_runtime.get() != Some(runtime_id) {
@@ -1247,7 +1246,7 @@ impl AppController {
             RpcEvent::ToolStart(tool) => self.tool_started(tool),
             RpcEvent::ToolUpdate(tool) => self.tool_updated(tool),
             RpcEvent::ToolEnd(tool) => self.tool_ended(tool, ToolResultSource::Live),
-            RpcEvent::Subagent(update) => self.subagent_updated(update),
+            RpcEvent::Subagent(update) => self.subagent_updated(*update),
             RpcEvent::CommandOutput(text) => {
                 if !text.is_empty() {
                     self.remove_empty_state();

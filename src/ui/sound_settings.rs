@@ -12,6 +12,9 @@ use crate::sound_registry::RegistryPack;
 
 use super::icons;
 
+pub(crate) const MESSAGES_ICON_NAME: &str = "omp-messages-symbolic";
+pub(crate) const SOUNDS_ICON_NAME: &str = "omp-sounds-symbolic";
+
 #[derive(Clone)]
 pub(crate) struct EventSoundRow {
     pub event: SoundEvent,
@@ -137,7 +140,7 @@ impl SettingsDialog {
             .build();
         let messages_page = adw::PreferencesPage::builder()
             .title("Messages")
-            .icon_name("mail-send-symbolic")
+            .icon_name(MESSAGES_ICON_NAME)
             .build();
         let delivery_group = adw::PreferencesGroup::builder()
             .title("Message delivery")
@@ -174,7 +177,7 @@ impl SettingsDialog {
 
         let page = adw::PreferencesPage::builder()
             .title("Sounds")
-            .icon_name("audio-speakers-symbolic")
+            .icon_name(SOUNDS_ICON_NAME)
             .build();
 
         let general = adw::PreferencesGroup::builder().title("General").build();
