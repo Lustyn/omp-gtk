@@ -37,7 +37,6 @@ fn image_slice_is_empty(images: &&[ImageContent]) -> bool {
     images.is_empty()
 }
 
-
 impl BridgeClient {
     pub fn initialize(&self) -> Result<(), BridgeError> {
         self.request("negotiate_protocol", json!({ "protocolVersion": 2 }))?;
@@ -50,11 +49,7 @@ impl BridgeClient {
         Ok(())
     }
 
-    pub fn prompt(
-        &self,
-        message: &str,
-        images: &[ImageContent],
-    ) -> Result<String, BridgeError> {
+    pub fn prompt(&self, message: &str, images: &[ImageContent]) -> Result<String, BridgeError> {
         self.message_request("prompt", message, images)
     }
 
@@ -62,26 +57,21 @@ impl BridgeClient {
         self.message_request("steer", message, images)
     }
 
-    pub fn follow_up(
-        &self,
-        message: &str,
-        images: &[ImageContent],
-    ) -> Result<String, BridgeError> {
+    pub fn follow_up(&self, message: &str, images: &[ImageContent]) -> Result<String, BridgeError> {
         self.message_request("follow_up", message, images)
     }
-
     pub fn set_steering_mode(&self, mode: QueueMode) -> Result<(), BridgeError> {
-        self.request("set_steering_mode", json!({ "mode": mode.as_str() }))?;
+        self.request("set_steering_mode", json!({ "mode": mode }))?;
         Ok(())
     }
 
     pub fn set_follow_up_mode(&self, mode: QueueMode) -> Result<(), BridgeError> {
-        self.request("set_follow_up_mode", json!({ "mode": mode.as_str() }))?;
+        self.request("set_follow_up_mode", json!({ "mode": mode }))?;
         Ok(())
     }
 
     pub fn set_interrupt_mode(&self, mode: InterruptMode) -> Result<(), BridgeError> {
-        self.request("set_interrupt_mode", json!({ "mode": mode.as_str() }))?;
+        self.request("set_interrupt_mode", json!({ "mode": mode }))?;
         Ok(())
     }
 
@@ -98,16 +88,10 @@ impl BridgeClient {
         Ok(())
     }
 
-    pub fn new_session(&self) -> Result<(), BridgeError> {
-        self.request("new_session", Value::Null)?;
-        Ok(())
-    }
-
     pub fn abort(&self) -> Result<(), BridgeError> {
         self.request("abort", Value::Null)?;
         Ok(())
     }
-
 
     pub fn get_branch_messages(&self) -> Result<(), BridgeError> {
         self.request("get_branch_messages", Value::Null)?;
@@ -127,13 +111,6 @@ impl BridgeClient {
         })
         .map_err(|error| BridgeError(format!("failed to encode handoff request: {error}")))?;
         self.request("handoff", request)?;
-        Ok(())
-    }
-    pub fn switch_session(&self, path: &Path) -> Result<(), BridgeError> {
-        self.request(
-            "switch_session",
-            json!({ "sessionPath": path.to_string_lossy() }),
-        )?;
         Ok(())
     }
 
@@ -274,9 +251,21 @@ fn is_executable(path: &Path) -> bool {
     path.metadata()
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
+fn omp_command(executable: &Path, session_path: Option<&Path>) -> Command {
+    let mut command = Command::new(executable);
+    command.args(["--mode", "rpc-ui"]);
+    if let Some(path) = session_path {
+        command.arg("--session").arg(path);
+    }
+    command
+}
 
 impl OmpBridge {
     pub fn spawn() -> io::Result<Self> {
+        Self::spawn_for_session(None)
+    }
+
+    pub fn spawn_for_session(session_path: Option<&Path>) -> io::Result<Self> {
         let override_bin: Option<OsString> = std::env::var_os("OMP_BIN");
         let search_path = std::env::var_os("PATH");
         let home_dir = std::env::var_os("HOME");
@@ -285,8 +274,7 @@ impl OmpBridge {
             search_path.as_deref(),
             home_dir.as_deref(),
         );
-        let mut child = Command::new(executable)
-            .args(["--mode", "rpc-ui"])
+        let mut child = omp_command(&executable, session_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -488,7 +476,7 @@ impl std::error::Error for BridgeError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{BridgeClient, WriterMessage, resolve_omp_executable};
+    use super::{BridgeClient, WriterMessage, omp_command, resolve_omp_executable};
     use crate::bridge::protocol::{
         ImageContent, InterruptMode, QueueMode, TodoItem, TodoPhase, TodoStatus,
     };
@@ -555,26 +543,45 @@ mod tests {
     }
 
     #[test]
-    fn emits_typed_running_turn_and_queue_mode_requests() {
+    fn resumed_session_runtime_starts_on_its_own_transcript() {
+        let session = Path::new("/tmp/session with spaces.jsonl");
+        let command = omp_command(Path::new("/opt/omp/bin/omp"), Some(session));
+
+        assert_eq!(command.get_program(), OsStr::new("/opt/omp/bin/omp"));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                OsStr::new("--mode"),
+                OsStr::new("rpc-ui"),
+                OsStr::new("--session"),
+                session.as_os_str(),
+            ]
+        );
+    }
+
+    #[test]
+    fn emits_typed_running_turn_and_global_delivery_requests() {
         let (writer, receiver) = mpsc::channel();
         let client = BridgeClient {
             writer,
             next_request_id: Arc::new(AtomicU64::new(1)),
         };
 
-        client.steer("adjust course").expect("queue steer request");
         client
-            .follow_up("verify afterward")
+            .steer("adjust course", &[])
+            .expect("queue steer request");
+        client
+            .follow_up("verify afterward", &[])
             .expect("queue follow-up request");
         client
             .set_steering_mode(QueueMode::All)
-            .expect("queue steering mode request");
+            .expect("queue global steering mode request");
         client
             .set_follow_up_mode(QueueMode::OneAtATime)
-            .expect("queue follow-up mode request");
+            .expect("queue global follow-up mode request");
         client
             .set_interrupt_mode(InterruptMode::Wait)
-            .expect("queue interrupt mode request");
+            .expect("queue global interrupt mode request");
 
         let frames = (0..5)
             .map(|_| {
@@ -631,7 +638,9 @@ mod tests {
                 next_request_id: Arc::new(AtomicU64::new(1)),
             };
 
-            let error = client.prompt(message, &[]).expect_err("reject mode command");
+            let error = client
+                .prompt(message, &[])
+                .expect_err("reject mode command");
 
             assert_eq!(
                 error.to_string(),
@@ -685,16 +694,17 @@ mod tests {
         client
             .follow_up("then summarize both", &images)
             .expect("queue follow-up request");
-        let WriterMessage::Frame(frame) = receiver.recv().expect("receive follow-up request") else {
+        let WriterMessage::Frame(frame) = receiver.recv().expect("receive follow-up request")
+        else {
             panic!("expected RPC frame");
         };
         let frame = serde_json::from_str::<Value>(&frame).expect("decode follow-up request");
         assert_eq!(frame["type"], "follow_up");
         assert_eq!(frame["images"][0]["mimeType"], "image/png");
         assert_eq!(frame["images"][1]["mimeType"], "image/jpeg");
-}
+    }
 
-#[test]
+    #[test]
     fn sends_complete_todo_state_through_set_todos() {
         let (writer, receiver) = mpsc::channel();
         let client = BridgeClient {
@@ -737,9 +747,7 @@ mod tests {
         client
             .get_branch_messages()
             .expect("queue branch message request");
-        client
-            .branch("entry-7f2b")
-            .expect("queue branch selection");
+        client.branch("entry-7f2b").expect("queue branch selection");
 
         let WriterMessage::Frame(messages) =
             receiver.recv().expect("receive branch message request")
@@ -779,10 +787,12 @@ mod tests {
             .expect("queue focused handoff");
         client.handoff(None).expect("queue default handoff");
 
-        let WriterMessage::Frame(focused) = receiver.recv().expect("receive focused handoff") else {
+        let WriterMessage::Frame(focused) = receiver.recv().expect("receive focused handoff")
+        else {
             panic!("expected RPC frame");
         };
-        let WriterMessage::Frame(default) = receiver.recv().expect("receive default handoff") else {
+        let WriterMessage::Frame(default) = receiver.recv().expect("receive default handoff")
+        else {
             panic!("expected RPC frame");
         };
         assert_eq!(

@@ -6,7 +6,8 @@ use adw::prelude::*;
 use gtk4 as gtk;
 use libadwaita as adw;
 
-use crate::alerts::{AlertPreferences, SoundEvent, SoundPackChoice};
+use crate::alerts::{Preferences, SoundEvent, SoundPackChoice};
+use crate::bridge::protocol::{InterruptMode, QueueMode};
 use crate::sound_registry::RegistryPack;
 
 use super::icons;
@@ -23,7 +24,7 @@ pub(crate) struct EventSoundRow {
 impl EventSoundRow {
     fn new(
         event: SoundEvent,
-        preferences: &AlertPreferences,
+        preferences: &Preferences,
         choices: Vec<SoundPackChoice>,
         sounds_enabled: bool,
     ) -> Self {
@@ -82,7 +83,7 @@ impl EventSoundRow {
 
     fn refresh(
         &self,
-        preferences: &AlertPreferences,
+        preferences: &Preferences,
         choices: Vec<SoundPackChoice>,
         sounds_enabled: bool,
     ) {
@@ -110,19 +111,22 @@ impl EventSoundRow {
 }
 
 #[derive(Clone)]
-pub(crate) struct SoundSettingsDialog {
+pub(crate) struct SettingsDialog {
     pub dialog: adw::PreferencesDialog,
     pub desktop_notifications: adw::SwitchRow,
     pub sounds: adw::SwitchRow,
     pub volume: gtk::Scale,
     pub event_rows: Rc<Vec<EventSoundRow>>,
     pub browse_packs: gtk::Button,
+    steering_delivery: adw::ComboRow,
+    follow_up_delivery: adw::ComboRow,
+    interrupt_timing: adw::ComboRow,
     installed_count: gtk::Label,
 }
 
-impl SoundSettingsDialog {
+impl SettingsDialog {
     pub fn new(
-        preferences: &AlertPreferences,
+        preferences: &Preferences,
         choices: &HashMap<SoundEvent, Vec<SoundPackChoice>>,
         installed_count: usize,
     ) -> Self {
@@ -131,6 +135,43 @@ impl SoundSettingsDialog {
             .content_width(620)
             .content_height(720)
             .build();
+        let messages_page = adw::PreferencesPage::builder()
+            .title("Messages")
+            .icon_name("mail-send-symbolic")
+            .build();
+        let delivery_group = adw::PreferencesGroup::builder()
+            .title("Message delivery")
+            .description(
+                "Global defaults for every conversation, including conversations already open.",
+            )
+            .build();
+        let steering_delivery = delivery_row(
+            "Steering messages",
+            "How messages sent with Enter are released while omp is responding",
+            &["One at a time", "All at once"],
+            queue_mode_selected(preferences.steering_mode),
+        );
+        let follow_up_delivery = delivery_row(
+            "Follow-up messages",
+            "How messages sent with Ctrl+Enter or Ctrl+Q are released after the active turn",
+            &["One at a time", "All at once"],
+            queue_mode_selected(preferences.follow_up_mode),
+        );
+        let interrupt_timing = delivery_row(
+            "When steering",
+            "Choose whether steering interrupts active tools immediately",
+            &["Interrupt immediately", "Wait for the current turn"],
+            match preferences.interrupt_mode {
+                InterruptMode::Immediate => 0,
+                InterruptMode::Wait => 1,
+            },
+        );
+        delivery_group.add(&steering_delivery);
+        delivery_group.add(&follow_up_delivery);
+        delivery_group.add(&interrupt_timing);
+        messages_page.add(&delivery_group);
+        dialog.add(&messages_page);
+
         let page = adw::PreferencesPage::builder()
             .title("Sounds")
             .icon_name("audio-speakers-symbolic")
@@ -212,8 +253,30 @@ impl SoundSettingsDialog {
             volume,
             event_rows: Rc::new(event_rows),
             browse_packs,
+            steering_delivery,
+            follow_up_delivery,
+            interrupt_timing,
             installed_count,
         }
+    }
+
+    pub fn connect_steering_mode_changed(&self, callback: impl Fn(QueueMode) + 'static) {
+        self.steering_delivery
+            .connect_selected_notify(move |row| callback(queue_mode_from_selected(row.selected())));
+    }
+
+    pub fn connect_follow_up_mode_changed(&self, callback: impl Fn(QueueMode) + 'static) {
+        self.follow_up_delivery
+            .connect_selected_notify(move |row| callback(queue_mode_from_selected(row.selected())));
+    }
+
+    pub fn connect_interrupt_mode_changed(&self, callback: impl Fn(InterruptMode) + 'static) {
+        self.interrupt_timing.connect_selected_notify(move |row| {
+            callback(match row.selected() {
+                1 => InterruptMode::Wait,
+                _ => InterruptMode::Immediate,
+            });
+        });
     }
 
     pub fn present(&self, parent: &gtk::ApplicationWindow) {
@@ -229,7 +292,7 @@ impl SoundSettingsDialog {
 
     pub fn refresh_packs(
         &self,
-        preferences: &AlertPreferences,
+        preferences: &Preferences,
         choices: &HashMap<SoundEvent, Vec<SoundPackChoice>>,
         installed_count: usize,
     ) {
@@ -242,6 +305,29 @@ impl SoundSettingsDialog {
         }
         self.installed_count
             .set_text(&installed_label(installed_count));
+    }
+}
+
+fn delivery_row(title: &str, subtitle: &str, choices: &[&str], selected: u32) -> adw::ComboRow {
+    adw::ComboRow::builder()
+        .title(title)
+        .subtitle(subtitle)
+        .model(&gtk::StringList::new(choices))
+        .selected(selected)
+        .build()
+}
+
+fn queue_mode_selected(mode: QueueMode) -> u32 {
+    match mode {
+        QueueMode::OneAtATime => 0,
+        QueueMode::All => 1,
+    }
+}
+
+fn queue_mode_from_selected(selected: u32) -> QueueMode {
+    match selected {
+        1 => QueueMode::All,
+        _ => QueueMode::OneAtATime,
     }
 }
 

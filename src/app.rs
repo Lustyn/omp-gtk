@@ -1,4 +1,6 @@
-use crate::alerts::{self, AlertKind, Alerts, SoundEvent, SoundPackChoice, WindowStatus};
+use crate::alerts::{
+    self, AlertKind, Alerts, Preferences, SoundEvent, SoundPackChoice, WindowStatus,
+};
 use crate::sound_registry::{self, RegistryPack};
 use crate::ui::{
     agent_hub as agent_hub_ui,
@@ -21,9 +23,9 @@ use serde_json::{Value, json};
 
 use crate::agent_hub::AgentHubState;
 use crate::bridge::protocol::{
-    BranchMessagesResponse, BranchResponse, HandoffResponse, InterruptMode, ModelSummary, QueueMode,
-    RpcEvent, RpcResponse, SessionState, SetTodosResponse, SlashCommand, SubagentMessages,
-    SubagentSnapshot, SubagentUpdate, SubagentUpdateKind, TodoItem, TodoPhase, TodoStatus, ToolEnd,
+    BranchMessagesResponse, BranchResponse, HandoffResponse, InterruptMode, ModelSummary,
+    QueueMode, RpcEvent, RpcResponse, SessionState, SetTodosResponse, SlashCommand,
+    SubagentMessages, SubagentSnapshot, SubagentUpdate, TodoItem, TodoPhase, TodoStatus, ToolEnd,
     ToolStart, ToolUpdate, message_cost, message_role, message_text, message_thinking,
     message_tool_calls, tool_result_parts,
 };
@@ -32,8 +34,8 @@ use crate::commands::{CommandCompletion, completions, unsupported_native_mode_er
 use crate::session_catalog::{self, SessionEntry};
 use chat::{MessageBody, MessageRole, ThinkingBlock};
 use sidebar::SessionRow;
-use tool_components::ToolCard;
 use todos::{TodoAction, TodoEdit, apply_edit, validate_phases};
+use tool_components::ToolCard;
 use workspace::WorkspaceView;
 
 const TASK_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
@@ -42,19 +44,28 @@ const PROMPT_BURST_THRESHOLD: usize = 3;
 
 pub(crate) fn build(app: &adw::Application) {
     let ui = workspace::build(app);
-
-    let (bridge, client, events) = match OmpBridge::spawn() {
+    let initial_runtime_id = 1;
+    let (runtimes, active_runtime, events) = match OmpBridge::spawn() {
         Ok(bridge) => {
-            let client = bridge.client.clone();
             let events = bridge.events.clone();
-            (Some(bridge), Some(client), Some(events))
+            let mut runtimes = HashMap::new();
+            runtimes.insert(
+                initial_runtime_id,
+                SessionRuntime {
+                    bridge,
+                    running: false,
+                    ready: false,
+                    delivery_target: None,
+                },
+            );
+            (runtimes, Some(initial_runtime_id), Some(events))
         }
-        Err(error) => (None, None, {
+        Err(error) => {
             ui.composer.set_input_sensitive(false);
             ui.conversation
                 .append_notice(&format!("Could not start omp: {error}"), true);
-            None
-        }),
+            (HashMap::new(), None, None)
+        }
     };
 
     let alerts = Alerts::new(app);
@@ -65,9 +76,10 @@ pub(crate) fn build(app: &adw::Application) {
 
     let controller = Rc::new(AppController {
         ui,
-        bridge: RefCell::new(bridge),
         alerts,
-        client,
+        runtimes: RefCell::new(runtimes),
+        active_runtime: Cell::new(active_runtime),
+        next_runtime_id: Cell::new(initial_runtime_id + 1),
         models: RefCell::new(Vec::new()),
         commands: RefCell::new(Vec::new()),
         thinking_levels: RefCell::new(Vec::new()),
@@ -88,7 +100,6 @@ pub(crate) fn build(app: &adw::Application) {
         session_rows: RefCell::new(Vec::new()),
         todo_phases: RefCell::new(Vec::new()),
         active_sessions: RefCell::new(Vec::new()),
-        pending_delete: RefCell::new(None),
         current_session_file: RefCell::new(None),
         current_session_title: RefCell::new("New conversation".to_owned()),
         pending_session_notice: RefCell::new(None),
@@ -103,12 +114,7 @@ pub(crate) fn build(app: &adw::Application) {
         current_model: RefCell::new(None),
         ready: Cell::new(false),
         running: Cell::new(false),
-        running_turn_action: Cell::new(RunningTurnAction::Steer),
-        steering_mode: Cell::new(QueueMode::OneAtATime),
-        follow_up_mode: Cell::new(QueueMode::OneAtATime),
-        interrupt_mode: Cell::new(InterruptMode::Immediate),
         queued_message_count: Cell::new(0),
-        reconciling_queue_state: Cell::new(false),
         goal_completion_calls: RefCell::new(HashSet::new()),
         goal_completed_this_run: Cell::new(false),
         window_status: Cell::new(WindowStatus::Ready),
@@ -119,8 +125,8 @@ pub(crate) fn build(app: &adw::Application) {
 
     controller.wire_interactions();
     controller.set_window_status(WindowStatus::Ready);
-    if let Some(events) = events {
-        AppController::run_event_loop(&controller, events);
+    if let (Some(runtime_id), Some(events)) = (active_runtime, events) {
+        AppController::run_event_loop(&controller, runtime_id, events);
     }
     let weak = Rc::downgrade(&controller);
     glib::timeout_add_local(Duration::from_millis(750), move || {
@@ -140,8 +146,8 @@ struct StreamingMessage {
     text: String,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RunningTurnAction {
-    Steer,
+enum SubmissionIntent {
+    Default,
     FollowUp,
 }
 
@@ -153,40 +159,138 @@ enum SubmissionAction {
 }
 
 impl SubmissionAction {
-    fn select(running: bool, running_turn_action: RunningTurnAction) -> Self {
+    fn select(running: bool, intent: SubmissionIntent) -> Self {
         if !running {
             return Self::Prompt;
         }
-        match running_turn_action {
-            RunningTurnAction::Steer => Self::Steer,
-            RunningTurnAction::FollowUp => Self::FollowUp,
+        match intent {
+            SubmissionIntent::Default => Self::Steer,
+            SubmissionIntent::FollowUp => Self::FollowUp,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ReconciledComposerState {
-    running_turn_action: RunningTurnAction,
+enum ComposerKeyAction {
+    Submit,
+    FollowUp,
+    Newline,
+}
+
+fn composer_key_action(key: gdk::Key, modifiers: gdk::ModifierType) -> Option<ComposerKeyAction> {
+    let control = modifiers.contains(gdk::ModifierType::CONTROL_MASK);
+    if key == gdk::Key::q && control {
+        return Some(ComposerKeyAction::FollowUp);
+    }
+    if !matches!(key, gdk::Key::Return | gdk::Key::KP_Enter) {
+        return None;
+    }
+    if modifiers.intersects(gdk::ModifierType::SHIFT_MASK | gdk::ModifierType::ALT_MASK) {
+        return Some(ComposerKeyAction::Newline);
+    }
+    Some(if control {
+        ComposerKeyAction::FollowUp
+    } else {
+        ComposerKeyAction::Submit
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeliveryModes {
     steering_mode: QueueMode,
     follow_up_mode: QueueMode,
     interrupt_mode: InterruptMode,
-    queued_message_count: usize,
 }
 
-fn reconcile_composer_state(
-    running_turn_action: RunningTurnAction,
-    state: &SessionState,
-) -> ReconciledComposerState {
-    ReconciledComposerState {
-        running_turn_action,
-        steering_mode: state.steering_mode,
-        follow_up_mode: state.follow_up_mode,
-        interrupt_mode: state.interrupt_mode,
-        queued_message_count: state.queued_message_count,
+impl From<&Preferences> for DeliveryModes {
+    fn from(preferences: &Preferences) -> Self {
+        Self {
+            steering_mode: preferences.steering_mode,
+            follow_up_mode: preferences.follow_up_mode,
+            interrupt_mode: preferences.interrupt_mode,
+        }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeliveryPreferenceUpdates {
+    steering_mode: Option<QueueMode>,
+    follow_up_mode: Option<QueueMode>,
+    interrupt_mode: Option<InterruptMode>,
+}
+impl DeliveryPreferenceUpdates {
+    fn is_empty(self) -> bool {
+        self.steering_mode.is_none()
+            && self.follow_up_mode.is_none()
+            && self.interrupt_mode.is_none()
+    }
+}
+fn should_send_delivery_preference_updates(
+    delivery_target: Option<DeliveryModes>,
+    desired: DeliveryModes,
+    updates: DeliveryPreferenceUpdates,
+) -> bool {
+    !updates.is_empty() && delivery_target != Some(desired)
+}
 
+fn delivery_preference_updates(
+    preferences: &Preferences,
+    state: &SessionState,
+) -> DeliveryPreferenceUpdates {
+    DeliveryPreferenceUpdates {
+        steering_mode: (state.steering_mode != preferences.steering_mode)
+            .then_some(preferences.steering_mode),
+        follow_up_mode: (state.follow_up_mode != preferences.follow_up_mode)
+            .then_some(preferences.follow_up_mode),
+        interrupt_mode: (state.interrupt_mode != preferences.interrupt_mode)
+            .then_some(preferences.interrupt_mode),
+    }
+}
+
+fn send_delivery_preference_updates(
+    client: &BridgeClient,
+    updates: DeliveryPreferenceUpdates,
+) -> Result<(), crate::bridge::BridgeError> {
+    let mut first_error = None;
+    for result in [
+        updates
+            .steering_mode
+            .map(|mode| client.set_steering_mode(mode)),
+        updates
+            .follow_up_mode
+            .map(|mode| client.set_follow_up_mode(mode)),
+        updates
+            .interrupt_mode
+            .map(|mode| client.set_interrupt_mode(mode)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Err(error) = result
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+fn session_actions_are_relevant(
+    ready: bool,
+    persisted: bool,
+    has_messages: bool,
+    running: bool,
+    session_busy: bool,
+    subagent_open: bool,
+    chat_visible: bool,
+) -> bool {
+    ready
+        && persisted
+        && has_messages
+        && !running
+        && !session_busy
+        && !subagent_open
+        && chat_visible
+}
 
 struct PendingSubmission {
     request_id: String,
@@ -202,12 +306,19 @@ struct SubagentTranscriptState {
     pending_refresh: bool,
     has_content: bool,
 }
+struct SessionRuntime {
+    bridge: OmpBridge,
+    running: bool,
+    ready: bool,
+    delivery_target: Option<DeliveryModes>,
+}
 
 struct AppController {
     ui: WorkspaceView,
     alerts: Alerts,
-    bridge: RefCell<Option<OmpBridge>>,
-    client: Option<BridgeClient>,
+    runtimes: RefCell<HashMap<u64, SessionRuntime>>,
+    active_runtime: Cell<Option<u64>>,
+    next_runtime_id: Cell<u64>,
     models: RefCell<Vec<ModelSummary>>,
     commands: RefCell<Vec<SlashCommand>>,
     thinking_levels: RefCell<Vec<String>>,
@@ -228,7 +339,6 @@ struct AppController {
     session_rows: RefCell<Vec<SessionRow>>,
     todo_phases: RefCell<Vec<TodoPhase>>,
     active_sessions: RefCell<Vec<SessionEntry>>,
-    pending_delete: RefCell<Option<PathBuf>>,
     current_session_file: RefCell<Option<PathBuf>>,
     current_session_title: RefCell<String>,
     pending_session_notice: RefCell<Option<String>>,
@@ -243,12 +353,7 @@ struct AppController {
     current_model: RefCell<Option<(String, String)>>,
     ready: Cell<bool>,
     running: Cell<bool>,
-    running_turn_action: Cell<RunningTurnAction>,
-    steering_mode: Cell<QueueMode>,
-    follow_up_mode: Cell<QueueMode>,
-    interrupt_mode: Cell<InterruptMode>,
     queued_message_count: Cell<usize>,
-    reconciling_queue_state: Cell<bool>,
     goal_completion_calls: RefCell<HashSet<String>>,
     goal_completed_this_run: Cell<bool>,
     window_status: Cell<WindowStatus>,
@@ -258,7 +363,6 @@ struct AppController {
 }
 
 impl AppController {
-
     fn wire_interactions(self: &Rc<Self>) {
         let weak = Rc::downgrade(self);
         self.ui.todos.connect_action(move |action| {
@@ -293,14 +397,16 @@ impl AppController {
                 controller.start_new_session();
                 return glib::Propagation::Stop;
             }
-            if matches!(key, gdk::Key::Return | gdk::Key::KP_Enter) {
-                if enter_inserts_newline(modifiers) {
-                    return glib::Propagation::Proceed;
-                }
+            if let Some(action) = composer_key_action(key, modifiers) {
+                let intent = match action {
+                    ComposerKeyAction::Submit => SubmissionIntent::Default,
+                    ComposerKeyAction::FollowUp => SubmissionIntent::FollowUp,
+                    ComposerKeyAction::Newline => return glib::Propagation::Proceed,
+                };
                 if controller.ui.composer.completions_visible() {
-                    controller.accept_completion(true);
+                    controller.accept_completion(Some(intent));
                 } else {
-                    controller.submit_current();
+                    controller.submit_current_with_intent(intent);
                 }
                 return glib::Propagation::Stop;
             }
@@ -317,7 +423,7 @@ impl AppController {
                     glib::Propagation::Stop
                 }
                 gdk::Key::Tab => {
-                    controller.accept_completion(false);
+                    controller.accept_completion(None);
                     glib::Propagation::Stop
                 }
                 gdk::Key::ISO_Left_Tab => {
@@ -356,51 +462,6 @@ impl AppController {
         });
 
         let weak = Rc::downgrade(self);
-        self.ui.composer.connect_steer_selected(move || {
-            if let Some(controller) = weak.upgrade() {
-                controller
-                    .running_turn_action
-                    .set(RunningTurnAction::Steer);
-                controller.update_send_state();
-            }
-        });
-
-        let weak = Rc::downgrade(self);
-        self.ui.composer.connect_follow_up_selected(move || {
-            if let Some(controller) = weak.upgrade() {
-                controller
-                    .running_turn_action
-                    .set(RunningTurnAction::FollowUp);
-                controller.update_send_state();
-            }
-        });
-
-        let weak = Rc::downgrade(self);
-        self.ui.composer.connect_steering_mode_changed(move |mode| {
-            if let Some(controller) = weak.upgrade() {
-                controller.request_steering_mode(mode);
-            }
-        });
-
-        let weak = Rc::downgrade(self);
-        self.ui
-            .composer
-            .connect_follow_up_mode_changed(move |mode| {
-                if let Some(controller) = weak.upgrade() {
-                    controller.request_follow_up_mode(mode);
-                }
-            });
-
-        let weak = Rc::downgrade(self);
-        self.ui
-            .composer
-            .connect_interrupt_mode_changed(move |mode| {
-                if let Some(controller) = weak.upgrade() {
-                    controller.request_interrupt_mode(mode);
-                }
-            });
-
-        let weak = Rc::downgrade(self);
         self.ui.new_chat_button.connect_clicked(move |_| {
             if let Some(controller) = weak.upgrade() {
                 controller.start_new_session();
@@ -415,7 +476,7 @@ impl AppController {
         let weak = Rc::downgrade(self);
         self.ui.preferences_button.connect_clicked(move |_| {
             if let Some(controller) = weak.upgrade() {
-                controller.present_alert_preferences();
+                controller.present_settings();
             }
         });
 
@@ -477,8 +538,8 @@ impl AppController {
         });
 
         let weak = Rc::downgrade(self);
-        self.ui.session_list.connect_row_activated(move |_, row| {
-            let Some(controller) = weak.upgrade() else {
+        self.ui.session_list.connect_row_selected(move |_, row| {
+            let (Some(controller), Some(row)) = (weak.upgrade(), row) else {
                 return;
             };
             let selected = controller
@@ -512,28 +573,273 @@ impl AppController {
                 return;
             };
             controller.completion_index.set(index as usize);
-            controller.accept_completion(false);
+            controller.accept_completion(None);
         });
 
         let weak = Rc::downgrade(self);
         self.ui.window.connect_close_request(move |_| {
             if let Some(controller) = weak.upgrade() {
                 controller.alerts.play(SoundEvent::SessionEnd);
-                if let Some(bridge) = controller.bridge.borrow().as_ref() {
-                    bridge.shutdown();
+                for runtime in controller.runtimes.borrow().values() {
+                    runtime.bridge.shutdown();
                 }
             }
             glib::Propagation::Proceed
         });
     }
 
-    fn run_event_loop(this: &Rc<Self>, events: async_channel::Receiver<RpcEvent>) {
+    fn run_event_loop(this: &Rc<Self>, runtime_id: u64, events: async_channel::Receiver<RpcEvent>) {
         let controller = this.clone();
         glib::spawn_future_local(async move {
             while let Ok(event) = events.recv().await {
-                controller.handle_event(event);
+                controller.handle_runtime_event(runtime_id, event);
             }
         });
+    }
+
+    fn active_client(&self) -> Option<BridgeClient> {
+        self.active_runtime
+            .get()
+            .and_then(|runtime_id| self.runtime_client(runtime_id))
+    }
+
+    fn runtime_client(&self, runtime_id: u64) -> Option<BridgeClient> {
+        self.runtimes
+            .borrow()
+            .get(&runtime_id)
+            .map(|runtime| runtime.bridge.client.clone())
+    }
+    fn apply_global_delivery_preferences(&self, runtime_id: u64, state: &SessionState) {
+        let preferences = self.alerts.preferences();
+        let desired = DeliveryModes::from(&preferences);
+        let updates = delivery_preference_updates(&preferences, state);
+        let client = {
+            let mut runtimes = self.runtimes.borrow_mut();
+            let Some(runtime) = runtimes.get_mut(&runtime_id) else {
+                return;
+            };
+            if updates.is_empty() {
+                runtime.delivery_target = None;
+                return;
+            }
+            if !should_send_delivery_preference_updates(runtime.delivery_target, desired, updates) {
+                return;
+            }
+            runtime.delivery_target = Some(desired);
+            runtime.bridge.client.clone()
+        };
+        if let Err(error) = send_delivery_preference_updates(&client, updates) {
+            if let Some(runtime) = self.runtimes.borrow_mut().get_mut(&runtime_id)
+                && runtime.delivery_target == Some(desired)
+            {
+                runtime.delivery_target = None;
+            }
+            if self.active_runtime.get() == Some(runtime_id) {
+                self.show_error(&format!(
+                    "Could not apply global message delivery settings: {error}"
+                ));
+            } else {
+                eprintln!("Could not apply global message delivery settings: {error}");
+            }
+        }
+    }
+
+    fn send_to_ready_runtimes(
+        &self,
+        desired: DeliveryModes,
+        send: impl Fn(&BridgeClient) -> Result<(), crate::bridge::BridgeError>,
+    ) {
+        let mut first_error = None;
+        {
+            let mut runtimes = self.runtimes.borrow_mut();
+            for runtime in runtimes.values_mut().filter(|runtime| runtime.ready) {
+                runtime.delivery_target = Some(desired);
+                if let Err(error) = send(&runtime.bridge.client) {
+                    runtime.delivery_target = None;
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            self.show_error(&format!(
+                "Could not apply global message delivery setting: {error}"
+            ));
+        }
+    }
+
+    fn set_global_steering_mode(&self, mode: QueueMode) {
+        if mode == self.alerts.preferences().steering_mode {
+            return;
+        }
+        if let Err(error) = self.alerts.set_steering_mode(mode) {
+            self.show_error(&error);
+            return;
+        }
+        let desired = DeliveryModes::from(&self.alerts.preferences());
+        self.send_to_ready_runtimes(desired, |client| client.set_steering_mode(mode));
+    }
+
+    fn set_global_follow_up_mode(&self, mode: QueueMode) {
+        if mode == self.alerts.preferences().follow_up_mode {
+            return;
+        }
+        if let Err(error) = self.alerts.set_follow_up_mode(mode) {
+            self.show_error(&error);
+            return;
+        }
+        let desired = DeliveryModes::from(&self.alerts.preferences());
+        self.send_to_ready_runtimes(desired, |client| client.set_follow_up_mode(mode));
+    }
+
+    fn set_global_interrupt_mode(&self, mode: InterruptMode) {
+        if mode == self.alerts.preferences().interrupt_mode {
+            return;
+        }
+        if let Err(error) = self.alerts.set_interrupt_mode(mode) {
+            self.show_error(&error);
+            return;
+        }
+        let desired = DeliveryModes::from(&self.alerts.preferences());
+        self.send_to_ready_runtimes(desired, |client| client.set_interrupt_mode(mode));
+    }
+
+    fn spawn_runtime(self: &Rc<Self>, session_path: Option<&Path>) -> std::io::Result<u64> {
+        let bridge = OmpBridge::spawn_for_session(session_path)?;
+        let events = bridge.events.clone();
+        let runtime_id = self.next_runtime_id.get();
+        self.next_runtime_id.set(runtime_id + 1);
+        self.runtimes.borrow_mut().insert(
+            runtime_id,
+            SessionRuntime {
+                bridge,
+                running: false,
+                ready: false,
+                delivery_target: None,
+            },
+        );
+        Self::run_event_loop(self, runtime_id, events);
+        Ok(runtime_id)
+    }
+
+    fn apply_inactive_state(&self, runtime_id: u64, state: SessionState) {
+        if let Some(runtime) = self.runtimes.borrow_mut().get_mut(&runtime_id) {
+            runtime.ready = true;
+            runtime.running = state.is_streaming;
+        }
+        self.apply_global_delivery_preferences(runtime_id, &state);
+        let path = state.session_file.as_deref().map(PathBuf::from);
+        let disk_title = path
+            .as_deref()
+            .and_then(session_catalog::read_session_title);
+        let mut entries = self.active_sessions.borrow_mut();
+        let Some(entry) = entries
+            .iter_mut()
+            .find(|entry| entry.runtime_id == Some(runtime_id))
+        else {
+            return;
+        };
+        let resolved = session_catalog::authoritative_title(
+            state.session_name.as_deref(),
+            disk_title.as_deref(),
+        );
+        let title =
+            session_catalog::authoritative_title(Some(&resolved), Some(entry.title.as_str()));
+        let mut refreshed = session_catalog::session_entry(path.as_deref(), &title, false);
+        refreshed.runtime_id = Some(runtime_id);
+        refreshed.running = state.is_streaming;
+        *entry = refreshed;
+    }
+
+    fn handle_runtime_event(self: &Rc<Self>, runtime_id: u64, event: RpcEvent) {
+        match &event {
+            RpcEvent::Ready => {
+                if let Some(runtime) = self.runtimes.borrow_mut().get_mut(&runtime_id) {
+                    runtime.ready = true;
+                    runtime.delivery_target = None;
+                }
+            }
+            RpcEvent::Disconnected(_) => {
+                if let Some(runtime) = self.runtimes.borrow_mut().get_mut(&runtime_id) {
+                    runtime.ready = false;
+                    runtime.delivery_target = None;
+                }
+            }
+            RpcEvent::Response(response)
+                if !response.success
+                    && matches!(
+                        response.command.as_str(),
+                        "set_steering_mode" | "set_follow_up_mode" | "set_interrupt_mode"
+                    ) =>
+            {
+                if let Some(runtime) = self.runtimes.borrow_mut().get_mut(&runtime_id) {
+                    runtime.delivery_target = None;
+                }
+            }
+            _ => {}
+        }
+        if matches!(event, RpcEvent::Ready)
+            && let Some(client) = self.runtime_client(runtime_id)
+            && let Err(error) = client.initialize()
+        {
+            if self.active_runtime.get() == Some(runtime_id) {
+                self.show_error(&error.to_string());
+            }
+            return;
+        }
+
+        let running = match &event {
+            RpcEvent::AgentStart => Some(true),
+            RpcEvent::AgentEnd | RpcEvent::Disconnected(_) => Some(false),
+            _ => None,
+        };
+        if let Some(running) = running {
+            if let Some(runtime) = self.runtimes.borrow_mut().get_mut(&runtime_id) {
+                runtime.running = running;
+            }
+            for entry in self.active_sessions.borrow_mut().iter_mut() {
+                if entry.runtime_id == Some(runtime_id) {
+                    entry.running = running;
+                }
+            }
+        }
+
+        if self.active_runtime.get() != Some(runtime_id) {
+            match &event {
+                RpcEvent::Response(response)
+                    if response.success && response.command == "get_state" =>
+                {
+                    if let Some(data) = response.data.clone()
+                        && let Ok(state) = serde_json::from_value::<SessionState>(data)
+                    {
+                        self.apply_inactive_state(runtime_id, state);
+                    }
+                }
+                RpcEvent::SessionInfo { title: Some(title) } if !title.trim().is_empty() => {
+                    if let Some(entry) = self
+                        .active_sessions
+                        .borrow_mut()
+                        .iter_mut()
+                        .find(|entry| entry.runtime_id == Some(runtime_id))
+                    {
+                        entry.title = title.trim().to_owned();
+                    }
+                }
+                _ => {}
+            }
+            if running.is_some()
+                || matches!(event, RpcEvent::Response(_) | RpcEvent::SessionInfo { .. })
+            {
+                self.render_session_sidebar(self.active_sessions.borrow().clone());
+            }
+            return;
+        }
+
+        self.handle_event(event);
+        if running.is_some() {
+            self.refresh_session_sidebar();
+        }
     }
 
     fn handle_event(self: &Rc<Self>, event: RpcEvent) {
@@ -541,11 +847,6 @@ impl AppController {
             RpcEvent::Ready => {
                 if !self.session_sound_started.replace(true) {
                     self.alerts.play(SoundEvent::SessionStart);
-                }
-                if let Some(client) = &self.client
-                    && let Err(error) = client.initialize()
-                {
-                    self.show_error(&error.to_string());
                 }
             }
             RpcEvent::Response(response) => self.handle_response(response),
@@ -588,7 +889,7 @@ impl AppController {
                 }
                 self.update_activity_counts();
                 self.update_send_state();
-                if let Some(client) = &self.client {
+                if let Some(client) = self.active_client() {
                     let _ = client.refresh_state();
                 }
             }
@@ -617,7 +918,7 @@ impl AppController {
                 }
             }
             RpcEvent::ConfigChanged => {
-                if let Some(client) = &self.client {
+                if let Some(client) = self.active_client() {
                     let _ = client.refresh_state();
                 }
             }
@@ -628,14 +929,14 @@ impl AppController {
                 self.scroll_to_bottom();
             }
             RpcEvent::ModelChanged => {
-                if let Some(client) = &self.client {
+                if let Some(client) = self.active_client() {
                     let _ = client.refresh_state();
                 }
             }
             RpcEvent::ThinkingChanged(level) => {
                 if let Some(level) = level {
                     self.select_thinking(&level);
-                } else if let Some(client) = &self.client {
+                } else if let Some(client) = self.active_client() {
                     let _ = client.refresh_state();
                 }
             }
@@ -671,9 +972,6 @@ impl AppController {
         if !response.success {
             if matches!(response.command.as_str(), "prompt" | "steer" | "follow_up") {
                 self.reject_submission_response(response.id.as_deref());
-            }
-            if response.command == "new_session" {
-                self.pending_delete.borrow_mut().take();
             }
             if matches!(
                 response.command.as_str(),
@@ -712,7 +1010,7 @@ impl AppController {
         if matches!(
             response.command.as_str(),
             "set_steering_mode" | "set_follow_up_mode" | "set_interrupt_mode"
-        ) && let Some(client) = &self.client
+        ) && let Some(client) = self.active_client()
         {
             let _ = client.refresh_state();
         }
@@ -726,7 +1024,6 @@ impl AppController {
         }
         let Some(data) = response.data else {
             match response.command.as_str() {
-                "new_session" => self.refresh_after_new_session(),
                 "set_todos" => self.reject_todo_reconciliation("omp returned no todo state."),
                 "get_branch_messages" | "branch" => {
                     self.branch_busy.set(false);
@@ -877,11 +1174,6 @@ impl AppController {
                     "omp returned invalid todo state: {error}"
                 )),
             },
-            "new_session" => self.refresh_after_new_session(),
-            "switch_session" => self.refresh_after_confirmed_session_change(
-                "Opening conversation",
-                "Loading conversation…",
-            ),
             "set_session_name" => self.refresh_after_session_change(),
             _ => {}
         }
@@ -969,40 +1261,14 @@ impl AppController {
         }
         self.hide_completions();
         self.scroll_to_bottom();
-        if let Some(client) = &self.client {
+        if let Some(client) = self.active_client() {
             let _ = client.refresh_state();
         }
         self.update_send_state();
     }
-    fn refresh_after_new_session(self: &Rc<Self>) {
-        if let Some(path) = self.pending_delete.borrow_mut().take() {
-            if let Err(error) = session_catalog::delete_session_files(&path) {
-                self.show_error(&format!("Could not delete conversation: {error}"));
-            }
-            self.active_sessions
-                .borrow_mut()
-                .retain(|entry| entry.path.as_deref() != Some(path.as_path()));
-        }
-        self.current_session_file.borrow_mut().take();
-        self.current_session_title
-            .replace("New conversation".to_owned());
-        self.session_cost.set(0.0);
-        self.goal_completed_this_run.set(false);
-        self.goal_completion_calls.borrow_mut().clear();
-        self.alerts.play(SoundEvent::SessionStart);
-        self.set_window_status(WindowStatus::Ready);
-        self.clear_messages();
-        self.clear_subagents();
-        self.set_session_title("New conversation");
-        self.ui
-            .conversation
-            .append_notice("Starting a new conversation…", false);
-        self.refresh_session_sidebar();
-        self.refresh_after_session_change();
-    }
 
     fn refresh_after_session_change(&self) {
-        if let Some(client) = &self.client {
+        if let Some(client) = self.active_client() {
             let _ = client.refresh_state();
             let _ = client.refresh_messages();
             let _ = client.refresh_subagents();
@@ -1012,16 +1278,19 @@ impl AppController {
     fn apply_state(self: &Rc<Self>, state: SessionState) {
         self.ready.set(true);
         self.running.set(state.is_streaming);
+        let runtime_id = self.active_runtime.get();
+        if let Some(runtime_id) = runtime_id
+            && let Some(runtime) = self.runtimes.borrow_mut().get_mut(&runtime_id)
+        {
+            runtime.ready = true;
+            runtime.running = state.is_streaming;
+        }
         self.ui.composer.set_input_sensitive(true);
-        let composer_state = reconcile_composer_state(self.running_turn_action.get(), &state);
-        self.running_turn_action
-            .set(composer_state.running_turn_action);
-        self.steering_mode.set(composer_state.steering_mode);
-        self.follow_up_mode.set(composer_state.follow_up_mode);
-        self.interrupt_mode.set(composer_state.interrupt_mode);
-        self.queued_message_count
-            .set(composer_state.queued_message_count);
+        self.queued_message_count.set(state.queued_message_count);
         self.render_authoritative_queue_state();
+        if let Some(runtime_id) = runtime_id {
+            self.apply_global_delivery_preferences(runtime_id, &state);
+        }
         self.reconcile_todos(state.todo_phases.clone());
 
         let session_file = state.session_file.as_deref().map(PathBuf::from);
@@ -1146,7 +1415,7 @@ impl AppController {
                 return;
             }
         };
-        let Some(client) = &self.client else {
+        let Some(client) = self.active_client() else {
             let error = "omp bridge is not running";
             self.ui.todos.set_error(Some(error));
             self.show_error(error);
@@ -1171,10 +1440,7 @@ impl AppController {
         task_content.set_placeholder_text(Some("First task"));
         task_content.set_max_length(2_000);
         task_content.set_activates_default(true);
-        let form = todo_form(&[
-            ("_Phase name", &phase_name),
-            ("_First task", &task_content),
-        ]);
+        let form = todo_form(&[("_Phase name", &phase_name), ("_First task", &task_content)]);
         let dialog = adw::AlertDialog::builder()
             .heading("Add todo phase")
             .body("Add the first task now; more tasks can be appended from the phase.")
@@ -1328,6 +1594,15 @@ impl AppController {
             title.trim()
         };
         self.current_session_title.replace(title.to_owned());
+        if let Some(runtime_id) = self.active_runtime.get()
+            && let Some(entry) = self
+                .active_sessions
+                .borrow_mut()
+                .iter_mut()
+                .find(|entry| entry.runtime_id == Some(runtime_id))
+        {
+            entry.title = title.to_owned();
+        }
         if self.active_subagent.borrow().is_none() {
             self.ui.title.set_text(title);
         }
@@ -1335,15 +1610,15 @@ impl AppController {
     }
 
     fn refresh_titles_from_disk(self: &Rc<Self>) {
-        let current_path = self.current_session_file.borrow().clone();
+        let active_runtime = self.active_runtime.get();
         let current_title = self.current_session_title.borrow().clone();
         let entries = self
             .active_sessions
             .borrow()
             .iter()
             .map(|entry| {
-                let current = entry.path == current_path;
-                session_catalog::session_entry(
+                let current = entry.runtime_id == active_runtime;
+                let mut refreshed = session_catalog::session_entry(
                     entry.path.as_deref(),
                     if current {
                         &current_title
@@ -1351,7 +1626,18 @@ impl AppController {
                         &entry.title
                     },
                     current,
-                )
+                );
+                refreshed.title = session_catalog::authoritative_title(
+                    Some(&refreshed.title),
+                    Some(if current {
+                        &current_title
+                    } else {
+                        &entry.title
+                    }),
+                );
+                refreshed.runtime_id = entry.runtime_id;
+                refreshed.running = entry.running;
+                refreshed
             })
             .collect::<Vec<_>>();
         if entries == *self.active_sessions.borrow() {
@@ -1367,19 +1653,30 @@ impl AppController {
     }
 
     fn refresh_session_sidebar(self: &Rc<Self>) {
-        let current = session_catalog::session_entry(
+        let runtime_id = self.active_runtime.get();
+        let running = runtime_id
+            .and_then(|runtime_id| {
+                self.runtimes
+                    .borrow()
+                    .get(&runtime_id)
+                    .map(|runtime| runtime.running)
+            })
+            .unwrap_or(false);
+        let mut current = session_catalog::session_entry(
             self.current_session_file.borrow().as_deref(),
             &self.current_session_title.borrow(),
             true,
         );
+        current.runtime_id = runtime_id;
+        current.running = running;
         let mut entries = self.active_sessions.borrow_mut();
-        if current.path.is_some() {
-            entries.retain(|entry| entry.path.is_some());
-        }
         for entry in entries.iter_mut() {
             entry.current = false;
         }
-        if let Some(position) = entries.iter().position(|entry| entry.path == current.path) {
+        if let Some(position) = entries
+            .iter()
+            .position(|entry| entry.runtime_id == runtime_id)
+        {
             entries.remove(position);
         }
         entries.insert(0, current);
@@ -1503,7 +1800,9 @@ impl AppController {
     }
 
     fn clipboard_has_supported_image(&self) -> bool {
-        let formats = self.ui.window.display().clipboard().formats();
+        let formats = gtk::prelude::WidgetExt::display(&self.ui.window)
+            .clipboard()
+            .formats();
         formats.contain_mime_type("image/png") || formats.contain_mime_type("image/jpeg")
     }
 
@@ -1511,14 +1810,11 @@ impl AppController {
         if !self.ready.get() {
             return;
         }
-        let clipboard = self.ui.window.display().clipboard();
+        let clipboard = gtk::prelude::WidgetExt::display(&self.ui.window).clipboard();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
             let bytes = match clipboard
-                .read_future(
-                    &["image/png", "image/jpeg"],
-                    glib::Priority::DEFAULT,
-                )
+                .read_future(&["image/png", "image/jpeg"], glib::Priority::DEFAULT)
                 .await
             {
                 Ok((stream, _)) => match read_stream_bytes(&stream).await {
@@ -1544,9 +1840,8 @@ impl AppController {
                 Ok(encoded) => encoded,
                 Err(error) => {
                     if let Some(controller) = weak.upgrade() {
-                        controller.show_error(&format!(
-                            "Could not attach the clipboard image: {error}"
-                        ));
+                        controller
+                            .show_error(&format!("Could not attach the clipboard image: {error}"));
                     }
                     return;
                 }
@@ -1556,11 +1851,7 @@ impl AppController {
             };
             let number = controller.pasted_image_count.get() + 1;
             controller.pasted_image_count.set(number);
-            controller.append_loaded_attachment(
-                format!("Pasted image {number}.png"),
-                image,
-                bytes,
-            );
+            controller.append_loaded_attachment(format!("Pasted image {number}.png"), image, bytes);
         });
     }
 
@@ -1634,7 +1925,7 @@ impl AppController {
                 if current_workspace.as_deref() == Some(path.as_path()) {
                     return;
                 }
-                let Some(client) = &controller.client else {
+                let Some(client) = controller.active_client() else {
                     return;
                 };
                 if let Err(error) = client.move_session(&path) {
@@ -1664,7 +1955,7 @@ impl AppController {
         picker.show_loading();
         picker.present(&self.ui.window);
 
-        let Some(client) = &self.client else {
+        let Some(client) = self.active_client() else {
             picker.show_error("The omp bridge is not available.");
             return;
         };
@@ -1681,7 +1972,7 @@ impl AppController {
         if !self.session_actions_available() {
             return;
         }
-        let Some(client) = &self.client else {
+        let Some(client) = self.active_client() else {
             return;
         };
         self.branch_busy.set(true);
@@ -1715,7 +2006,7 @@ impl AppController {
         if !self.session_actions_available() {
             return;
         }
-        let Some(client) = &self.client else {
+        let Some(client) = self.active_client() else {
             return;
         };
         let instructions = instructions.trim();
@@ -1746,36 +2037,59 @@ impl AppController {
         });
     }
 
+    fn activate_runtime(self: &Rc<Self>, runtime_id: u64, entry: &SessionEntry) {
+        let Some((ready, running)) = self
+            .runtimes
+            .borrow()
+            .get(&runtime_id)
+            .map(|runtime| (runtime.ready, runtime.running))
+        else {
+            return;
+        };
+        self.active_runtime.set(Some(runtime_id));
+        self.ready.set(ready);
+        self.running.set(running);
+        self.branch_busy.set(false);
+        self.handoff_busy.set(false);
+        self.pending_submissions.borrow_mut().clear();
+        self.current_session_file.replace(entry.path.clone());
+        self.current_session_title.replace(entry.title.clone());
+        self.clear_messages();
+        self.clear_subagents();
+        self.set_session_title(&entry.title);
+        self.ui.composer.set_input_sensitive(ready);
+        self.ui.chat_status.activity("Opening conversation");
+        self.ui
+            .conversation
+            .append_notice("Loading conversation…", false);
+        self.refresh_session_sidebar();
+        if ready {
+            self.refresh_after_session_change();
+        }
+        self.update_send_state();
+    }
+
     fn open_session(self: &Rc<Self>, entry: &SessionEntry) {
         if entry.current || self.branch_busy.get() || self.handoff_busy.get() {
+            return;
+        }
+        if let Some(runtime_id) = entry.runtime_id {
+            self.activate_runtime(runtime_id, entry);
             return;
         }
         let Some(path) = entry.path.as_deref() else {
             return;
         };
-        let Some(client) = &self.client else {
-            return;
-        };
-        match client.switch_session(path) {
-            Ok(()) => {
-                let mut sessions = self.active_sessions.borrow_mut();
-                if !sessions.iter().any(|active| active.path == entry.path) {
-                    let mut opened = entry.clone();
-                    opened.current = false;
-                    sessions.insert(0, opened);
-                }
-                let entries = sessions.clone();
-                drop(sessions);
-                self.render_session_sidebar(entries);
-                self.ui.chat_status.activity("Opening conversation");
-                self.clear_messages();
-                self.clear_subagents();
-                self.set_session_title(&entry.title);
-                self.ui
-                    .conversation
-                    .append_notice("Loading conversation…", false);
+        match self.spawn_runtime(Some(path)) {
+            Ok(runtime_id) => {
+                let mut opened = entry.clone();
+                opened.runtime_id = Some(runtime_id);
+                opened.current = true;
+                opened.running = false;
+                self.active_sessions.borrow_mut().insert(0, opened.clone());
+                self.activate_runtime(runtime_id, &opened);
             }
-            Err(error) => self.show_error(&error.to_string()),
+            Err(error) => self.show_error(&format!("Could not start omp: {error}")),
         }
     }
 
@@ -1783,18 +2097,23 @@ impl AppController {
         if entry.current {
             self.alerts.play(SoundEvent::SessionEnd);
         }
+        if let Some(runtime_id) = entry.runtime_id {
+            self.runtimes.borrow_mut().remove(&runtime_id);
+        }
         self.active_sessions
             .borrow_mut()
-            .retain(|active| active.path != entry.path);
+            .retain(|active| active.runtime_id != entry.runtime_id);
         let next = entry
             .current
             .then(|| self.active_sessions.borrow().first().cloned())
             .flatten();
-        self.render_session_sidebar(self.active_sessions.borrow().clone());
         if let Some(next) = next {
             self.open_session(&next);
         } else if entry.current {
+            self.active_runtime.set(None);
             self.start_new_session();
+        } else {
+            self.render_session_sidebar(self.active_sessions.borrow().clone());
         }
     }
 
@@ -1820,16 +2139,19 @@ impl AppController {
                 return;
             };
             if current {
-                let Some(client) = &controller.client else {
+                let previous_runtime = controller.active_runtime.get();
+                controller.start_new_session();
+                if controller.active_runtime.get() == previous_runtime {
                     return;
-                };
-                match client.new_session() {
-                    Ok(()) => {
-                        controller.pending_delete.replace(Some(path.clone()));
-                        controller.ui.chat_status.activity("Deleting conversation");
-                    }
-                    Err(error) => controller.show_error(&error.to_string()),
                 }
+                if let Some(runtime_id) = previous_runtime {
+                    controller.runtimes.borrow_mut().remove(&runtime_id);
+                    controller
+                        .active_sessions
+                        .borrow_mut()
+                        .retain(|entry| entry.runtime_id != Some(runtime_id));
+                }
+                controller.delete_closed_session(&path);
             } else {
                 controller.delete_closed_session(&path);
             }
@@ -1863,7 +2185,7 @@ impl AppController {
         dialog.set_default_response(Some("rename"));
         dialog.set_close_response("cancel");
         dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
-        let session_path = entry.path.clone();
+        let runtime_id = entry.runtime_id;
         let was_current = entry.current;
         let weak = Rc::downgrade(self);
         dialog.connect_response(None, move |_, response| {
@@ -1877,18 +2199,24 @@ impl AppController {
             if title.is_empty() {
                 return;
             }
-            let Some(client) = &controller.client else {
+            let Some(client) =
+                runtime_id.and_then(|runtime_id| controller.runtime_client(runtime_id))
+            else {
                 return;
             };
-            if !was_current
-                && let Some(path) = session_path.as_deref()
-                && let Err(error) = client.switch_session(path)
-            {
-                controller.show_error(&error.to_string());
-                return;
-            }
             match client.set_session_name(&title) {
-                Ok(()) => controller.set_session_title(&title),
+                Ok(()) if was_current => controller.set_session_title(&title),
+                Ok(()) => {
+                    if let Some(entry) = controller
+                        .active_sessions
+                        .borrow_mut()
+                        .iter_mut()
+                        .find(|entry| entry.runtime_id == runtime_id)
+                    {
+                        entry.title = title.clone();
+                    }
+                    controller.render_session_sidebar(controller.active_sessions.borrow().clone());
+                }
                 Err(error) => controller.show_error(&error.to_string()),
             }
         });
@@ -1924,7 +2252,7 @@ impl AppController {
     }
 
     fn choose_model(&self, model: ModelSummary) {
-        let Some(client) = &self.client else {
+        let Some(client) = self.active_client() else {
             return;
         };
         match client.set_model(&model.provider, &model.id) {
@@ -1994,7 +2322,7 @@ impl AppController {
                 let Some(controller) = weak.upgrade() else {
                     return;
                 };
-                let Some(client) = &controller.client else {
+                let Some(client) = controller.active_client() else {
                     return;
                 };
                 match client.set_thinking_level(&requested) {
@@ -2095,6 +2423,7 @@ impl AppController {
         }
         self.refresh_session_sidebar();
         self.scroll_to_bottom();
+        self.update_send_state();
     }
 
     fn message_started(&self, message: &Value) {
@@ -2277,7 +2606,7 @@ impl AppController {
         }
         if tool.name == "todo"
             && !tool.is_error
-            && let Some(client) = &self.client
+            && let Some(client) = self.active_client()
         {
             let _ = client.refresh_state();
         }
@@ -2360,8 +2689,7 @@ impl AppController {
         });
         for agent in chip_agents {
             let status = title_case(&agent.status);
-            let chip =
-                composer::subagent_chip(&agent.display_name(), &status, agent.is_active());
+            let chip = composer::subagent_chip(&agent.display_name(), &status, agent.is_active());
             let tooltip = match (agent.current_task(), agent.current_activity()) {
                 (Some(task), Some(activity)) => format!("{task}\n{activity}"),
                 (Some(task), None) => task.to_owned(),
@@ -2394,12 +2722,21 @@ impl AppController {
             self.ui.agent_hub.show_placeholder();
         }
         self.update_activity_counts();
+        if total_count == 0
+            && self.ui.content_stack.visible_child_name().as_deref() == Some("agent-hub")
+        {
+            self.close_subagent_view();
+        }
     }
 
     fn open_agent_hub(self: &Rc<Self>) {
         self.refresh_agent_surfaces();
+        if self.agent_hub.borrow().is_empty() {
+            return;
+        }
         self.ui.title.set_text("Agent Hub");
         self.ui.back_button.set_visible(true);
+        self.ui.session_actions_button.set_visible(false);
         self.ui.branch_button.set_visible(false);
         self.ui.handoff_button.set_visible(false);
         self.ui.composer_clamp.set_visible(false);
@@ -2446,7 +2783,7 @@ impl AppController {
     }
 
     fn request_subagent_transcript(&self) {
-        let Some(client) = &self.client else {
+        let Some(client) = self.active_client() else {
             self.ui
                 .subagent_conversation
                 .append_notice("omp is not connected", true);
@@ -2482,12 +2819,16 @@ impl AppController {
         response_id: Option<&str>,
         transcript_response: SubagentMessages,
     ) {
-        let expected_session = self
-            .active_subagent
-            .borrow()
+        let expected_session = self.active_subagent.borrow().as_deref().and_then(|id| {
+            self.agent_hub
+                .borrow()
+                .get(id)
+                .and_then(|agent| agent.session_file.clone())
+        });
+        if expected_session
             .as_deref()
-            .and_then(|id| self.agent_hub.borrow().get(id).and_then(|agent| agent.session_file.clone()));
-        if expected_session.as_deref().is_some_and(|session| session != transcript_response.session_file) {
+            .is_some_and(|session| session != transcript_response.session_file)
+        {
             return;
         }
 
@@ -2533,17 +2874,6 @@ impl AppController {
         if request_again {
             self.request_subagent_transcript();
         }
-    }
-
-    fn close_subagent_view(&self) {
-        self.active_subagent.borrow_mut().take();
-        self.ui.content_stack.set_visible_child_name("chat");
-        self.ui.back_button.set_visible(false);
-        self.ui.branch_button.set_visible(true);
-        self.ui.handoff_button.set_visible(true);
-        self.ui.composer_clamp.set_visible(true);
-        self.ui.title.set_text(&self.current_session_title.borrow());
-        self.update_send_state();
     }
 
     fn subagent_transcript_failed(&self, response_id: Option<&str>, error: &str) {
@@ -2616,6 +2946,7 @@ impl AppController {
         self.ui.back_button.set_visible(false);
         self.ui.composer_clamp.set_visible(true);
         self.ui.title.set_text(&self.current_session_title.borrow());
+        self.update_send_state();
     }
 
     fn clear_subagents(&self) {
@@ -2634,6 +2965,7 @@ impl AppController {
             self.ui.back_button.set_visible(false);
             self.ui.composer_clamp.set_visible(true);
         }
+        self.update_send_state();
         self.update_activity_counts();
     }
 
@@ -2642,16 +2974,18 @@ impl AppController {
             let hub = self.agent_hub.borrow();
             (hub.active_count(), hub.len())
         };
+        self.ui.set_agent_hub_activity(active_agents, total_agents);
         self.ui
             .composer
             .set_subagent_count(&format!("{active_agents} active · {total_agents} total"));
         self.ui.agent_hub.set_counts(active_agents, total_agents);
-        self.ui.agent_hub_button.update_property(&[
-            gtk::accessible::Property::Label(&format!(
-                "Open runtime agent hub, {active_agents} active agents, {total_agents} total"
-            )),
-        ]);
-        let active_items = active_agents + usize::from(self.running.get());
+        let running_sessions = self
+            .runtimes
+            .borrow()
+            .values()
+            .filter(|runtime| runtime.running)
+            .count();
+        let active_items = active_agents + running_sessions;
         self.ui.sidebar_activity_count.set_visible(active_items > 0);
         self.ui
             .sidebar_activity_count
@@ -2676,7 +3010,7 @@ impl AppController {
         if !self.running.get() {
             return;
         }
-        if let Some(client) = &self.client {
+        if let Some(client) = self.active_client() {
             match client.abort() {
                 Ok(()) => self.ui.chat_status.activity("Stopping"),
                 Err(error) => self.show_error(&error.to_string()),
@@ -2684,32 +3018,33 @@ impl AppController {
         }
     }
 
-    fn start_new_session(&self) {
+    fn start_new_session(self: &Rc<Self>) {
         if self.branch_busy.get() || self.handoff_busy.get() {
             return;
         }
-        let Some(client) = &self.client else {
-            return;
-        };
-        match client.new_session() {
-            Ok(()) => {
+        match self.spawn_runtime(None) {
+            Ok(runtime_id) => {
                 self.goal_completed_this_run.set(false);
                 self.goal_completion_calls.borrow_mut().clear();
-                self.ui.chat_status.activity("Starting conversation");
-                self.clear_messages();
-                self.clear_subagents();
                 self.current_session_file.borrow_mut().take();
-                self.set_session_title("New conversation");
-                self.set_window_status(WindowStatus::Working);
+                let mut entry = session_catalog::session_entry(None, "New conversation", true);
+                entry.runtime_id = Some(runtime_id);
+                self.active_sessions.borrow_mut().insert(0, entry.clone());
+                self.activate_runtime(runtime_id, &entry);
+                self.ui.chat_status.activity("Starting conversation");
                 self.ui
                     .conversation
                     .append_notice("Starting a new conversation…", false);
             }
-            Err(error) => self.show_error(&error.to_string()),
+            Err(error) => self.show_error(&format!("Could not start omp: {error}")),
         }
     }
 
     fn submit_current(&self) {
+        self.submit_current_with_intent(SubmissionIntent::Default);
+    }
+
+    fn submit_current_with_intent(&self, intent: SubmissionIntent) {
         if self.branch_busy.get()
             || self.handoff_busy.get()
             || !self.ready.get()
@@ -2719,7 +3054,7 @@ impl AppController {
         }
         let draft_text = self.ui.composer.text();
         let message = draft_text.trim().to_owned();
-        let Some(client) = &self.client else {
+        let Some(client) = self.active_client() else {
             return;
         };
         if let Some(error) = unsupported_native_mode_error(&message) {
@@ -2731,7 +3066,7 @@ impl AppController {
             if message.is_empty() && attachments.is_empty() {
                 return;
             }
-            let action = SubmissionAction::select(self.running.get(), self.running_turn_action.get());
+            let action = SubmissionAction::select(self.running.get(), intent);
             match action {
                 SubmissionAction::Prompt => client.prompt(&message, attachments.images()),
                 SubmissionAction::Steer => client.steer(&message, attachments.images()),
@@ -2760,82 +3095,30 @@ impl AppController {
         }
     }
 
-    fn request_steering_mode(&self, mode: QueueMode) {
-        if self.reconciling_queue_state.get() || mode == self.steering_mode.get() {
-            return;
-        }
-        let result = self
-            .client
-            .as_ref()
-            .ok_or_else(|| "omp is disconnected".to_owned())
-            .and_then(|client| client.set_steering_mode(mode).map_err(|error| error.to_string()));
-        if let Err(error) = result {
-            self.render_authoritative_queue_state();
-            self.show_error(&error);
-        }
-    }
-
-    fn request_follow_up_mode(&self, mode: QueueMode) {
-        if self.reconciling_queue_state.get() || mode == self.follow_up_mode.get() {
-            return;
-        }
-        let result = self
-            .client
-            .as_ref()
-            .ok_or_else(|| "omp is disconnected".to_owned())
-            .and_then(|client| client.set_follow_up_mode(mode).map_err(|error| error.to_string()));
-        if let Err(error) = result {
-            self.render_authoritative_queue_state();
-            self.show_error(&error);
-        }
-    }
-
-    fn request_interrupt_mode(&self, mode: InterruptMode) {
-        if self.reconciling_queue_state.get() || mode == self.interrupt_mode.get() {
-            return;
-        }
-        let result = self
-            .client
-            .as_ref()
-            .ok_or_else(|| "omp is disconnected".to_owned())
-            .and_then(|client| client.set_interrupt_mode(mode).map_err(|error| error.to_string()));
-        if let Err(error) = result {
-            self.render_authoritative_queue_state();
-            self.show_error(&error);
-        }
-    }
-
     fn render_authoritative_queue_state(&self) {
-        self.reconciling_queue_state.set(true);
-        self.ui.composer.set_queue_state(
-            self.steering_mode.get(),
-            self.follow_up_mode.get(),
-            self.interrupt_mode.get(),
-            self.queued_message_count.get(),
-        );
-        self.reconciling_queue_state.set(false);
+        self.ui
+            .composer
+            .set_queued_message_count(self.queued_message_count.get());
+    }
 
     fn session_actions_available(&self) -> bool {
-        self.ready.get()
-            && !self.running.get()
-            && !self.branch_busy.get()
-            && !self.handoff_busy.get()
-            && self.active_subagent.borrow().is_none()
+        session_actions_are_relevant(
+            self.ready.get(),
+            self.current_session_file.borrow().is_some(),
+            !self.ui.conversation.is_empty(),
+            self.running.get(),
+            self.branch_busy.get() || self.handoff_busy.get(),
+            self.active_subagent.borrow().is_some(),
+            self.ui.content_stack.visible_child_name().as_deref() == Some("chat"),
+        )
     }
 
     fn update_send_state(&self) {
         let ready = self.ready.get();
         let running = self.running.get();
         let session_busy = self.branch_busy.get() || self.handoff_busy.get();
-        self.ui.composer.set_running_turn_action(matches!(
-            self.running_turn_action.get(),
-            RunningTurnAction::Steer
-        ));
-        let primary_ready =
-            ready && !session_busy && self.pending_submissions.borrow().is_empty();
-        self.ui
-            .composer
-            .set_primary_action(primary_ready, running);
+        let primary_ready = ready && !session_busy && self.pending_submissions.borrow().is_empty();
+        self.ui.composer.set_primary_action(primary_ready, running);
         self.ui
             .composer
             .set_attachment_sensitive(ready && !session_busy);
@@ -2848,11 +3131,12 @@ impl AppController {
             .set_sensitive(ready && !running && !session_busy);
         let session_actions_available = self.session_actions_available();
         self.ui
-            .branch_button
-            .set_sensitive(session_actions_available);
+            .session_actions_button
+            .set_visible(session_actions_available);
+        self.ui.branch_button.set_visible(session_actions_available);
         self.ui
             .handoff_button
-            .set_sensitive(session_actions_available);
+            .set_visible(session_actions_available);
     }
 
     fn update_completions(&self) {
@@ -2884,7 +3168,7 @@ impl AppController {
         self.ui.composer.select_completion(index as i32);
     }
 
-    fn accept_completion(&self, submit_if_complete: bool) {
+    fn accept_completion(&self, submission: Option<SubmissionIntent>) {
         let Some(completion) = self
             .completion_items
             .borrow()
@@ -2895,9 +3179,11 @@ impl AppController {
         };
         self.ui.composer.set_text(&completion.replacement);
         self.ui.composer.focus();
-        if submit_if_complete && !completion.replacement.ends_with(' ') {
+        if let Some(intent) = submission
+            && !completion.replacement.ends_with(' ')
+        {
             self.hide_completions();
-            self.submit_current();
+            self.submit_current_with_intent(intent);
         }
     }
 
@@ -2982,13 +3268,33 @@ impl AppController {
         );
     }
 
-    fn present_alert_preferences(self: &Rc<Self>) {
+    fn present_settings(self: &Rc<Self>) {
         let preferences = self.alerts.preferences();
-        let settings = sound_settings::SoundSettingsDialog::new(
+        let settings = sound_settings::SettingsDialog::new(
             &preferences,
             &self.sound_pack_choices(),
             self.alerts.installed_pack_count(),
         );
+        let weak = Rc::downgrade(self);
+        settings.connect_steering_mode_changed(move |mode| {
+            if let Some(controller) = weak.upgrade() {
+                controller.set_global_steering_mode(mode);
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        settings.connect_follow_up_mode_changed(move |mode| {
+            if let Some(controller) = weak.upgrade() {
+                controller.set_global_follow_up_mode(mode);
+            }
+        });
+
+        let weak = Rc::downgrade(self);
+        settings.connect_interrupt_mode_changed(move |mode| {
+            if let Some(controller) = weak.upgrade() {
+                controller.set_global_interrupt_mode(mode);
+            }
+        });
 
         let weak = Rc::downgrade(self);
         settings
@@ -3055,7 +3361,7 @@ impl AppController {
             .collect()
     }
 
-    fn present_sound_pack_browser(self: &Rc<Self>, settings: &sound_settings::SoundSettingsDialog) {
+    fn present_sound_pack_browser(self: &Rc<Self>, settings: &sound_settings::SettingsDialog) {
         let browser = sound_settings::PackBrowserDialog::new();
         let weak = Rc::downgrade(self);
         let browser_for_retry = browser.clone();
@@ -3074,7 +3380,7 @@ impl AppController {
 
     fn load_sound_pack_registry(
         self: &Rc<Self>,
-        settings: sound_settings::SoundSettingsDialog,
+        settings: sound_settings::SettingsDialog,
         browser: sound_settings::PackBrowserDialog,
     ) {
         browser.show_loading();
@@ -3119,7 +3425,7 @@ impl AppController {
         self: &Rc<Self>,
         pack: RegistryPack,
         button: gtk::Button,
-        settings: sound_settings::SoundSettingsDialog,
+        settings: sound_settings::SettingsDialog,
         browser: sound_settings::PackBrowserDialog,
     ) {
         sound_settings::PackBrowserDialog::set_installing(&button);
@@ -3380,9 +3686,7 @@ impl AppController {
             } else {
                 json!({ "type": "extension_ui_response", "id": id, "cancelled": true })
             };
-            if let Some(client) = &controller.client {
-                let _ = client.respond_to_extension(payload);
-            }
+            if let Some(client) = controller.active_client() { let _ = client.respond_to_extension(payload); }
         });
         dialog.present(Some(&self.ui.window));
     }
@@ -3440,7 +3744,6 @@ fn title_case(value: &str) -> String {
     }
 }
 
-
 fn compact_path(path: &Path) -> String {
     let mut text = path.to_string_lossy().into_owned();
     if let Some(home) = std::env::var_os("HOME") {
@@ -3480,64 +3783,103 @@ async fn encode_image_in_background(
         Ok((image, bytes))
     })
     .await
-}
-
-fn enter_inserts_newline(modifiers: gdk::ModifierType) -> bool {
-    modifiers.intersects(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK)
+    .map_err(|_| "Image encoding task panicked".to_owned())?
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        RunningTurnAction, SubmissionAction, enter_inserts_newline, gdk,
-        reconcile_composer_state,
+        ComposerKeyAction, DeliveryModes, SubmissionAction, SubmissionIntent, composer_key_action,
+        delivery_preference_updates, gdk, session_actions_are_relevant,
+        should_send_delivery_preference_updates,
     };
+    use crate::alerts::Preferences;
     use crate::bridge::protocol::{InterruptMode, QueueMode, SessionState};
     use serde_json::json;
 
     #[test]
-    fn ctrl_or_shift_enter_inserts_newline_while_plain_enter_submits() {
-        assert!(enter_inserts_newline(gdk::ModifierType::CONTROL_MASK));
-        assert!(enter_inserts_newline(gdk::ModifierType::SHIFT_MASK));
-        assert!(!enter_inserts_newline(gdk::ModifierType::empty()));
+    fn composer_shortcuts_choose_delivery_without_persistent_view_state() {
+        assert_eq!(
+            composer_key_action(gdk::Key::Return, gdk::ModifierType::empty()),
+            Some(ComposerKeyAction::Submit)
+        );
+        assert_eq!(
+            composer_key_action(gdk::Key::Return, gdk::ModifierType::CONTROL_MASK),
+            Some(ComposerKeyAction::FollowUp)
+        );
+        assert_eq!(
+            composer_key_action(gdk::Key::q, gdk::ModifierType::CONTROL_MASK),
+            Some(ComposerKeyAction::FollowUp)
+        );
+        assert_eq!(
+            composer_key_action(gdk::Key::Return, gdk::ModifierType::SHIFT_MASK),
+            Some(ComposerKeyAction::Newline)
+        );
+        assert_eq!(
+            composer_key_action(gdk::Key::Return, gdk::ModifierType::ALT_MASK),
+            Some(ComposerKeyAction::Newline)
+        );
     }
 
     #[test]
-    fn submission_action_never_maps_running_text_to_abort() {
+    fn submission_intent_maps_idle_text_to_prompt_and_running_text_to_delivery() {
         assert_eq!(
-            SubmissionAction::select(false, RunningTurnAction::FollowUp),
+            SubmissionAction::select(false, SubmissionIntent::FollowUp),
             SubmissionAction::Prompt
         );
         assert_eq!(
-            SubmissionAction::select(true, RunningTurnAction::Steer),
+            SubmissionAction::select(true, SubmissionIntent::Default),
             SubmissionAction::Steer
         );
         assert_eq!(
-            SubmissionAction::select(true, RunningTurnAction::FollowUp),
+            SubmissionAction::select(true, SubmissionIntent::FollowUp),
             SubmissionAction::FollowUp
         );
     }
 
     #[test]
-    fn state_refresh_reconciles_queue_settings_without_resetting_running_action() {
+    fn session_actions_require_an_idle_persisted_conversation_with_messages() {
+        assert!(session_actions_are_relevant(
+            true, true, true, false, false, false, true,
+        ));
+        assert!(!session_actions_are_relevant(
+            true, true, false, false, false, false, true,
+        ));
+        assert!(!session_actions_are_relevant(
+            true, true, true, true, false, false, true,
+        ));
+        assert!(!session_actions_are_relevant(
+            true, true, true, false, false, true, false,
+        ));
+    }
+
+    #[test]
+    fn global_delivery_preferences_override_different_session_values_only() {
+        let preferences: Preferences = serde_json::from_value(json!({
+            "steering_mode": "all",
+            "follow_up_mode": "one-at-a-time",
+            "interrupt_mode": "wait"
+        }))
+        .expect("deserialize global delivery preferences");
         let state: SessionState = serde_json::from_value(json!({
-            "isStreaming": true,
-            "steeringMode": "all",
+            "steeringMode": "one-at-a-time",
             "followUpMode": "one-at-a-time",
-            "interruptMode": "wait",
-            "queuedMessageCount": 3
+            "interruptMode": "immediate"
         }))
         .expect("deserialize session state");
 
-        let reconciled = reconcile_composer_state(RunningTurnAction::FollowUp, &state);
-
-        assert_eq!(
-            reconciled.running_turn_action,
-            RunningTurnAction::FollowUp
-        );
-        assert_eq!(reconciled.steering_mode, QueueMode::All);
-        assert_eq!(reconciled.follow_up_mode, QueueMode::OneAtATime);
-        assert_eq!(reconciled.interrupt_mode, InterruptMode::Wait);
-        assert_eq!(reconciled.queued_message_count, 3);
+        let updates = delivery_preference_updates(&preferences, &state);
+        assert_eq!(updates.steering_mode, Some(QueueMode::All));
+        assert_eq!(updates.follow_up_mode, None);
+        assert_eq!(updates.interrupt_mode, Some(InterruptMode::Wait));
+        let desired = DeliveryModes::from(&preferences);
+        assert!(should_send_delivery_preference_updates(
+            None, desired, updates
+        ));
+        assert!(!should_send_delivery_preference_updates(
+            Some(desired),
+            desired,
+            updates,
+        ));
     }
 }

@@ -135,7 +135,7 @@ pub fn session_row(entry: SessionEntry) -> SessionRow {
     content.set_margin_bottom(8);
     content.set_margin_start(9);
     content.set_margin_end(4);
-    let indicator = session_indicator(&row, entry.current);
+    let indicator = session_indicator(&row, entry.current, entry.running);
     let text = gtk::Box::new(gtk::Orientation::Vertical, 3);
     text.set_hexpand(true);
     let title = gtk::Label::new(Some(&entry.title));
@@ -230,7 +230,7 @@ pub fn session_row(entry: SessionEntry) -> SessionRow {
     }
 }
 
-fn session_indicator(row: &gtk::ListBoxRow, current: bool) -> gtk::DrawingArea {
+fn session_indicator(row: &gtk::ListBoxRow, current: bool, running: bool) -> gtk::DrawingArea {
     const CYCLE_SECONDS: f64 = 2.4;
     const PINK: (f64, f64, f64) = (
         0xed as f64 / 255.0,
@@ -248,7 +248,11 @@ fn session_indicator(row: &gtk::ListBoxRow, current: bool) -> gtk::DrawingArea {
         0xa5 as f64 / 255.0,
         0xe3 as f64 / 255.0,
     );
-
+    const IDLE: (f64, f64, f64) = (
+        0x3a as f64 / 255.0,
+        0x40 as f64 / 255.0,
+        0x4d as f64 / 255.0,
+    );
     let indicator = gtk::DrawingArea::new();
     indicator.set_content_width(3);
     indicator.add_css_class("session-indicator");
@@ -266,9 +270,7 @@ fn session_indicator(row: &gtk::ListBoxRow, current: bool) -> gtk::DrawingArea {
         context.move_to(width / 2.0, stroke_width / 2.0);
         context.line_to(width / 2.0, height - stroke_width / 2.0);
 
-        if current || row.upgrade().is_some_and(|row| row.is_selected()) {
-            context.set_source_rgb(BLUE.0, BLUE.1, BLUE.2);
-        } else {
+        if running {
             let phase = (started.elapsed().as_secs_f64() / CYCLE_SECONDS) % 1.0;
             let start = -phase * height;
             let gradient = gtk::cairo::LinearGradient::new(0.0, start, 0.0, start + height);
@@ -278,11 +280,15 @@ fn session_indicator(row: &gtk::ListBoxRow, current: bool) -> gtk::DrawingArea {
             gradient.add_color_stop_rgb(1.0, PINK.0, PINK.1, PINK.2);
             gradient.set_extend(gtk::cairo::Extend::Repeat);
             let _ = context.set_source(&gradient);
+        } else if current || row.upgrade().is_some_and(|row| row.is_selected()) {
+            context.set_source_rgb(BLUE.0, BLUE.1, BLUE.2);
+        } else {
+            context.set_source_rgb(IDLE.0, IDLE.1, IDLE.2);
         }
         let _ = context.stroke();
     });
 
-    if !current {
+    if running {
         let indicator_weak = indicator.downgrade();
         glib::timeout_add_local(Duration::from_millis(33), move || {
             let Some(indicator) = indicator_weak.upgrade() else {

@@ -54,12 +54,6 @@ impl ComposerAttachments {
         }
     }
 
-    pub(crate) fn summaries(&self) -> impl Iterator<Item = (AttachmentId, &str)> {
-        self.metadata
-            .iter()
-            .map(|item| (item.id, item.name.as_str()))
-    }
-
     pub(crate) fn ids(&self) -> impl Iterator<Item = AttachmentId> + '_ {
         self.metadata.iter().map(|item| item.id)
     }
@@ -101,10 +95,7 @@ mod tests {
         let last = attachments.add("last.png", image("last"));
 
         assert!(attachments.remove(middle));
-        assert_eq!(
-            attachments.ids().collect::<Vec<_>>(),
-            vec![first, last]
-        );
+        assert_eq!(attachments.ids().collect::<Vec<_>>(), vec![first, last]);
         assert_eq!(
             attachments
                 .images()

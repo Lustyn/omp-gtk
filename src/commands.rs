@@ -200,15 +200,7 @@ mod tests {
             subcommands: Vec::new(),
         });
 
-        for input in [
-            "/v",
-            "/go",
-            "/goal ",
-            "/goal sh",
-            "/guided",
-            "/l",
-            "/other",
-        ] {
+        for input in ["/v", "/go", "/goal ", "/goal sh", "/guided", "/l", "/other"] {
             assert!(completions(input, &commands).is_empty(), "{input}");
         }
     }

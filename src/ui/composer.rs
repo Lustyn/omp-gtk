@@ -4,7 +4,6 @@ use std::rc::Rc;
 
 use gtk::prelude::*;
 use gtk4 as gtk;
-use crate::bridge::protocol::{InterruptMode, QueueMode};
 
 use super::icons;
 
@@ -18,14 +17,7 @@ pub(crate) struct ComposerView {
     attachment_previews: Rc<RefCell<HashMap<u64, gtk::Box>>>,
     send: gtk::Button,
     stop: gtk::Button,
-    running_actions: gtk::Box,
-    steer: gtk::ToggleButton,
-    follow_up: gtk::ToggleButton,
     queue_count: gtk::Label,
-    queue_settings: gtk::MenuButton,
-    steering_mode: gtk::DropDown,
-    follow_up_mode: gtk::DropDown,
-    interrupt_mode: gtk::DropDown,
     model_button: gtk::Button,
     model_label: gtk::Label,
     model_icon: icons::ProviderIcon,
@@ -107,7 +99,6 @@ pub(crate) fn build() -> ComposerView {
     attachment_strip.add_css_class("attachment-strip");
     let attachment_previews = Rc::new(RefCell::new(HashMap::new()));
 
-
     let controls = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     controls.set_margin_top(2);
     controls.set_margin_bottom(8);
@@ -118,7 +109,6 @@ pub(crate) fn build() -> ComposerView {
     attach.set_sensitive(false);
     attach.add_css_class("composer-affordance");
     attach.add_css_class("attachment-button");
-
 
     let model_icon = icons::provider_icon("", 15);
     model_icon.root.add_css_class("provider-icon");
@@ -187,56 +177,10 @@ pub(crate) fn build() -> ComposerView {
     extension_status.set_visible(false);
     extension_status.add_css_class("extension-status");
 
-    let running_actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    running_actions.add_css_class("linked");
-    running_actions.set_visible(false);
-    let steer = gtk::ToggleButton::with_label("Steer");
-    steer.set_active(true);
-    steer.set_tooltip_text(Some("Deliver during the active turn"));
-    steer.update_property(&[gtk::accessible::Property::Label("Steer active turn")]);
-    let follow_up = gtk::ToggleButton::with_label("Follow up");
-    follow_up.set_group(Some(&steer));
-    follow_up.set_tooltip_text(Some("Queue until the active turn finishes"));
-    follow_up.update_property(&[gtk::accessible::Property::Label(
-        "Follow up after active turn",
-    )]);
-    steer.add_css_class("composer-affordance");
-    follow_up.add_css_class("composer-affordance");
-    running_actions.append(&steer);
-    running_actions.append(&follow_up);
-
     let queue_count = gtk::Label::new(None);
     queue_count.set_visible(false);
     queue_count.add_css_class("queue-count");
     queue_count.update_property(&[gtk::accessible::Property::Label("Queued messages")]);
-
-    let steering_mode = queue_mode_dropdown("Steering delivery");
-    let follow_up_mode = queue_mode_dropdown("Follow-up delivery");
-    let interrupt_mode = gtk::DropDown::from_strings(&["Immediate", "Wait for turn"]);
-    interrupt_mode.update_property(&[gtk::accessible::Property::Label(
-        "Steering interrupt timing",
-    )]);
-    let settings_content = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    settings_content.set_margin_top(12);
-    settings_content.set_margin_bottom(12);
-    settings_content.set_margin_start(12);
-    settings_content.set_margin_end(12);
-    append_setting_row(&settings_content, "Steering messages", &steering_mode);
-    append_setting_row(&settings_content, "Follow-up messages", &follow_up_mode);
-    append_setting_row(&settings_content, "Interrupt tools", &interrupt_mode);
-    let settings_popover = gtk::Popover::builder()
-        .has_arrow(false)
-        .position(gtk::PositionType::Top)
-        .child(&settings_content)
-        .build();
-    let queue_settings = gtk::MenuButton::new();
-    queue_settings.set_label("Queue settings");
-    queue_settings.set_popover(Some(&settings_popover));
-    queue_settings.set_tooltip_text(Some("Configure queued message delivery"));
-    queue_settings.add_css_class("composer-affordance");
-    queue_settings.update_property(&[gtk::accessible::Property::Label(
-        "Queue settings",
-    )]);
 
     let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     spacer.set_hexpand(true);
@@ -255,14 +199,12 @@ pub(crate) fn build() -> ComposerView {
     let extension_below = gtk::Box::new(gtk::Orientation::Vertical, 4);
     extension_below.set_visible(false);
     extension_below.add_css_class("extension-widgets");
-    controls.append(&attach);
     controls.append(&model_button);
     controls.append(&thinking_button);
     controls.append(&extension_status);
-    controls.append(&running_actions);
     controls.append(&queue_count);
-    controls.append(&queue_settings);
     controls.append(&spacer);
+    controls.append(&attach);
     controls.append(&stop);
     controls.append(&send);
     composer.append(&subagent_bar);
@@ -311,14 +253,7 @@ pub(crate) fn build() -> ComposerView {
         attachment_previews,
         send,
         stop,
-        running_actions,
-        steer,
-        follow_up,
         queue_count,
-        queue_settings,
-        steering_mode,
-        follow_up_mode,
-        interrupt_mode,
         model_button,
         model_label,
         model_icon,
@@ -358,53 +293,6 @@ impl ComposerView {
         self.stop.connect_clicked(move |_| callback());
     }
 
-    pub(crate) fn connect_steer_selected(&self, callback: impl Fn() + 'static) {
-        self.steer.connect_toggled(move |button| {
-            if button.is_active() {
-                callback();
-            }
-        });
-    }
-
-    pub(crate) fn connect_follow_up_selected(&self, callback: impl Fn() + 'static) {
-        self.follow_up.connect_toggled(move |button| {
-            if button.is_active() {
-                callback();
-            }
-        });
-    }
-
-    pub(crate) fn connect_steering_mode_changed(
-        &self,
-        callback: impl Fn(QueueMode) + 'static,
-    ) {
-        self.steering_mode.connect_selected_notify(move |dropdown| {
-            callback(queue_mode_from_selected(dropdown.selected()));
-        });
-    }
-
-    pub(crate) fn connect_follow_up_mode_changed(
-        &self,
-        callback: impl Fn(QueueMode) + 'static,
-    ) {
-        self.follow_up_mode.connect_selected_notify(move |dropdown| {
-            callback(queue_mode_from_selected(dropdown.selected()));
-        });
-    }
-
-    pub(crate) fn connect_interrupt_mode_changed(
-        &self,
-        callback: impl Fn(InterruptMode) + 'static,
-    ) {
-        self.interrupt_mode.connect_selected_notify(move |dropdown| {
-            callback(match dropdown.selected() {
-                1 => InterruptMode::Wait,
-                _ => InterruptMode::Immediate,
-            });
-        });
-    }
-
-
     pub(crate) fn connect_attach_clicked(&self, callback: impl Fn() + 'static) {
         self.attach.connect_clicked(move |_| callback());
     }
@@ -442,34 +330,15 @@ impl ComposerView {
     }
 
     pub(crate) fn set_primary_action(&self, ready: bool, running: bool) {
-        self.running_actions.set_visible(running);
         self.stop.set_visible(running);
         self.stop.set_sensitive(ready && running);
-        self.queue_settings.set_sensitive(ready);
-        icons::set_button_icon(&self.send, icons::Icon::SendHorizontal);
-        let action = if running {
-            if self.steer.is_active() {
-                "Steer active turn · Enter"
-            } else {
-                "Queue follow-up · Enter"
-            }
-        } else {
-            "Send · Enter"
-        };
-        self.send.set_tooltip_text(Some(action));
+        self.send.set_visible(!running);
+        self.send.set_tooltip_text(Some("Send · Enter"));
         self.send
-            .update_property(&[gtk::accessible::Property::Label(action)]);
+            .update_property(&[gtk::accessible::Property::Label("Send · Enter")]);
         self.send.set_sensitive(
-            ready && (!self.text().trim().is_empty() || self.has_attachments()),
+            ready && !running && (!self.text().trim().is_empty() || self.has_attachments()),
         );
-    }
-
-    pub(crate) fn set_running_turn_action(&self, steer_selected: bool) {
-        if steer_selected {
-            self.steer.set_active(true);
-        } else {
-            self.follow_up.set_active(true);
-        }
     }
 
     pub(crate) fn set_submission_pending(&self, pending: bool) {
@@ -478,24 +347,12 @@ impl ComposerView {
         }
     }
 
-    pub(crate) fn set_queue_state(
-        &self,
-        steering: QueueMode,
-        follow_up: QueueMode,
-        interrupt: InterruptMode,
-        queued: usize,
-    ) {
-        self.steering_mode.set_selected(queue_mode_selected(steering));
-        self.follow_up_mode
-            .set_selected(queue_mode_selected(follow_up));
-        self.interrupt_mode.set_selected(match interrupt {
-            InterruptMode::Immediate => 0,
-            InterruptMode::Wait => 1,
-        });
+    pub(crate) fn set_queued_message_count(&self, queued: usize) {
         self.queue_count.set_text(&format!("{queued} queued"));
         self.queue_count.set_visible(queued > 0);
-        self.queue_count
-            .set_tooltip_text(Some(&format!("{queued} queued messages")));
+        self.queue_count.set_tooltip_text(Some(&format!(
+            "{queued} queued messages · Ctrl+Enter or Ctrl+Q queues a follow-up"
+        )));
     }
 
     pub(crate) fn set_attachment_sensitive(&self, sensitive: bool) {
@@ -517,9 +374,7 @@ impl ComposerView {
         ))]);
 
         let remove = icons::icon_button(icons::Icon::X, &format!("Remove {name}"));
-        remove.update_property(&[gtk::accessible::Property::Label(&format!(
-            "Remove {name}"
-        ))]);
+        remove.update_property(&[gtk::accessible::Property::Label(&format!("Remove {name}"))]);
         remove.set_halign(gtk::Align::End);
         remove.set_valign(gtk::Align::Start);
         remove.add_css_class("attachment-remove");
@@ -693,36 +548,6 @@ impl ComposerView {
     }
 }
 
-fn queue_mode_dropdown(accessible_label: &str) -> gtk::DropDown {
-    let dropdown = gtk::DropDown::from_strings(&["One at a time", "All at once"]);
-    dropdown.update_property(&[gtk::accessible::Property::Label(accessible_label)]);
-    dropdown
-}
-
-fn append_setting_row(container: &gtk::Box, title: &str, dropdown: &gtk::DropDown) {
-    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    let label = gtk::Label::new(Some(title));
-    label.set_xalign(0.0);
-    label.set_hexpand(true);
-    row.append(&label);
-    row.append(dropdown);
-    container.append(&row);
-}
-
-fn queue_mode_selected(mode: QueueMode) -> u32 {
-    match mode {
-        QueueMode::OneAtATime => 0,
-        QueueMode::All => 1,
-    }
-}
-
-fn queue_mode_from_selected(selected: u32) -> QueueMode {
-    match selected {
-        1 => QueueMode::All,
-        _ => QueueMode::OneAtATime,
-    }
-}
-
 pub fn thinking_option(level: &str) -> gtk::Button {
     let title_text = thinking_title(level);
     let detail_text = thinking_description(level);
@@ -755,7 +580,8 @@ fn thinking_title(level: &str) -> String {
         "low" => "Light".to_owned(),
         "medium" => "Balanced".to_owned(),
         "high" => "Deep".to_owned(),
-        "xhigh" | "max" => "Maximum".to_owned(),
+        "xhigh" => "Extended".to_owned(),
+        "max" => "Maximum".to_owned(),
         _ => {
             let normalized = level.replace(['-', '_'], " ");
             let normalized = normalized.trim();
@@ -775,7 +601,8 @@ fn thinking_description(level: &str) -> &'static str {
         "low" => "Quick reasoning for routine work",
         "medium" => "Balanced for most tasks",
         "high" => "Deeper reasoning for complex work",
-        "xhigh" | "max" => "Most thorough; may take longer",
+        "xhigh" => "Extended reasoning for demanding work",
+        "max" => "Maximum reasoning the model supports",
         _ => "Uses this model's recommended reasoning depth",
     }
 }
@@ -808,4 +635,23 @@ pub fn subagent_chip(name: &str, status: &str, active: bool) -> gtk::Button {
     button.set_child(Some(&content));
     button.set_tooltip_text(Some("Open subagent transcript"));
     button
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{thinking_description, thinking_title};
+
+    #[test]
+    fn distinguishes_top_reasoning_effort_tiers() {
+        assert_eq!(thinking_title("xhigh"), "Extended");
+        assert_eq!(
+            thinking_description("xhigh"),
+            "Extended reasoning for demanding work"
+        );
+        assert_eq!(thinking_title("max"), "Maximum");
+        assert_eq!(
+            thinking_description("max"),
+            "Maximum reasoning the model supports"
+        );
+    }
 }

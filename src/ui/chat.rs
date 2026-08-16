@@ -238,6 +238,7 @@ impl TelemetryWidgets {
         cwd.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
         let cwd_button = gtk::Button::builder().child(&cwd_box).build();
         cwd_button.set_hexpand(true);
+        cwd_button.set_halign(gtk::Align::Start);
         cwd_button.update_property(&[gtk::accessible::Property::Label("Change workspace")]);
         cwd_button.set_tooltip_text(Some("Change workspace"));
         cwd_button.add_css_class("flat");

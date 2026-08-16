@@ -5,6 +5,7 @@ use std::io::Cursor;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::bridge::protocol::{InterruptMode, QueueMode};
 use adw::prelude::*;
 use gtk::{gio, glib};
 use gtk4 as gtk;
@@ -101,7 +102,7 @@ impl SoundEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct AlertPreferences {
+pub(crate) struct Preferences {
     #[serde(default = "enabled")]
     pub desktop_notifications: bool,
     #[serde(default = "enabled")]
@@ -110,9 +111,15 @@ pub(crate) struct AlertPreferences {
     pub volume: f64,
     #[serde(default)]
     pub event_packs: HashMap<String, String>,
+    #[serde(default)]
+    pub steering_mode: QueueMode,
+    #[serde(default)]
+    pub follow_up_mode: QueueMode,
+    #[serde(default)]
+    pub interrupt_mode: InterruptMode,
 }
 
-impl Default for AlertPreferences {
+impl Default for Preferences {
     fn default() -> Self {
         Self {
             desktop_notifications: true,
@@ -122,11 +129,14 @@ impl Default for AlertPreferences {
                 SoundEvent::TaskComplete.key().to_owned(),
                 BUILTIN_PACK_ID.to_owned(),
             )]),
+            steering_mode: QueueMode::default(),
+            follow_up_mode: QueueMode::default(),
+            interrupt_mode: InterruptMode::default(),
         }
     }
 }
 
-impl AlertPreferences {
+impl Preferences {
     pub fn pack_for(&self, event: SoundEvent) -> Option<&str> {
         self.event_packs.get(event.key()).map(String::as_str)
     }
@@ -219,7 +229,7 @@ impl SoundPack {
 
 pub(crate) struct Alerts {
     application: adw::Application,
-    preferences: RefCell<AlertPreferences>,
+    preferences: RefCell<Preferences>,
     packs: RefCell<Vec<SoundPack>>,
     next_sounds: RefCell<HashMap<(String, SoundEvent), usize>>,
     last_events: RefCell<HashMap<SoundEvent, Instant>>,
@@ -240,7 +250,7 @@ impl Alerts {
         }
     }
 
-    pub fn preferences(&self) -> AlertPreferences {
+    pub fn preferences(&self) -> Preferences {
         self.preferences.borrow().clone()
     }
 
@@ -292,6 +302,17 @@ impl Alerts {
     pub fn set_volume(&self, volume: f64) -> Result<(), String> {
         let volume = volume.clamp(0.0, 1.0);
         self.update_preferences(|preferences| preferences.volume = volume)
+    }
+    pub fn set_steering_mode(&self, mode: QueueMode) -> Result<(), String> {
+        self.update_preferences(|preferences| preferences.steering_mode = mode)
+    }
+
+    pub fn set_follow_up_mode(&self, mode: QueueMode) -> Result<(), String> {
+        self.update_preferences(|preferences| preferences.follow_up_mode = mode)
+    }
+
+    pub fn set_interrupt_mode(&self, mode: InterruptMode) -> Result<(), String> {
+        self.update_preferences(|preferences| preferences.interrupt_mode = mode)
     }
 
     pub fn set_event_pack(&self, event: SoundEvent, pack_id: Option<&str>) -> Result<(), String> {
@@ -374,7 +395,7 @@ impl Alerts {
         self.application.withdraw_notification(NOTIFICATION_ID);
     }
 
-    fn update_preferences(&self, update: impl FnOnce(&mut AlertPreferences)) -> Result<(), String> {
+    fn update_preferences(&self, update: impl FnOnce(&mut Preferences)) -> Result<(), String> {
         let mut preferences = self.preferences.borrow().clone();
         update(&mut preferences);
         save_preferences(&preferences)?;
@@ -467,7 +488,7 @@ fn preferences_path() -> PathBuf {
         .join("preferences.json")
 }
 
-fn load_preferences() -> AlertPreferences {
+fn load_preferences() -> Preferences {
     let path = preferences_path();
     match fs::read(&path) {
         Ok(contents) => decode_preferences(&contents).unwrap_or_else(|error| {
@@ -475,26 +496,26 @@ fn load_preferences() -> AlertPreferences {
                 "Could not read alert preferences from {}: {error}",
                 path.display()
             );
-            AlertPreferences::default()
+            Preferences::default()
         }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => AlertPreferences::default(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Preferences::default(),
         Err(error) => {
             eprintln!(
                 "Could not read alert preferences from {}: {error}",
                 path.display()
             );
-            AlertPreferences::default()
+            Preferences::default()
         }
     }
 }
 
-fn decode_preferences(contents: &[u8]) -> Result<AlertPreferences, serde_json::Error> {
+fn decode_preferences(contents: &[u8]) -> Result<Preferences, serde_json::Error> {
     let value = serde_json::from_slice::<Value>(contents)?;
     let legacy_pack = value
         .get("sound_pack")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    let mut preferences = serde_json::from_value::<AlertPreferences>(value)?;
+    let mut preferences = serde_json::from_value::<Preferences>(value)?;
     if preferences.event_packs.is_empty()
         && let Some(pack) = legacy_pack
     {
@@ -506,10 +527,7 @@ fn decode_preferences(contents: &[u8]) -> Result<AlertPreferences, serde_json::E
     Ok(preferences)
 }
 
-fn normalize_preferences(
-    mut preferences: AlertPreferences,
-    packs: &[SoundPack],
-) -> AlertPreferences {
+fn normalize_preferences(mut preferences: Preferences, packs: &[SoundPack]) -> Preferences {
     for pack_id in preferences.event_packs.values_mut() {
         if packs.iter().any(|pack| pack.id == *pack_id) {
             continue;
@@ -525,7 +543,7 @@ fn normalize_preferences(
     preferences
 }
 
-fn save_preferences(preferences: &AlertPreferences) -> Result<(), String> {
+fn save_preferences(preferences: &Preferences) -> Result<(), String> {
     let path = preferences_path();
     let parent = path
         .parent()
@@ -722,6 +740,27 @@ mod tests {
             Some("pack:peon")
         );
         assert_eq!(preferences.pack_for(SoundEvent::SessionStart), None);
+    }
+
+    #[test]
+    fn defaults_and_round_trips_global_delivery_preferences() {
+        let defaults = decode_preferences(br#"{}"#).expect("default preferences decode");
+        assert_eq!(defaults.steering_mode, QueueMode::OneAtATime);
+        assert_eq!(defaults.follow_up_mode, QueueMode::OneAtATime);
+        assert_eq!(defaults.interrupt_mode, InterruptMode::Immediate);
+
+        let configured = decode_preferences(
+            br#"{"steering_mode":"all","follow_up_mode":"all","interrupt_mode":"wait"}"#,
+        )
+        .expect("configured preferences decode");
+        assert_eq!(configured.steering_mode, QueueMode::All);
+        assert_eq!(configured.follow_up_mode, QueueMode::All);
+        assert_eq!(configured.interrupt_mode, InterruptMode::Wait);
+        let encoded = serde_json::to_vec(&configured).expect("encode configured preferences");
+        let decoded = decode_preferences(&encoded).expect("round-trip configured preferences");
+        assert_eq!(decoded.steering_mode, QueueMode::All);
+        assert_eq!(decoded.follow_up_mode, QueueMode::All);
+        assert_eq!(decoded.interrupt_mode, InterruptMode::Wait);
     }
 
     #[test]

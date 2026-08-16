@@ -714,21 +714,49 @@ popover.command-popover > contents {
     background: #292f3a;
 }
 
+.agent-hub-button.active {
+    border-color: #405d4a;
+    background: #1c2821;
+}
+
+.agent-hub-button-badge {
+    padding: 1px 6px;
+    border-radius: 999px;
+    background: #2a303a;
+    color: #aeb6c2;
+    font-size: 10px;
+    font-weight: 700;
+}
+
+.agent-hub-button.active .agent-hub-button-badge {
+    background: #294033;
+    color: #a8d4b4;
+}
+
 .agent-hub {
     background: #0f1217;
 }
 
 .agent-hub-summary {
-    min-height: 50px;
+    min-height: 56px;
     padding: 0 16px;
     border-bottom: 1px solid #292f38;
     background: #15191f;
+}
+
+.agent-hub-summary-icon {
+    color: #8fa9cc;
 }
 
 .agent-hub-summary-title {
     color: #e0e4eb;
     font-size: 15px;
     font-weight: 700;
+}
+
+.agent-hub-summary-subtitle {
+    color: #7f8997;
+    font-size: 10px;
 }
 
 .agent-hub-active-count,
@@ -742,6 +770,11 @@ popover.command-popover > contents {
 .agent-hub-active-count {
     background: #203128;
     color: #91c6a0;
+}
+
+.agent-hub-active-count.inactive {
+    background: #252a33;
+    color: #84909f;
 }
 
 .agent-hub-total-count {
@@ -769,10 +802,20 @@ popover.command-popover > contents {
 
 .agent-hub-row:selected {
     background: #202938;
+    box-shadow: inset 3px 0 #79a5e3;
+}
+
+.agent-hub-row:focus {
+    box-shadow: inset 0 0 0 2px #4a6487;
+}
+
+.agent-hub-row:selected:focus {
+    box-shadow: inset 3px 0 #79a5e3, inset 0 0 0 2px #4a6487;
 }
 
 .agent-hub-tree-branch {
-    color: #596473;
+    color: #667384;
+    font-size: 14px;
 }
 
 .agent-hub-status-dot {
@@ -787,35 +830,64 @@ popover.command-popover > contents {
 
 .agent-hub-agent-status,
 .agent-hub-detail-status {
+    padding: 2px 7px;
+    border-radius: 999px;
     font-size: 10px;
     font-weight: 700;
 }
 
 .agent-hub-agent-task {
-    color: #adb5c1;
+    color: #c1c8d2;
     font-size: 12px;
 }
 
-.agent-hub-agent-metadata,
-.agent-hub-detail-activity,
-.agent-hub-detail-metrics {
+.agent-hub-agent-metadata {
     color: #7f8997;
     font-size: 11px;
 }
 
 .agent-hub-detail-header {
-    padding: 13px 18px;
+    padding: 14px 18px 13px;
     border-bottom: 1px solid #292f38;
     background: #15191f;
 }
 
 .agent-hub-detail-name {
-    font-size: 16px;
+    font-size: 17px;
+}
+
+.agent-hub-detail-context {
+    color: #c2c9d2;
+}
+
+.agent-hub-detail-field {
+    min-height: 37px;
+}
+
+.agent-hub-detail-caption,
+.agent-hub-transcript-heading {
+    color: #727d8c;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+}
+
+.agent-hub-detail-task,
+.agent-hub-detail-activity,
+.agent-hub-detail-runtime,
+.agent-hub-detail-metrics {
+    color: #b9c1cc;
+    font-size: 11px;
 }
 
 .agent-hub-detail-task {
-    color: #c2c9d2;
+    color: #d4d9e1;
     font-size: 12px;
+    font-weight: 600;
+}
+
+.agent-hub-transcript-heading {
+    padding: 10px 18px 0;
 }
 
 .agent-hub-empty-title {
@@ -828,25 +900,52 @@ popover.command-popover > contents {
     font-size: 12px;
 }
 
-.agent-status-running {
+.agent-hub .agent-status-running {
     color: #76c893;
 }
 
-.agent-status-pending {
+.agent-hub-agent-status.agent-status-running,
+.agent-hub-detail-status.agent-status-running {
+    background: #203128;
+}
+
+.agent-hub .agent-status-pending {
     color: #d1b56f;
 }
 
-.agent-status-completed {
-    color: #84909f;
+.agent-hub-agent-status.agent-status-pending,
+.agent-hub-detail-status.agent-status-pending {
+    background: #302a1e;
 }
 
-.agent-status-failed {
+.agent-hub .agent-status-completed {
+    color: #9aa5b3;
+}
+
+.agent-hub-agent-status.agent-status-completed,
+.agent-hub-detail-status.agent-status-completed {
+    background: #252a33;
+}
+
+.agent-hub .agent-status-failed {
     color: #e07b88;
 }
 
-.agent-status-aborted,
-.agent-status-unknown {
-    color: #a38f9a;
+.agent-hub-agent-status.agent-status-failed,
+.agent-hub-detail-status.agent-status-failed {
+    background: #351f25;
+}
+
+.agent-hub .agent-status-aborted,
+.agent-hub .agent-status-unknown {
+    color: #aa96a1;
+}
+
+.agent-hub-agent-status.agent-status-aborted,
+.agent-hub-detail-status.agent-status-aborted,
+.agent-hub-agent-status.agent-status-unknown,
+.agent-hub-detail-status.agent-status-unknown {
+    background: #2d252c;
 }
 
 
@@ -1229,20 +1328,68 @@ popover.model-picker-popover > contents {
     margin-left: 4px;
 }
 
-.session-action {
-    min-width: 30px;
+.session-actions > button {
     min-height: 30px;
-    padding: 0;
-    border: 0;
+    padding: 0 9px;
+    border: 1px solid #303540;
     border-radius: 8px;
-    background: transparent;
-    color: #8d96a3;
+    background: #191c23;
+    color: #cbd1d9;
     box-shadow: none;
 }
 
-.session-action:hover {
+.session-actions > button:hover,
+.session-actions > button:checked {
     background: #252a33;
     color: #eef1f5;
+}
+
+.session-actions-popover contents {
+    min-width: 330px;
+    padding: 8px;
+    border: 1px solid #303540;
+    border-radius: 10px;
+    background: #15181e;
+}
+
+.session-actions-heading {
+    margin: 4px 6px 0;
+    color: #eef1f5;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.session-actions-help {
+    margin: 1px 6px 8px;
+    color: #7f8997;
+    font-size: 11px;
+}
+
+.session-action {
+    min-height: 54px;
+    padding: 9px 10px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: #cbd1d9;
+    box-shadow: none;
+}
+
+.session-action:hover,
+.session-action:focus {
+    background: #252a33;
+    color: #eef1f5;
+}
+
+.session-action-title {
+    color: #eef1f5;
+    font-size: 12px;
+    font-weight: 650;
+}
+
+.session-action-detail {
+    color: #7f8997;
+    font-size: 10px;
 }
 
 .branch-picker {
@@ -1250,7 +1397,7 @@ popover.model-picker-popover > contents {
 }
 
 .branch-picker-header {
-    padding: 14px 14px 13px 18px;
+    padding: 16px 14px 15px 18px;
     border-bottom: 1px solid #292f39;
 }
 
@@ -1278,7 +1425,8 @@ popover.model-picker-popover > contents {
     box-shadow: none;
 }
 
-.branch-picker-close:hover {
+.branch-picker-close:hover,
+.branch-picker-close:focus {
     background: #252a33;
     color: #eef1f5;
 }
@@ -1305,30 +1453,35 @@ popover.model-picker-popover > contents {
     border: 0;
     border-radius: 10px;
     background: transparent;
+    color: #929ba7;
     box-shadow: none;
 }
 
-.branch-picker-row-action:hover {
+.branch-picker-row-action:hover,
+.branch-picker-row-action:focus {
     background: #202630;
+    color: #c8bbff;
 }
 
 .branch-picker-marker {
     border-radius: 15px;
     background: #29263a;
     color: #c8bbff;
-    font-size: 11px;
-    font-weight: 750;
 }
 
 .branch-picker-message-label {
-    color: #eef1f5;
-    font-size: 12px;
-    font-weight: 700;
+    color: #7f8997;
+    font-size: 10px;
+    font-weight: 650;
 }
 
 .branch-picker-preview {
-    color: #858f9d;
-    font-size: 11px;
+    color: #d4d9e1;
+    font-size: 12px;
+}
+
+.branch-picker-select-icon {
+    color: inherit;
 }
 
 .branch-picker-state {
@@ -1359,6 +1512,34 @@ popover.model-picker-popover > contents {
     background: #101319;
 }
 
+.handoff-summary {
+    padding: 11px 12px;
+    border: 1px solid #303540;
+    border-radius: 9px;
+    background: #191d24;
+}
+
+.handoff-summary-icon {
+    color: #a996f0;
+}
+
+.handoff-summary-title {
+    color: #d4d9e1;
+    font-size: 11px;
+    font-weight: 700;
+}
+
+.handoff-summary-detail,
+.handoff-instructions-help {
+    color: #828c99;
+    font-size: 11px;
+}
+
+.handoff-difference {
+    color: #aeb4bf;
+    font-size: 11px;
+}
+
 .handoff-instructions-label {
     color: #cbd1d9;
     font-size: 11px;
@@ -1374,6 +1555,11 @@ popover.model-picker-popover > contents {
 .handoff-instructions {
     background: #191d24;
     color: #edf0f5;
+}
+
+.handoff-instructions-placeholder {
+    color: #737986;
+    font-size: 11px;
 }
 
 .story-browser,
@@ -1435,21 +1621,70 @@ popover.model-picker-popover > contents {
 }
 
 .todo-summary {
-    min-height: 34px;
-    padding: 5px 11px;
+    min-height: 52px;
+    padding: 8px 12px;
     border: 0;
     border-radius: 11px;
     background: transparent;
     color: #c9ced7;
     box-shadow: none;
-    font-size: 12px;
-    font-weight: 600;
 }
 
 .todo-summary:hover,
 .todo-summary:checked {
     background: #1b1f26;
     color: #f0f2f6;
+}
+
+.todo-summary-context,
+.todo-phase-index {
+    color: #747d8a;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+}
+
+.todo-summary-current {
+    color: #eef0f4;
+    font-size: 12px;
+    font-weight: 650;
+}
+
+.todo-summary-count {
+    color: #aeb5c0;
+    font-size: 10px;
+    font-weight: 600;
+}
+
+.todo-summary-progress {
+    min-width: 72px;
+}
+
+.todo-summary-progress trough {
+    min-height: 4px;
+    border-radius: 4px;
+    background: #292e37;
+}
+
+.todo-summary-progress progress {
+    min-height: 4px;
+    border-radius: 4px;
+    background: #76c99b;
+}
+
+.todo-summary-blocked {
+    padding: 2px 6px;
+    border-radius: 6px;
+    background: #2b241c;
+    color: #e3ad70;
+    font-size: 9px;
+    font-weight: 700;
+}
+
+.todo-summary-disclosure {
+    min-width: 28px;
+    color: #858d99;
+    font-size: 10px;
 }
 
 .todo-panel-heading {
@@ -1460,7 +1695,8 @@ popover.model-picker-popover > contents {
 }
 
 .todo-panel-status {
-    padding: 7px 12px 9px;
+    padding: 8px 12px;
+    border-top: 1px solid #292e37;
     color: #8f98a5;
     font-size: 11px;
 }
@@ -1470,21 +1706,36 @@ popover.model-picker-popover > contents {
 }
 
 .todo-phase {
-    padding: 9px 10px;
+    padding: 12px;
     border: 1px solid #292e37;
-    border-radius: 9px;
+    border-radius: 8px;
     background: #171a20;
 }
 
 .todo-phase-title {
     color: #eef0f4;
-    font-size: 12px;
+    font-size: 13px;
     font-weight: 700;
 }
 
+.todo-phase-progress {
+    color: #858d99;
+    font-size: 10px;
+    font-weight: 600;
+}
+
 .todo-task {
-    padding: 7px 2px;
+    padding: 8px;
     border-top: 1px solid #262b33;
+    border-radius: 8px;
+}
+
+.todo-task.in-progress {
+    background: #1a212b;
+}
+
+.todo-task.blocked {
+    background: #221e19;
 }
 
 .todo-task-marker {
@@ -1494,7 +1745,8 @@ popover.model-picker-popover > contents {
     font-weight: 700;
 }
 
-.todo-task.in-progress .todo-task-marker {
+.todo-task.in-progress .todo-task-marker,
+.todo-task.in-progress .todo-task-state {
     color: #82aaff;
 }
 
@@ -1502,7 +1754,8 @@ popover.model-picker-popover > contents {
     color: #76c99b;
 }
 
-.todo-task.blocked .todo-task-marker {
+.todo-task.blocked .todo-task-marker,
+.todo-task.blocked .todo-task-state {
     color: #f1b267;
 }
 
@@ -1526,14 +1779,18 @@ popover.model-picker-popover > contents {
     font-size: 10px;
 }
 
+.todo-task-state {
+    font-weight: 600;
+}
+
 .todo-blocker {
     color: #d6a36b;
     font-size: 10px;
 }
 
 .todo-action {
-    min-height: 25px;
-    padding: 2px 7px;
+    min-height: 28px;
+    padding: 2px 8px;
     border: 0;
     border-radius: 6px;
     background: #222730;
@@ -1549,6 +1806,26 @@ popover.model-picker-popover > contents {
 
 .todo-action.destructive-action {
     color: #d49a9a;
+}
+
+.todo-more-action {
+    background: transparent;
+    color: #858d99;
+}
+
+popover.todo-actions-popover > contents {
+    padding: 4px;
+    border: 1px solid #3a414d;
+    border-radius: 8px;
+    background: #181b21;
+}
+
+.todo-actions-menu {
+    min-width: 148px;
+}
+
+.todo-menu-action {
+    padding: 6px 8px;
 }
 
 .todo-dialog-label {

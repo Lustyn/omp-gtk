@@ -13,8 +13,7 @@ use super::tool_components::ToolCard;
 use super::{agent_hub, composer, session_actions, sidebar, todos};
 use crate::agent_hub::AgentHubState;
 use crate::bridge::protocol::{
-    BranchMessage, InterruptMode, ModelSummary, ModelThinking, QueueMode, SubagentSnapshot, TodoItem,
-    TodoPhase, TodoStatus,
+    BranchMessage, ModelSummary, ModelThinking, SubagentSnapshot, TodoItem, TodoPhase, TodoStatus,
 };
 use crate::session_catalog::SessionEntry;
 
@@ -35,7 +34,7 @@ pub(crate) fn find(id: &str) -> Option<Story> {
     STORIES.iter().copied().find(|story| story.id == id)
 }
 
-const STORIES: [Story; 42] = [
+const STORIES: [Story; 44] = [
     Story {
         id: "header/ready",
         title: "Header · Ready",
@@ -143,14 +142,14 @@ const STORIES: [Story; 42] = [
     },
     Story {
         id: "todos/empty",
-        title: "Todos · Empty",
+        title: "Todos · Hidden when empty",
         width: 900,
         height: 180,
         build: todos_empty,
     },
     Story {
         id: "todos/multi-phase",
-        title: "Todos · Multiple phases",
+        title: "Todos · Expanded plan",
         width: 900,
         height: 560,
         build: todos_multi_phase,
@@ -178,9 +177,9 @@ const STORIES: [Story; 42] = [
     },
     Story {
         id: "todos/active",
-        title: "Todos · Active task",
+        title: "Todos · Compact active task",
         width: 900,
-        height: 320,
+        height: 180,
         build: todos_active,
     },
     Story {
@@ -254,8 +253,15 @@ const STORIES: [Story; 42] = [
         build: thinking_picker_default,
     },
     Story {
+        id: "branch-picker/loading",
+        title: "Branch picker · Loading messages",
+        width: 720,
+        height: 640,
+        build: branch_picker_loading,
+    },
+    Story {
         id: "branch-picker/linear",
-        title: "Branch picker · Linear candidates",
+        title: "Branch picker · Independent conversation",
         width: 720,
         height: 640,
         build: branch_picker_linear,
@@ -282,6 +288,13 @@ const STORIES: [Story; 42] = [
         build: branch_picker_empty,
     },
     Story {
+        id: "branch-picker/committing",
+        title: "Branch picker · Creating conversation",
+        width: 720,
+        height: 640,
+        build: branch_picker_committing,
+    },
+    Story {
         id: "branch-picker/error",
         title: "Branch picker · Error",
         width: 720,
@@ -290,9 +303,9 @@ const STORIES: [Story; 42] = [
     },
     Story {
         id: "handoff/default",
-        title: "Handoff · Default",
-        width: 620,
-        height: 440,
+        title: "Handoff · Summarize and continue",
+        width: 660,
+        height: 520,
         build: handoff_default,
     },
     Story {
@@ -375,6 +388,8 @@ fn sidebar_sessions() -> gtk::Widget {
             subtitle: "omp-native · 42 messages · Just now".to_owned(),
             cwd: Some(PathBuf::from("/home/agent/code/omp-native")),
             current: true,
+            running: false,
+            runtime_id: None,
         },
         SessionEntry {
             path: Some(PathBuf::from("/tmp/accessibility.jsonl")),
@@ -382,6 +397,8 @@ fn sidebar_sessions() -> gtk::Widget {
             subtitle: "omp-native · 16 messages · 18m ago".to_owned(),
             cwd: Some(PathBuf::from("/home/agent/code/omp-native")),
             current: false,
+            running: false,
+            runtime_id: None,
         },
         SessionEntry {
             path: Some(PathBuf::from("/tmp/release.jsonl")),
@@ -389,6 +406,8 @@ fn sidebar_sessions() -> gtk::Widget {
             subtitle: "desktop-client · 8 messages · 2h ago".to_owned(),
             cwd: Some(PathBuf::from("/home/agent/code/desktop-client")),
             current: false,
+            running: false,
+            runtime_id: None,
         },
     ] {
         view.list.append(&sidebar::session_row(entry).row);
@@ -455,13 +474,6 @@ fn composer_running_empty() -> gtk::Widget {
     view.set_model("anthropic", "Claude Opus 4.6");
     view.set_thinking_sensitive(true);
     view.set_thinking_label("High");
-    view.set_running_turn_action(true);
-    view.set_queue_state(
-        QueueMode::OneAtATime,
-        QueueMode::OneAtATime,
-        InterruptMode::Immediate,
-        0,
-    );
     view.set_primary_action(true, true);
     view.widget().clone()
 }
@@ -473,7 +485,6 @@ fn composer_running_draft() -> gtk::Widget {
     view.set_thinking_sensitive(true);
     view.set_thinking_label("High");
     view.set_text("Run the accessibility review after this turn");
-    view.set_running_turn_action(false);
     view.append_subagent_chip(&composer::subagent_chip("Designer", "Working", true));
     view.append_subagent_chip(&composer::subagent_chip("Reviewer", "Done", false));
     view.set_subagent_count("1 active · 2 total");
@@ -488,13 +499,7 @@ fn composer_queued() -> gtk::Widget {
     view.set_model("openai-codex", "GPT-5.6-Sol");
     view.set_thinking_sensitive(true);
     view.set_thinking_label("High");
-    view.set_queue_state(
-        QueueMode::All,
-        QueueMode::OneAtATime,
-        InterruptMode::Wait,
-        3,
-    );
-    view.set_running_turn_action(true);
+    view.set_queued_message_count(3);
     view.set_primary_action(true, true);
     view.widget().clone()
 }
@@ -618,21 +623,33 @@ fn todos_abandoned() -> gtk::Widget {
     todo_story(vec![TodoPhase {
         name: "Experiments".to_owned(),
         tasks: vec![
-            todo_item("Parse todo state from transcript prose", TodoStatus::Abandoned),
-            todo_item("Use authoritative get_state instead", TodoStatus::InProgress),
+            todo_item(
+                "Parse todo state from transcript prose",
+                TodoStatus::Abandoned,
+            ),
+            todo_item(
+                "Use authoritative get_state instead",
+                TodoStatus::InProgress,
+            ),
         ],
     }])
 }
 
 fn todos_active() -> gtk::Widget {
-    todo_story(vec![TodoPhase {
-        name: "Native todos".to_owned(),
-        tasks: vec![
-            todo_item("Read protocol definitions", TodoStatus::Completed),
-            todo_item("Implement authoritative reconciliation", TodoStatus::InProgress),
-            todo_item("Add component stories", TodoStatus::Pending),
-        ],
-    }])
+    todo_story_with_expansion(
+        vec![TodoPhase {
+            name: "Native todos".to_owned(),
+            tasks: vec![
+                todo_item("Read protocol definitions", TodoStatus::Completed),
+                todo_item(
+                    "Implement authoritative reconciliation",
+                    TodoStatus::InProgress,
+                ),
+                todo_item("Add component stories", TodoStatus::Pending),
+            ],
+        }],
+        false,
+    )
 }
 
 fn todos_long_text() -> gtk::Widget {
@@ -650,9 +667,13 @@ fn todos_long_text() -> gtk::Widget {
 }
 
 fn todo_story(phases: Vec<TodoPhase>) -> gtk::Widget {
+    todo_story_with_expansion(phases, true)
+}
+
+fn todo_story_with_expansion(phases: Vec<TodoPhase>, expanded: bool) -> gtk::Widget {
     let panel = todos::TodoPanel::new();
     panel.set_phases(&phases);
-    panel.set_expanded(true);
+    panel.set_expanded(expanded);
     panel.root.upcast()
 }
 
@@ -770,7 +791,22 @@ fn agent_hub_terminal() -> gtk::Widget {
                 "reviewer",
                 "completed",
                 "Review the projection",
-                None,
+                Some(json!({
+                    "id": "CompletedReviewer",
+                    "index": 0,
+                    "agent": "reviewer",
+                    "agentSource": "project",
+                    "status": "completed",
+                    "task": "Review the projection",
+                    "recentTools": [],
+                    "recentOutput": [],
+                    "toolCount": 8,
+                    "requests": 5,
+                    "tokens": 24600,
+                    "cost": 0.084,
+                    "durationMs": 132000,
+                    "resolvedModel": "openai-codex/gpt-5.6-sol"
+                })),
             ),
             hub_snapshot(
                 "StoppedWorker",
@@ -782,7 +818,7 @@ fn agent_hub_terminal() -> gtk::Widget {
             ),
         ],
         Some("CompletedReviewer"),
-        false,
+        true,
     )
 }
 
@@ -904,7 +940,20 @@ fn agent_hub_story(
     {
         view.show_agent(agent);
         view.select_id(id, &rendered);
-        if transcript {
+        if transcript && agent.is_terminal() {
+            view.transcript.append_message(
+                MessageRole::User,
+                "Review the implementation and call out any remaining risks.",
+            );
+            view.transcript.append_thinking(
+                "I’ll inspect the final behavior, focusing on state transitions and accessible navigation.",
+                false,
+            );
+            view.transcript.append_message(
+                MessageRole::Assistant,
+                "Review complete. The final transcript remains available after the agent has finished.",
+            );
+        } else if transcript {
             view.transcript.append_message(
                 MessageRole::User,
                 "Load the selected agent transcript and keep it current.",
@@ -918,8 +967,10 @@ fn agent_hub_story(
                 "The initial transcript is loaded. New completed messages will append without duplicating earlier entries.",
             );
         } else {
-            view.transcript
-                .append_notice("Transcript messages have not been loaded in this story.", false);
+            view.transcript.append_notice(
+                "Transcript messages have not been loaded in this story.",
+                false,
+            );
         }
     }
     view.widget().clone()
@@ -965,7 +1016,7 @@ fn thinking_picker_default() -> gtk::Widget {
     composer.set_input_sensitive(true);
     composer.set_model("openai-codex", "GPT-5.6-Sol");
     composer.set_model_sensitive(true);
-    for level in ["off", "minimal", "low", "medium", "high", "xhigh"] {
+    for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
         let option = composer::thinking_option(level);
         if level == "medium" {
             option.add_css_class("thinking-option-selected");
@@ -984,6 +1035,11 @@ fn thinking_picker_default() -> gtk::Widget {
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.append(composer.widget());
     root.upcast()
+}
+
+fn branch_picker_loading() -> gtk::Widget {
+    let view = session_actions::BranchPickerView::new(|_| {});
+    view.widget().clone()
 }
 
 fn branch_picker_linear() -> gtk::Widget {
@@ -1037,6 +1093,12 @@ fn branch_picker_long_content() -> gtk::Widget {
 
 fn branch_picker_empty() -> gtk::Widget {
     branch_picker(Vec::new())
+}
+
+fn branch_picker_committing() -> gtk::Widget {
+    let view = session_actions::BranchPickerView::new(|_| {});
+    view.show_branching();
+    view.widget().clone()
 }
 
 fn branch_picker_error() -> gtk::Widget {

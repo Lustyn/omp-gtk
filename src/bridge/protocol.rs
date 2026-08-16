@@ -33,7 +33,6 @@ impl ImageContent {
     }
 }
 
-
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SlashCommand {
@@ -99,30 +98,12 @@ pub enum QueueMode {
     OneAtATime,
 }
 
-impl QueueMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::All => "all",
-            Self::OneAtATime => "one-at-a-time",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum InterruptMode {
     #[default]
     Immediate,
     Wait,
-}
-
-impl InterruptMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Immediate => "immediate",
-            Self::Wait => "wait",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -529,16 +510,25 @@ fn decode_subagent(kind: SubagentUpdateKind, value: Value) -> SubagentUpdate {
             .or_else(|| progress.as_ref().map(|progress| progress.index)),
         agent: string_field(&payload, "agent")
             .or_else(|| progress.as_ref().map(|progress| progress.agent.clone())),
-        agent_source: string_field(&payload, "agentSource")
-            .or_else(|| progress.as_ref().and_then(|progress| progress.agent_source.clone())),
+        agent_source: string_field(&payload, "agentSource").or_else(|| {
+            progress
+                .as_ref()
+                .and_then(|progress| progress.agent_source.clone())
+        }),
         status: string_field(&payload, "status")
             .or_else(|| progress.as_ref().map(|progress| progress.status.clone())),
-        description: string_field(&payload, "description")
-            .or_else(|| progress.as_ref().and_then(|progress| progress.description.clone())),
+        description: string_field(&payload, "description").or_else(|| {
+            progress
+                .as_ref()
+                .and_then(|progress| progress.description.clone())
+        }),
         task: string_field(&payload, "task")
             .or_else(|| progress.as_ref().map(|progress| progress.task.clone())),
-        assignment: string_field(&payload, "assignment")
-            .or_else(|| progress.as_ref().and_then(|progress| progress.assignment.clone())),
+        assignment: string_field(&payload, "assignment").or_else(|| {
+            progress
+                .as_ref()
+                .and_then(|progress| progress.assignment.clone())
+        }),
         session_file: string_field(&payload, "sessionFile"),
         parent_tool_call_id: string_field(&payload, "parentToolCallId"),
         progress,
@@ -862,10 +852,24 @@ mod tests {
         assert_eq!(response.id.as_deref(), Some("native_42"));
         assert_eq!(response.command, "prompt");
         assert!(!response.success);
-}
+    }
 
-#[test]
+    #[test]
     fn preserves_full_snapshot_activity_metrics_and_nested_agent_ids() {
+        let child = json!({
+            "id": "Child",
+            "index": 0,
+            "agent": "scout",
+            "status": "running",
+            "task": "Read RPC",
+            "recentTools": [],
+            "recentOutput": [],
+            "toolCount": 1,
+            "requests": 1,
+            "tokens": 2000,
+            "cost": 0.005,
+            "durationMs": 10000
+        });
         let snapshot = serde_json::from_value::<SubagentSnapshot>(json!({
             "id": "Parent",
             "index": 0,
@@ -896,22 +900,7 @@ mod tests {
                 "contextWindow": 272000,
                 "cost": 0.04,
                 "durationMs": 90000,
-                "inflightTaskDetails": {
-                    "progress": [{
-                        "id": "Child",
-                        "index": 0,
-                        "agent": "scout",
-                        "status": "running",
-                        "task": "Read RPC",
-                        "recentTools": [],
-                        "recentOutput": [],
-                        "toolCount": 1,
-                        "requests": 1,
-                        "tokens": 2000,
-                        "cost": 0.005,
-                        "durationMs": 10000
-                    }]
-                }
+                "inflightTaskDetails": { "progress": [child] }
             }
         }))
         .unwrap();
@@ -1010,9 +999,9 @@ mod tests {
         let response: SetTodosResponse =
             serde_json::from_value(json!({"todoPhases": phases})).unwrap();
         assert_eq!(response.todo_phases, state.todo_phases);
-}
+    }
 
-#[test]
+    #[test]
     fn decodes_branch_and_handoff_response_shapes() {
         let messages: BranchMessagesResponse = serde_json::from_value(json!({
             "messages": [

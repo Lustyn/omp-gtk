@@ -16,6 +16,8 @@ pub struct SessionEntry {
     pub subtitle: String,
     pub cwd: Option<PathBuf>,
     pub current: bool,
+    pub running: bool,
+    pub runtime_id: Option<u64>,
 }
 
 pub fn session_entry(path: Option<&Path>, current_title: &str, current: bool) -> SessionEntry {
@@ -26,6 +28,8 @@ pub fn session_entry(path: Option<&Path>, current_title: &str, current: bool) ->
             subtitle: "Unsaved conversation".to_owned(),
             cwd: None,
             current,
+            running: false,
+            runtime_id: None,
         };
     };
     let metadata = read_session_metadata(path);
@@ -43,6 +47,8 @@ pub fn session_entry(path: Option<&Path>, current_title: &str, current: bool) ->
         subtitle: session_subtitle(metadata.message_count, modified, metadata.cwd.as_deref()),
         cwd: metadata.cwd,
         current,
+        running: false,
+        runtime_id: None,
     }
 }
 
