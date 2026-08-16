@@ -18,6 +18,7 @@ Commands and behavior below target jj 0.44.
 - The owner of a stack performs its rebases, merges, conflict resolution, cleanup, and focused verification.
 - A dispatcher/orchestrator assigns ownership, communicates change IDs and dependencies, and checks results. It MUST NOT become the default merge bottleneck for stacks it does not understand.
 - When cross-stack integration is needed, designate an **integration owner** with relevant implementation context. That agent creates and validates the integration change.
+- A **landing owner** serializes updates to a shared target bookmark from an owned secondary workspace after the integrated result is verified.
 
 Filesystem isolation does not prevent semantic conflicts. Reduce conflicts through ownership and task boundaries; use jj to preserve and expose the conflicts that remain.
 
@@ -28,7 +29,7 @@ Filesystem isolation does not prevent semantic conflicts. Reduce conflicts throu
 3. NEVER rewrite another live workspace's working-copy commit. That workspace will become stale.
 4. NEVER run `jj rebase`, `jj squash`, `jj absorb`, `jj abandon`, or `jj edit` across a stack owned by another active agent.
 5. NEVER use mutating Git commands in a jj workspace. Use `jj status`, `jj diff`, `jj log`, `jj git fetch`, and `jj git push`.
-6. NEVER move a shared bookmark such as `main` from a worker. Workers may own uniquely named task bookmarks.
+6. A shared bookmark such as `main` has exactly one landing owner at a time. The landing owner advances it only after rebasing or merging onto its current target and verifying the combined result.
 7. NEVER run project-wide formatting, code generation, or lockfile updates concurrently when they touch shared files. The stack or integration owner performs them after integration.
 8. NEVER use `jj undo` blindly in a shared multi-agent repository. The newest operation may belong to another agent.
 9. Do not choose a side of an ambiguous conflict without implementation context. Route it to a contributing stack owner.
@@ -104,6 +105,45 @@ For agent tasks, the workspace contract should include:
 - The agent responsible for cross-stack integration.
 
 Do not put multiple agents in the same workspace.
+
+## Land verified work on a shared target
+
+Landing is a serialized ownership phase performed entirely from an owned secondary workspace. The primary working tree is not used for implementation, integration, verification, or landing.
+
+For an ordinary single-stack task, the task owner may become the landing owner after all other owners stop rewriting its inputs. Resolve the shared target immediately before landing:
+
+```bash
+TARGET=main
+LAND_BASE=$(jj log -r "$TARGET" --no-graph -T 'commit_id ++ "\n"')
+```
+
+Confirm every owned change has a real author and an accurate description, then rebase the owned stack onto that immutable target:
+
+```bash
+jj log -r "$LAND_BASE..<stack-tip>"
+jj rebase -s <stack-root> -o "$LAND_BASE"
+jj log -r 'conflicts() & ::<stack-tip>'
+jj status
+jj diff
+```
+
+Resolve conflicts and repeat focused verification after the rebase. For several independent inputs, use the merge workflow below in the integration owner's workspace, with the current shared target as one merge parent.
+
+Advance the shared bookmark from the verified workspace with the descendant-only bookmark move:
+
+```bash
+jj bookmark move "$TARGET" --to <stack-tip>
+jj log -r "$TARGET" --no-graph \
+  -T 'change_id ++ " " ++ commit_id ++ " " ++ description.first_line() ++ "\n"'
+```
+
+After the bookmark resolves to the verified tip, forget the current task workspace and delete its directory from outside it:
+
+```bash
+jj workspace forget
+```
+
+The bookmark keeps the landed history reachable. The primary working tree remains unchanged throughout this workflow.
 
 ## Single-threaded stack workflow
 
@@ -371,7 +411,7 @@ jj git push --bookmark agents/feature-a/behavior
 
 Set the first PR's base to the trunk branch and each later PR's base to the prior bookmark.
 
-Bookmarks follow a change when that change is rewritten. They do not advance automatically when a new child is created. The stack owner is responsible for moving its unique bookmarks. Workers MUST NOT move shared release or trunk bookmarks.
+Bookmarks follow a change when that change is rewritten. They do not advance automatically when a new child is created. Stack owners move their unique task bookmarks; the designated landing owner advances a shared target bookmark through the landing workflow above.
 
 ## Recovery in a shared repository
 
@@ -418,12 +458,14 @@ Full clones isolate operation logs and stale-workspace behavior but require book
 
 Before yielding an owned stack or integration result:
 
-- [ ] All changes have accurate descriptions.
+- [ ] All changes have real authors and accurate descriptions.
 - [ ] Root and tip change IDs are recorded.
 - [ ] Only owned changes were rewritten.
 - [ ] `jj status` reports no unresolved conflict in the delivered result.
 - [ ] The final graph matches the intended dependency structure.
 - [ ] Focused behavior was exercised after the last rebase or merge.
 - [ ] Shared formatting, generated files, and lockfiles were updated once by the responsible owner.
-- [ ] Bookmark changes, if any, are unique to the owned stack.
+- [ ] Task bookmark changes are unique to the owned stack.
+- [ ] A shared target was advanced only by its designated landing owner after verification.
+- [ ] Landed task workspaces were forgotten and their directories removed.
 - [ ] The next owner and remaining risks are explicit.
