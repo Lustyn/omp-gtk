@@ -29,7 +29,7 @@ use crate::bridge::protocol::{
     SubagentSnapshot, SubagentUpdate, TodoPhase, ToolEnd, ToolStart, ToolUpdate, message_cost,
     message_role, message_text, message_thinking, message_tool_calls, tool_result_parts,
 };
-use crate::bridge::{BridgeClient, OmpBridge};
+use crate::bridge::{BridgeClient, MANUAL_CONTINUE_PROMPT, OmpBridge};
 use crate::commands::{CommandCompletion, completions, unsupported_native_mode_error};
 use crate::session_catalog::{self, SessionEntry};
 use chat::{MessageBody, MessageRole, ThinkingBlock};
@@ -61,6 +61,15 @@ fn should_finish_hydrated_tool_group(is_streaming: bool) -> bool {
 
 fn has_visible_text(text: &str) -> bool {
     !text.trim().is_empty()
+}
+
+fn is_resume_shortcut(message: &str) -> bool {
+    message == "."
+}
+
+fn is_hidden_resume_message(message: &Value) -> bool {
+    matches!(message_role(message), Some("user" | "developer"))
+        && message_text(message) == MANUAL_CONTINUE_PROMPT
 }
 
 fn completion_is_unread(
@@ -369,6 +378,7 @@ struct PendingSubmission {
     request_id: String,
     draft_text: String,
     message: String,
+    display_message: Option<String>,
     attachment_ids: Vec<AttachmentId>,
 }
 
@@ -1509,10 +1519,10 @@ impl AppController {
         self.record_prompt_sound();
         self.set_window_status(WindowStatus::Working);
         self.remove_empty_state();
-        if !submission.message.is_empty() {
+        if let Some(message) = submission.display_message.as_deref() {
             self.ui
                 .conversation()
-                .append_message(MessageRole::User, &submission.message);
+                .append_message(MessageRole::User, message);
         }
         if self.ui.composer.text() == submission.draft_text {
             self.ui.composer.set_text("");
@@ -2540,7 +2550,9 @@ impl AppController {
         self.clear_messages();
         let mut cost = 0.0;
         for message in messages {
-            if message.get("synthetic").and_then(Value::as_bool) == Some(true) {
+            if message.get("synthetic").and_then(Value::as_bool) == Some(true)
+                || is_hidden_resume_message(message)
+            {
                 continue;
             }
             match message_role(message) {
@@ -3440,11 +3452,14 @@ impl AppController {
             self.show_error(&error);
             return;
         }
-        let request = {
+        let resume = is_resume_shortcut(&message);
+        if message.is_empty() && self.attachments.borrow().is_empty() {
+            return;
+        }
+        let request = if resume {
+            client.resume()
+        } else {
             let attachments = self.attachments.borrow();
-            if message.is_empty() && attachments.is_empty() {
-                return;
-            }
             let action = SubmissionAction::select(self.running.get(), intent);
             match action {
                 SubmissionAction::Prompt => client.prompt(&message, attachments.images()),
@@ -3454,16 +3469,26 @@ impl AppController {
         };
         match request {
             Ok(request_id) => {
-                let attachment_ids = self.attachments.borrow().ids().collect::<Vec<_>>();
+                let attachment_ids = if resume {
+                    Vec::new()
+                } else {
+                    self.attachments.borrow().ids().collect::<Vec<_>>()
+                };
+                let submitted_message = if resume {
+                    MANUAL_CONTINUE_PROMPT.to_owned()
+                } else {
+                    message.clone()
+                };
                 self.pending_user_messages
                     .borrow_mut()
-                    .push_back(message.clone());
+                    .push_back(submitted_message.clone());
                 self.pending_submissions
                     .borrow_mut()
                     .push_back(PendingSubmission {
                         request_id,
                         draft_text,
-                        message,
+                        message: submitted_message,
+                        display_message: (!resume).then_some(message),
                         attachment_ids,
                     });
                 self.ui.chat_status.activity("Sending");
@@ -4187,9 +4212,9 @@ mod tests {
         ComposerKeyAction, DeliveryModes, SubmissionAction, SubmissionIntent, ToolResultSource,
         WARM_SESSION_VIEW_LIMIT, cloned_or_insert_with, completion_is_unread, composer_key_action,
         delivery_preference_updates, gdk, has_visible_text, insert_session_by_creation,
-        messages_need_hydration, reorder_session_entries, session_actions_are_relevant,
-        should_finish_hydrated_tool_group, should_send_delivery_preference_updates,
-        touch_bounded_lru, update_current_session,
+        is_hidden_resume_message, is_resume_shortcut, messages_need_hydration,
+        reorder_session_entries, session_actions_are_relevant, should_finish_hydrated_tool_group,
+        should_send_delivery_preference_updates, touch_bounded_lru, update_current_session,
     };
     use crate::alerts::Preferences;
     use crate::bridge::protocol::{InterruptMode, QueueMode, SessionState};
@@ -4301,6 +4326,27 @@ mod tests {
             SubmissionAction::select(true, SubmissionIntent::FollowUp),
             SubmissionAction::FollowUp
         );
+    }
+
+    #[test]
+    fn dot_is_the_hidden_manual_resume_shortcut() {
+        assert!(is_resume_shortcut("."));
+        assert!(!is_resume_shortcut("c"));
+        assert!(!is_resume_shortcut("continue"));
+
+        let hidden = json!({
+            "role": "user",
+            "content": crate::bridge::MANUAL_CONTINUE_PROMPT,
+        });
+        assert!(is_hidden_resume_message(&hidden));
+        assert!(!is_hidden_resume_message(&json!({
+            "role": "user",
+            "content": ".",
+        })));
+        assert!(!is_hidden_resume_message(&json!({
+            "role": "assistant",
+            "content": crate::bridge::MANUAL_CONTINUE_PROMPT,
+        })));
     }
 
     #[test]

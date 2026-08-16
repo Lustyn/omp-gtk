@@ -19,6 +19,13 @@ use self::protocol::{
     RpcFrameDecoder, decode_event,
 };
 use crate::commands::unsupported_native_mode_error;
+pub(crate) const MANUAL_CONTINUE_PROMPT: &str = r#"<system-notice>
+Continue.
+
+MUST resume most recent intent; complete unfinished work.
+If interrupted mid-step: resume where stopped.
+NEVER pause to summarize progress, re-confirm plan, or ask whether to proceed; continue.
+</system-notice>"#;
 
 #[derive(Clone)]
 pub struct BridgeClient {
@@ -50,6 +57,9 @@ impl BridgeClient {
 
     pub fn prompt(&self, message: &str, images: &[ImageContent]) -> Result<String, BridgeError> {
         self.message_request("prompt", message, images)
+    }
+    pub fn resume(&self) -> Result<String, BridgeError> {
+        self.message_request("prompt", MANUAL_CONTINUE_PROMPT, &[])
     }
 
     pub fn steer(&self, message: &str, images: &[ImageContent]) -> Result<String, BridgeError> {
@@ -506,7 +516,9 @@ impl std::error::Error for BridgeError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{BridgeClient, WriterMessage, omp_command, resolve_omp_executable};
+    use super::{
+        BridgeClient, MANUAL_CONTINUE_PROMPT, WriterMessage, omp_command, resolve_omp_executable,
+    };
     use crate::bridge::protocol::{ImageContent, InterruptMode, QueueMode};
     use crate::commands::unsupported_native_mode_error;
     use serde_json::Value;
@@ -674,6 +686,25 @@ mod tests {
         assert_eq!(frames[3]["mode"], "one-at-a-time");
         assert_eq!(frames[4]["type"], "set_interrupt_mode");
         assert_eq!(frames[4]["mode"], "wait");
+    }
+
+    #[test]
+    fn resume_sends_the_hidden_manual_continuation_as_a_text_only_prompt() {
+        let (writer, receiver) = mpsc::channel();
+        let client = BridgeClient {
+            writer,
+            next_request_id: Arc::new(AtomicU64::new(1)),
+        };
+
+        client.resume().expect("queue resume request");
+
+        let WriterMessage::Frame(frame) = receiver.recv().expect("receive resume request") else {
+            panic!("expected RPC frame");
+        };
+        let frame = serde_json::from_str::<Value>(&frame).expect("decode resume request");
+        assert_eq!(frame["type"], "prompt");
+        assert_eq!(frame["message"], MANUAL_CONTINUE_PROMPT);
+        assert!(frame.get("images").is_none());
     }
 
     #[test]
