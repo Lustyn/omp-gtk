@@ -134,12 +134,6 @@ pub struct TodoPhase {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SetTodosResponse {
-    pub todo_phases: Vec<TodoPhase>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct SessionState {
     pub model: Option<ModelSummary>,
     pub thinking_level: Option<String>,
@@ -760,8 +754,7 @@ mod tests {
 
     use super::{
         BranchMessagesResponse, BranchResponse, HandoffResponse, RpcEvent, RpcFrameDecoder,
-        SessionState, SetTodosResponse, SubagentMessages, SubagentSnapshot, TodoPhase, TodoStatus,
-        decode_event,
+        SessionState, SubagentMessages, SubagentSnapshot, TodoPhase, TodoStatus, decode_event,
     };
 
     #[test]
@@ -986,19 +979,15 @@ mod tests {
     }
 
     #[test]
-    fn state_and_set_todos_response_decode_camel_case_todo_phases() {
+    fn state_decodes_camel_case_todo_phases() {
         let phases = json!([
             {
                 "name": "Ship",
                 "tasks": [{"content": "Commit", "status": "in_progress"}]
             }
         ]);
-        let state: SessionState =
-            serde_json::from_value(json!({"todoPhases": phases.clone()})).unwrap();
+        let state: SessionState = serde_json::from_value(json!({"todoPhases": phases})).unwrap();
         assert_eq!(state.todo_phases[0].name, "Ship");
-        let response: SetTodosResponse =
-            serde_json::from_value(json!({"todoPhases": phases})).unwrap();
-        assert_eq!(response.todo_phases, state.todo_phases);
     }
 
     #[test]

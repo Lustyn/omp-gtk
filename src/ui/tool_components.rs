@@ -1,10 +1,14 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use super::{chat::shimmer_markup, icons};
+use super::{
+    chat::{self, shimmer_markup},
+    icons,
+};
 use adw::prelude::*;
 use gtk::{gdk, glib};
 use gtk4 as gtk;
@@ -46,6 +50,391 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "goal",
     "think",
 ];
+
+const COLLAPSED_ACTIVITY_COUNT: usize = 3;
+fn collapsed_activity_start(count: usize) -> usize {
+    count.saturating_sub(COLLAPSED_ACTIVITY_COUNT)
+}
+fn activity_entry_is_active(index: usize, count: usize, working: bool, finished: bool) -> bool {
+    working && !finished && count.checked_sub(1) == Some(index)
+}
+
+#[derive(Clone)]
+struct ActivityPreview {
+    root: gtk::Box,
+    title: gtk::Label,
+    summary: gtk::Label,
+    active: Rc<Cell<bool>>,
+    title_text: Rc<RefCell<String>>,
+    summary_text: Rc<RefCell<String>>,
+    animation_generation: Rc<Cell<u64>>,
+}
+
+impl ActivityPreview {
+    fn new(icon: icons::Icon, title: &str, summary: &str) -> Self {
+        let root = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        root.add_css_class("activity-preview-row");
+        let icon = icons::icon(icon, 14);
+        icon.add_css_class("activity-icon");
+        let title_label = gtk::Label::new(Some(title));
+        title_label.set_xalign(0.0);
+        title_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        title_label.add_css_class("activity-preview-title");
+        title_label.set_visible(!title.is_empty());
+        let summary_label = gtk::Label::new(Some(summary));
+        summary_label.set_xalign(0.0);
+        summary_label.set_hexpand(true);
+        summary_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        summary_label.add_css_class("activity-summary");
+        root.append(&icon);
+        root.append(&title_label);
+        root.append(&summary_label);
+        Self {
+            root,
+            title: title_label,
+            summary: summary_label,
+            active: Rc::new(Cell::new(false)),
+            title_text: Rc::new(RefCell::new(title.to_owned())),
+            summary_text: Rc::new(RefCell::new(summary.to_owned())),
+            animation_generation: Rc::new(Cell::new(0)),
+        }
+    }
+
+    fn sync_text(&self, title: &str, summary: &str) {
+        self.title_text.replace(title.to_owned());
+        self.summary_text.replace(summary.to_owned());
+        self.title.set_text(title);
+        self.summary.set_text(summary);
+    }
+
+    fn set_active(&self, active: bool) {
+        if self.active.replace(active) == active {
+            return;
+        }
+        let generation = self.animation_generation.get().wrapping_add(1);
+        self.animation_generation.set(generation);
+        if !active {
+            self.title.set_text(&self.title_text.borrow());
+            self.summary.set_text(&self.summary_text.borrow());
+            return;
+        }
+
+        let summary = self.summary.downgrade();
+        let summary_text = self.summary_text.clone();
+        let active = self.active.clone();
+        let animation_generation = self.animation_generation.clone();
+        let started = Instant::now();
+        self.summary
+            .set_markup(&shimmer_markup(&summary_text.borrow(), Duration::ZERO));
+        glib::timeout_add_local(Duration::from_millis(33), move || {
+            let Some(summary) = summary.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if !active.get() || animation_generation.get() != generation {
+                return glib::ControlFlow::Break;
+            }
+            summary.set_markup(&shimmer_markup(&summary_text.borrow(), started.elapsed()));
+            glib::ControlFlow::Continue
+        });
+    }
+}
+
+#[derive(Clone)]
+enum ActivityEntry {
+    Tool {
+        card: ToolCard,
+        preview: ActivityPreview,
+    },
+    Thinking {
+        thinking: chat::ThinkingBlock,
+        preview: ActivityPreview,
+    },
+    Notice {
+        preview: ActivityPreview,
+    },
+}
+
+impl ActivityEntry {
+    fn preview(&self) -> &ActivityPreview {
+        match self {
+            Self::Tool { preview, .. }
+            | Self::Thinking { preview, .. }
+            | Self::Notice { preview, .. } => preview,
+        }
+    }
+
+    fn sync(&self) {
+        match self {
+            Self::Tool { card, preview, .. } => {
+                preview.sync_text(&card.title.text(), &card.summary.text());
+            }
+            Self::Thinking { thinking, preview } => {
+                preview.sync_text("", &thinking.summary());
+            }
+            Self::Notice { .. } => {}
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ToolActivityGroup {
+    pub root: gtk::Box,
+    entries: Rc<RefCell<Vec<ActivityEntry>>>,
+    index_by_id: Rc<RefCell<HashMap<String, usize>>>,
+    history_toggle: gtk::Button,
+    history_label: gtk::Label,
+    expanded: Rc<Cell<bool>>,
+    working: Rc<Cell<bool>>,
+    finished: Rc<Cell<bool>>,
+}
+
+impl ToolActivityGroup {
+    pub fn new() -> Self {
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        root.add_css_class("tool-activity-group");
+        root.set_visible(false);
+
+        let history_toggle = gtk::Button::new();
+        history_toggle.add_css_class("activity-history-toggle");
+        history_toggle.set_halign(gtk::Align::Start);
+        history_toggle.set_visible(false);
+        let history_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        history_content.append(&icons::icon(icons::Icon::History, 12));
+        let history_label = gtk::Label::new(None);
+        history_content.append(&history_label);
+        history_toggle.set_child(Some(&history_content));
+        root.append(&history_toggle);
+
+        let entries = Rc::new(RefCell::new(Vec::new()));
+        let expanded = Rc::new(Cell::new(false));
+        let working = Rc::new(Cell::new(false));
+        let finished = Rc::new(Cell::new(false));
+        let group = Self {
+            root,
+            entries,
+            index_by_id: Rc::new(RefCell::new(HashMap::new())),
+            history_toggle,
+            history_label,
+            expanded,
+            working,
+            finished,
+        };
+        let root = group.root.downgrade();
+        let toggle = group.history_toggle.downgrade();
+        let label = group.history_label.downgrade();
+        let entries = group.entries.clone();
+        let expanded = group.expanded.clone();
+        let working = group.working.clone();
+        let finished = group.finished.clone();
+        group.history_toggle.connect_clicked(move |_| {
+            expanded.set(!expanded.get());
+            let (Some(root), Some(toggle), Some(label)) =
+                (root.upgrade(), toggle.upgrade(), label.upgrade())
+            else {
+                return;
+            };
+            refresh_activity_group(
+                &root,
+                &toggle,
+                &label,
+                &entries,
+                expanded.get(),
+                working.get(),
+                finished.get(),
+            );
+        });
+        group
+    }
+
+    pub fn ensure_card(
+        &self,
+        id: &str,
+        name: &str,
+        args: &Value,
+        intent: Option<&str>,
+    ) -> ToolCard {
+        if let Some(index) = self.index_by_id.borrow().get(id).copied() {
+            let entries = self.entries.borrow();
+            let ActivityEntry::Tool { card, .. } = &entries[index] else {
+                unreachable!("tool call index points to a non-tool activity");
+            };
+            return card.clone();
+        }
+
+        let presentation = presentation(name, args, None, intent);
+        let card = ToolCard::new(name, args, intent);
+        let preview = ActivityPreview::new(
+            presentation.icon,
+            &presentation.title,
+            &presentation.summary,
+        );
+        self.root.append(&preview.root);
+        let mut entries = self.entries.borrow_mut();
+        let index = entries.len();
+        entries.push(ActivityEntry::Tool {
+            card: card.clone(),
+            preview,
+        });
+        self.index_by_id.borrow_mut().insert(id.to_owned(), index);
+        drop(entries);
+        self.refresh();
+        card
+    }
+
+    pub fn append_thinking(&self, text: &str, streaming: bool) -> chat::ThinkingBlock {
+        let thinking = chat::ThinkingBlock::new(text, streaming);
+        let preview = ActivityPreview::new(icons::Icon::BrainCircuit, "", &thinking.summary());
+        self.root.append(&preview.root);
+        self.entries.borrow_mut().push(ActivityEntry::Thinking {
+            thinking: thinking.clone(),
+            preview,
+        });
+        self.refresh();
+        thinking
+    }
+
+    pub fn append_notice(&self, text: &str, is_error: bool) {
+        let preview = ActivityPreview::new(
+            if is_error {
+                icons::Icon::TriangleAlert
+            } else {
+                icons::Icon::Info
+            },
+            if is_error { "Error" } else { "Update" },
+            &compact_update(text, 150),
+        );
+        if is_error {
+            preview.root.add_css_class("activity-error");
+        }
+        self.root.append(&preview.root);
+        self.entries
+            .borrow_mut()
+            .push(ActivityEntry::Notice { preview });
+        self.refresh();
+    }
+
+    pub fn update_partial(&self, id: &str, partial: &Value) {
+        let Some(index) = self.index_by_id.borrow().get(id).copied() else {
+            return;
+        };
+        let entries = self.entries.borrow();
+        let ActivityEntry::Tool { card, .. } = &entries[index] else {
+            return;
+        };
+        card.update_partial(partial);
+        drop(entries);
+        self.refresh();
+    }
+
+    pub fn complete(&self, id: &str, result: &Value, is_error: bool) {
+        let Some(index) = self.index_by_id.borrow().get(id).copied() else {
+            return;
+        };
+        {
+            let mut entries = self.entries.borrow_mut();
+            let ActivityEntry::Tool { card, preview } = &mut entries[index] else {
+                return;
+            };
+            card.complete(result, is_error);
+            preview.root.add_css_class(if is_error {
+                "activity-error"
+            } else {
+                "activity-done"
+            });
+        }
+        self.refresh();
+    }
+
+    pub fn set_working(&self, working: bool) {
+        if self.working.replace(working) != working {
+            self.refresh();
+        }
+    }
+
+    pub fn refresh_summary(&self) {
+        self.refresh();
+    }
+
+    pub fn finish(&self) {
+        self.working.set(false);
+        if self.finished.replace(true) {
+            return;
+        }
+        let entries = self.entries.borrow();
+        for entry in entries.iter() {
+            if let ActivityEntry::Tool { card, .. } = entry {
+                card.finish_incomplete();
+            } else if let ActivityEntry::Thinking { thinking, .. } = entry
+                && thinking.is_active()
+            {
+                thinking.finish(None);
+            }
+            entry.sync();
+        }
+        drop(entries);
+        self.refresh();
+    }
+
+    fn refresh(&self) {
+        refresh_activity_group(
+            &self.root,
+            &self.history_toggle,
+            &self.history_label,
+            &self.entries,
+            self.expanded.get(),
+            self.working.get(),
+            self.finished.get(),
+        );
+    }
+}
+
+fn refresh_activity_group(
+    root: &gtk::Box,
+    history_toggle: &gtk::Button,
+    history_label: &gtk::Label,
+    entries: &Rc<RefCell<Vec<ActivityEntry>>>,
+    expanded: bool,
+    working: bool,
+    finished: bool,
+) {
+    let entries = entries.borrow();
+    if entries.is_empty() {
+        root.set_visible(false);
+        return;
+    }
+    let hidden_count = entries.len().saturating_sub(COLLAPSED_ACTIVITY_COUNT);
+    let first_visible = if expanded {
+        0
+    } else {
+        collapsed_activity_start(entries.len())
+    };
+    for (index, entry) in entries.iter().enumerate() {
+        entry.sync();
+        entry.preview().set_active(activity_entry_is_active(
+            index,
+            entries.len(),
+            working,
+            finished,
+        ));
+        entry.preview().root.set_visible(index >= first_visible);
+    }
+    history_toggle.set_visible(hidden_count > 0);
+    if expanded {
+        history_label.set_text(&format!("Show {COLLAPSED_ACTIVITY_COUNT} recent"));
+        history_toggle.set_tooltip_text(Some("Collapse earlier tool activity"));
+    } else {
+        history_label.set_text(&format!(
+            "{hidden_count} earlier {}",
+            if hidden_count == 1 {
+                "action"
+            } else {
+                "actions"
+            }
+        ));
+        history_toggle.set_tooltip_text(Some("Show earlier tool activity"));
+    }
+    root.set_visible(true);
+}
 
 #[derive(Clone)]
 pub struct ToolCard {
@@ -181,6 +570,15 @@ impl ToolCard {
             self.expander.set_expanded(true);
         }
     }
+    fn finish_incomplete(&self) {
+        if !self.active.replace(false) {
+            return;
+        }
+        self.spinner.stop();
+        self.spinner.set_visible(false);
+        self.status.set_text("Stopped");
+        self.root.remove_css_class("activity-running");
+    }
 
     fn apply(&self, presentation: &ToolPresentation) {
         self.title_text.replace(presentation.title.clone());
@@ -225,26 +623,20 @@ impl ToolCard {
     }
 
     fn start_animation(&self) {
-        let title = self.title.downgrade();
         let summary = self.summary.downgrade();
-        let title_text = self.title_text.clone();
         let summary_text = self.summary_text.clone();
         let active = self.active.clone();
         let started = Instant::now();
-        self.title
-            .set_markup(&shimmer_markup(&title_text.borrow(), Duration::ZERO));
         self.summary
             .set_markup(&shimmer_markup(&summary_text.borrow(), Duration::ZERO));
         glib::timeout_add_local(Duration::from_millis(33), move || {
-            let (Some(title), Some(summary)) = (title.upgrade(), summary.upgrade()) else {
+            let Some(summary) = summary.upgrade() else {
                 return glib::ControlFlow::Break;
             };
             if !active.get() {
                 return glib::ControlFlow::Break;
             }
-            let elapsed = started.elapsed();
-            title.set_markup(&shimmer_markup(&title_text.borrow(), elapsed));
-            summary.set_markup(&shimmer_markup(&summary_text.borrow(), elapsed));
+            summary.set_markup(&shimmer_markup(&summary_text.borrow(), started.elapsed()));
             glib::ControlFlow::Continue
         });
     }
@@ -674,6 +1066,122 @@ fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
     if count == 1 { singular } else { plural }
 }
 
+#[derive(Clone, Copy)]
+struct UpdateTag<'a> {
+    start: usize,
+    end: usize,
+    name: &'a str,
+    closing: bool,
+    self_closing: bool,
+}
+
+fn compact_update(text: &str, limit: usize) -> String {
+    let tags = update_tags(text);
+    if !tags.iter().any(|tag| update_tag_is_removable(*tag, &tags)) {
+        return compact(text, limit);
+    }
+
+    let mut visible = String::with_capacity(text.len());
+    let mut cursor = 0;
+    for tag in &tags {
+        if update_tag_is_removable(*tag, &tags) {
+            visible.push_str(&text[cursor..tag.start]);
+            cursor = tag.end;
+        }
+    }
+    visible.push_str(&text[cursor..]);
+    compact(&visible, limit)
+}
+
+fn update_tag_is_removable(tag: UpdateTag<'_>, tags: &[UpdateTag<'_>]) -> bool {
+    tag.self_closing
+        || tags.iter().any(|candidate| {
+            candidate.name == tag.name
+                && candidate.closing != tag.closing
+                && !candidate.self_closing
+                && if tag.closing {
+                    candidate.start < tag.start
+                } else {
+                    candidate.start > tag.start
+                }
+        })
+}
+
+fn update_tags(text: &str) -> Vec<UpdateTag<'_>> {
+    let mut tags = Vec::new();
+    let mut cursor = 0;
+    while let Some(offset) = text[cursor..].find('<') {
+        let start = cursor + offset;
+        if let Some(tag) = parse_update_tag(text, start) {
+            cursor = tag.end;
+            tags.push(tag);
+        } else {
+            cursor = start + 1;
+        }
+    }
+    tags
+}
+
+fn parse_update_tag(text: &str, start: usize) -> Option<UpdateTag<'_>> {
+    let bytes = text.as_bytes();
+    let mut cursor = start.checked_add(1)?;
+    let closing = bytes.get(cursor) == Some(&b'/');
+    if closing {
+        cursor += 1;
+    }
+
+    let name_start = cursor;
+    if !bytes.get(cursor)?.is_ascii_alphabetic() {
+        return None;
+    }
+    cursor += 1;
+    while bytes
+        .get(cursor)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        cursor += 1;
+    }
+    let name_end = cursor;
+    if !bytes
+        .get(cursor)
+        .is_some_and(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>'))
+    {
+        return None;
+    }
+
+    let mut quote = None;
+    while let Some(&byte) = bytes.get(cursor) {
+        if let Some(delimiter) = quote {
+            if byte == delimiter {
+                quote = None;
+            }
+        } else {
+            match byte {
+                b'\'' | b'"' => quote = Some(byte),
+                b'<' => return None,
+                b'>' => {
+                    let mut content_end = cursor;
+                    while content_end > name_end && bytes[content_end - 1].is_ascii_whitespace() {
+                        content_end -= 1;
+                    }
+                    return Some(UpdateTag {
+                        start,
+                        end: cursor + 1,
+                        name: &text[name_start..name_end],
+                        closing,
+                        self_closing: !closing
+                            && content_end > name_end
+                            && bytes[content_end - 1] == b'/',
+                    });
+                }
+                _ => {}
+            }
+        }
+        cursor += 1;
+    }
+    None
+}
+
 fn compact(text: &str, limit: usize) -> String {
     let flattened = text.replace(['\r', '\n', '\t'], " ");
     let mut output = flattened.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -701,7 +1209,10 @@ fn title_case(value: &str) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{BUILTIN_TOOL_NAMES, presentation, preview_height, read_image_data};
+    use super::{
+        BUILTIN_TOOL_NAMES, activity_entry_is_active, collapsed_activity_start, compact_update,
+        presentation, preview_height, read_image_data,
+    };
 
     #[test]
     fn every_builtin_tool_has_a_compact_renderer() {
@@ -734,11 +1245,55 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_activity_shows_only_the_latest_three_actions() {
+        assert_eq!(collapsed_activity_start(0), 0);
+        assert_eq!(collapsed_activity_start(3), 0);
+        assert_eq!(collapsed_activity_start(5), 2);
+    }
+
+    #[test]
+    fn only_the_trailing_activity_animates_while_the_agent_is_working() {
+        assert!(!activity_entry_is_active(0, 2, true, false));
+        assert!(activity_entry_is_active(1, 2, true, false));
+        assert!(!activity_entry_is_active(1, 2, false, false));
+        assert!(!activity_entry_is_active(1, 2, true, true));
+        assert!(!activity_entry_is_active(0, 0, true, false));
+    }
+
+    #[test]
     fn mcp_and_custom_tools_get_safe_catered_fallbacks() {
         let mcp = presentation("mcp__linear_issue", &json!({"id": "ENG-42"}), None, None);
         assert!(mcp.summary.contains("linear"));
         let custom = presentation("deploy_preview", &json!({"name": "staging"}), None, None);
         assert_eq!(custom.summary, "staging");
+    }
+
+    #[test]
+    fn update_preview_hides_balanced_omp_tags() {
+        assert_eq!(
+            compact_update(
+                "<system-reminder>\n2 todos remain. Continue working.\n</system-reminder>",
+                150,
+            ),
+            "2 todos remain. Continue working."
+        );
+        assert_eq!(
+            compact_update(
+                concat!(
+                    "<system-notice reason=\"manual_continue\">",
+                    "<role>Continue.</role> Read memory://<memory-id>.",
+                    "</system-notice>",
+                ),
+                150,
+            ),
+            "Continue. Read memory://<memory-id>."
+        );
+    }
+
+    #[test]
+    fn update_preview_preserves_plain_angle_brackets_and_unpaired_tags() {
+        let text = "Keep x < y > z and the placeholder <memory-id>.";
+        assert_eq!(compact_update(text, 150), text);
     }
 
     #[test]

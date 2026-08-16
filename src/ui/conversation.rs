@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use adw::prelude::*;
@@ -5,14 +6,16 @@ use gtk::glib;
 use gtk4 as gtk;
 use libadwaita as adw;
 
-use super::chat::{self, MessageBody, MessageRole, ThinkingBlock};
+#[cfg(feature = "ui-stories")]
+use super::chat::ThinkingBlock;
+use super::chat::{self, ChatHero, MessageBody, MessageRole};
 
 #[derive(Clone)]
 pub(crate) struct ConversationView {
     root: gtk::Overlay,
     items: gtk::Box,
     scroller: gtk::ScrolledWindow,
-    empty_state: Option<gtk::Box>,
+    hero: Option<ChatHero>,
 }
 
 impl ConversationView {
@@ -45,19 +48,19 @@ impl ConversationView {
 
         let root = gtk::Overlay::new();
         root.set_child(Some(&scroller));
-        let empty_state = with_empty_state.then(|| {
-            let empty = chat::empty_chat_hero();
-            empty.set_can_target(false);
-            empty.set_visible(false);
-            root.add_overlay(&empty);
-            empty
+        let hero = with_empty_state.then(|| {
+            let hero = ChatHero::new();
+            hero.root.set_can_target(false);
+            hero.root.set_visible(false);
+            root.add_overlay(&hero.root);
+            hero
         });
 
         Self {
             root,
             items,
             scroller,
-            empty_state,
+            hero,
         }
     }
 
@@ -66,18 +69,28 @@ impl ConversationView {
     }
 
     pub(crate) fn append_message(&self, role: MessageRole, text: &str) -> MessageBody {
+        self.hide_empty();
         chat::append_message(&self.items, role, text)
     }
 
+    pub(crate) fn append_streaming_message(&self, role: MessageRole, text: &str) -> MessageBody {
+        self.hide_empty();
+        chat::append_streaming_message(&self.items, role, text)
+    }
+
+    #[cfg(feature = "ui-stories")]
     pub(crate) fn append_thinking(&self, text: &str, streaming: bool) -> ThinkingBlock {
+        self.hide_empty();
         chat::append_thinking(&self.items, text, streaming)
     }
 
     pub(crate) fn append_notice(&self, text: &str, error: bool) -> gtk::Box {
+        self.hide_empty();
         chat::append_notice(&self.items, text, error)
     }
 
     pub(crate) fn append(&self, widget: &impl IsA<gtk::Widget>) {
+        self.hide_empty();
         self.items.append(widget);
     }
 
@@ -92,15 +105,48 @@ impl ConversationView {
         self.items.first_child().is_none()
     }
 
-    pub(crate) fn show_empty(&self) {
-        if let Some(empty) = &self.empty_state {
-            empty.set_visible(true);
+    pub(crate) fn show_workspace_onboarding<F, G>(
+        &self,
+        recent_workspaces: &[PathBuf],
+        current_workspace: Option<&Path>,
+        on_select: F,
+        on_browse: G,
+    ) where
+        F: Fn(PathBuf) + Clone + 'static,
+        G: Fn() + 'static,
+    {
+        if let Some(hero) = &self.hero {
+            hero.root.set_can_target(true);
+            hero.show_workspace_onboarding(
+                recent_workspaces,
+                current_workspace,
+                on_select,
+                on_browse,
+            );
+            hero.root.set_visible(true);
+        }
+    }
+
+    pub(crate) fn show_loading(&self, title: &str, detail: &str, activity: &str) {
+        if let Some(hero) = &self.hero {
+            hero.root.set_can_target(false);
+            hero.show_loading(title, detail, activity);
+            hero.root.set_visible(true);
+        }
+    }
+
+    pub(crate) fn show_disconnected(&self, detail: &str) {
+        if let Some(hero) = &self.hero {
+            hero.root.set_can_target(false);
+            hero.show_disconnected(detail);
+            hero.root.set_visible(true);
         }
     }
 
     pub(crate) fn hide_empty(&self) {
-        if let Some(empty) = &self.empty_state {
-            empty.set_visible(false);
+        if let Some(hero) = &self.hero {
+            hero.root.set_can_target(false);
+            hero.hide();
         }
     }
 

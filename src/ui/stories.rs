@@ -1,6 +1,7 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use gtk::prelude::*;
 use gtk4 as gtk;
@@ -9,7 +10,7 @@ use serde_json::json;
 use super::chat::{ChatStatus, MessageRole, TelemetryWidgets};
 use super::conversation::ConversationView;
 use super::model_picker::ModelPickerView;
-use super::tool_components::ToolCard;
+use super::tool_components::ToolActivityGroup;
 use super::{agent_hub, composer, session_actions, sidebar, todos};
 use crate::agent_hub::AgentHubState;
 use crate::bridge::protocol::{
@@ -34,7 +35,7 @@ pub(crate) fn find(id: &str) -> Option<Story> {
     STORIES.iter().copied().find(|story| story.id == id)
 }
 
-const STORIES: [Story; 44] = [
+const STORIES: [Story; 48] = [
     Story {
         id: "header/ready",
         title: "Header · Ready",
@@ -64,6 +65,20 @@ const STORIES: [Story; 44] = [
         build: conversation_empty,
     },
     Story {
+        id: "conversation/creating",
+        title: "Conversation · Creating",
+        width: 900,
+        height: 620,
+        build: conversation_creating,
+    },
+    Story {
+        id: "conversation/disconnected",
+        title: "Conversation · Disconnected",
+        width: 900,
+        height: 620,
+        build: conversation_disconnected,
+    },
+    Story {
         id: "conversation/tool-use",
         title: "Conversation · Tool use",
         width: 900,
@@ -78,11 +93,25 @@ const STORIES: [Story; 44] = [
         build: conversation_markdown,
     },
     Story {
+        id: "conversation/rich-content-stress",
+        title: "Conversation · Rich content stress",
+        width: 900,
+        height: 720,
+        build: conversation_rich_content_stress,
+    },
+    Story {
         id: "composer/ready",
         title: "Composer · Ready",
         width: 900,
         height: 180,
         build: composer_ready,
+    },
+    Story {
+        id: "composer/session-actions",
+        title: "Composer · Continue actions",
+        width: 900,
+        height: 180,
+        build: composer_session_actions,
     },
     Story {
         id: "composer/running-empty",
@@ -309,32 +338,32 @@ const STORIES: [Story; 44] = [
         build: handoff_default,
     },
     Story {
-        id: "tool-card/running",
-        title: "Tool card · Running",
+        id: "tool-group/running",
+        title: "Tool activity · Running",
         width: 780,
-        height: 180,
-        build: tool_card_running,
+        height: 250,
+        build: tool_group_running,
     },
     Story {
-        id: "tool-card/success",
-        title: "Tool card · Success",
+        id: "tool-group/completed",
+        title: "Tool activity · Completed",
         width: 780,
-        height: 220,
-        build: tool_card_success,
+        height: 250,
+        build: tool_group_completed,
     },
     Story {
-        id: "tool-card/read-image",
-        title: "Tool card · Read image",
+        id: "tool-group/read-image",
+        title: "Tool activity · Read image",
         width: 780,
-        height: 560,
-        build: tool_card_read_image,
+        height: 620,
+        build: tool_group_read_image,
     },
     Story {
-        id: "tool-card/error",
-        title: "Tool card · Error",
+        id: "tool-group/error",
+        title: "Tool activity · Error",
         width: 780,
-        height: 260,
-        build: tool_card_error,
+        height: 300,
+        build: tool_group_error,
     },
     Story {
         id: "thinking/streaming",
@@ -381,12 +410,17 @@ fn header(state: &str) -> gtk::Widget {
 
 fn sidebar_sessions() -> gtk::Widget {
     let view = sidebar::build();
+    view.active_count.set_text("1 active");
+    view.active_count.add_css_class("has-items");
+    view.unread_count.set_text("2 unread");
+    view.unread_count.add_css_class("has-items");
     for entry in [
         SessionEntry {
             path: Some(PathBuf::from("/tmp/current.jsonl")),
             title: "Refactor native component architecture".to_owned(),
             subtitle: "omp-native · 42 messages · Just now".to_owned(),
             cwd: Some(PathBuf::from("/home/agent/code/omp-native")),
+            created_at: SystemTime::UNIX_EPOCH,
             current: true,
             running: false,
             runtime_id: None,
@@ -396,8 +430,9 @@ fn sidebar_sessions() -> gtk::Widget {
             title: "Improve accessible component selectors".to_owned(),
             subtitle: "omp-native · 16 messages · 18m ago".to_owned(),
             cwd: Some(PathBuf::from("/home/agent/code/omp-native")),
+            created_at: SystemTime::UNIX_EPOCH,
             current: false,
-            running: false,
+            running: true,
             runtime_id: None,
         },
         SessionEntry {
@@ -405,19 +440,59 @@ fn sidebar_sessions() -> gtk::Widget {
             title: "Prepare the release and verify packaging".to_owned(),
             subtitle: "desktop-client · 8 messages · 2h ago".to_owned(),
             cwd: Some(PathBuf::from("/home/agent/code/desktop-client")),
+            created_at: SystemTime::UNIX_EPOCH,
             current: false,
             running: false,
             runtime_id: None,
         },
     ] {
-        view.list.append(&sidebar::session_row(entry).row);
+        let session = sidebar::session_row(entry);
+        if session.entry.title.starts_with("Prepare the release") {
+            session.row.add_css_class("unread-session");
+            session.indicator.queue_draw();
+        }
+        view.list.append(&session.row);
     }
     view.root.upcast()
 }
 
 fn conversation_empty() -> gtk::Widget {
     let view = ConversationView::main();
-    view.show_empty();
+    let selected_view = view.clone();
+    view.show_workspace_onboarding(
+        &[
+            PathBuf::from("/home/agent/code/omp-native"),
+            PathBuf::from("/home/agent/code/desktop-client"),
+            PathBuf::from("/home/agent/code/service-api"),
+        ],
+        Some(std::path::Path::new("/home/agent")),
+        move |path| {
+            selected_view.show_loading(
+                "Opening selected folder",
+                &path.to_string_lossy(),
+                "Changing workspace",
+            );
+        },
+        || {},
+    );
+    view.widget().clone()
+}
+
+fn conversation_creating() -> gtk::Widget {
+    let view = ConversationView::main();
+    view.show_loading(
+        "Creating a new conversation",
+        "Preparing a fresh omp session in this workspace.",
+        "Starting the local runtime",
+    );
+    view.widget().clone()
+}
+
+fn conversation_disconnected() -> gtk::Widget {
+    let view = ConversationView::main();
+    view.show_disconnected(
+        "The local runtime stopped before a connection could be established. Check your omp installation and try again.",
+    );
     view.widget().clone()
 }
 
@@ -431,13 +506,16 @@ fn conversation_tool_use() -> gtk::Widget {
         "I’ll first map component ownership, then isolate the runtime from rendering.",
         false,
     );
-    let card = ToolCard::new(
+    let group = ToolActivityGroup::new();
+    group.ensure_card(
+        "read-composer",
         "read",
         &json!({"path": "src/ui/composer.rs:1-220"}),
         Some("Inspecting composer component"),
     );
-    card.complete(&json!({"text": "Loaded 220 lines"}), false);
-    view.append(&card.root);
+    group.complete("read-composer", &json!({"text": "Loaded 220 lines"}), false);
+    group.finish();
+    view.append(&group.root);
     view.append_message(
         MessageRole::Assistant,
         "The composer now owns its widget state and exposes behavior-oriented methods.",
@@ -448,11 +526,82 @@ fn conversation_markdown() -> gtk::Widget {
     let view = ConversationView::main();
     view.append_message(
         MessageRole::Assistant,
-        "# Markdown history\n\nMessages now support **strong emphasis**, *italics*, \
-         ~~strikethrough~~, and `inline code`.\n\n## Structured content\n\n\
-         1. Ordered and unordered lists\n2. [Safe links](https://example.com)\n\
-         3. Escaped HTML such as <button>\n\n> Block quotes preserve their visual hierarchy.\n\n\
-         ```rust\nfn render(markdown: &str) {\n    println!(\"{markdown}\");\n}\n```",
+        r#"# Rich Markdown
+
+Messages support **strong emphasis**, *italics*, `inline code`, and native math such as $E = mc^2$.
+
+$$\frac{-b \pm \sqrt{b^2 - 4ac}}{2a}$$
+
+| Renderer | Output | Status |
+| :--- | :---: | ---: |
+| LaTeX | Vector formula | Ready |
+| Mermaid | Native SVG | Ready |
+
+```mermaid
+flowchart LR
+    Prompt --> Parse{Block type}
+    Parse -->|Math| Formula[LaTeX]
+    Parse -->|Diagram| Mermaid
+    Formula --> GTK
+    Mermaid --> GTK
+```
+
+```rust
+fn render(markdown: &str) {
+    println!("{markdown}");
+}
+```"#,
+    );
+    view.widget().clone()
+}
+fn conversation_rich_content_stress() -> gtk::Widget {
+    let view = ConversationView::main();
+    view.append_message(
+        MessageRole::Assistant,
+        r#"## Concurrent agent pipeline
+
+```mermaid
+flowchart LR
+    U[User prompt] --> R[RPC bridge]
+    R --> P{Classify content}
+    P -->|Plain text| M[Markdown parser]
+    P -->|Tool request| T[Tool dispatcher]
+    T --> S[Subagent task]
+    S --> H[Agent hub]
+    H --> A1[Research agent]
+    H --> A2[Implementation agent]
+    H --> A3[Review agent]
+    A1 --> J[Aggregate results]
+    A2 --> J
+    A3 --> J
+    J --> B{Renderable block}
+    B --> L[Native formula SVG]
+    B --> D[Native diagram SVG]
+    B --> G[GTK table grid]
+    B --> W[Wrapped text]
+    L --> C[Conversation view]
+    D --> C
+    G --> C
+    W --> C
+```
+
+$$
+\begin{aligned}
+\mathcal{L}(x,\lambda,\mu) &= f(x) + \sum_{i=1}^{m}\lambda_i h_i(x)
+  + \sum_{j=1}^{p}\mu_j g_j(x), \\
+\nabla_x \mathcal{L}(x^\star,\lambda^\star,\mu^\star) &= 0, \\
+h_i(x^\star) &= 0,\quad g_j(x^\star) \le 0,\quad \mu_j^\star \ge 0
+\end{aligned}
+$$
+
+\[
+A=
+\begin{pmatrix}
+4 & 12 & -16 \\
+12 & 37 & -43 \\
+-16 & -43 & 98
+\end{pmatrix}
+\]"#,
     );
     view.widget().clone()
 }
@@ -464,6 +613,18 @@ fn composer_ready() -> gtk::Widget {
     view.set_thinking_sensitive(true);
     view.set_thinking_label("High");
     view.set_text("Describe the component you want to build");
+    view.set_primary_action(true, false);
+    view.widget().clone()
+}
+
+fn composer_session_actions() -> gtk::Widget {
+    let view = composer::build();
+    view.set_input_sensitive(true);
+    view.set_attachment_sensitive(true);
+    view.set_model("openai-codex", "GPT-5.6-Sol");
+    view.set_thinking_sensitive(true);
+    view.set_thinking_label("High");
+    view.set_session_actions_visible(true);
     view.set_primary_action(true, false);
     view.widget().clone()
 }
@@ -523,11 +684,20 @@ fn attachment_story_composer() -> composer::ComposerView {
     view
 }
 
+fn workspace_story(child: &gtk::Widget) -> gtk::Widget {
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.add_css_class("workspace");
+    root.append(child);
+    root.upcast()
+}
+
 fn story_attachment_texture() -> gtk::gdk::Texture {
-    gtk::gdk::Texture::from_bytes(&gtk::glib::Bytes::from_static(include_bytes!(
-        "../assets/omp.svg"
-    )))
-    .expect("story attachment is a valid image")
+    const HIGH_RESOLUTION_IMAGE: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="3840" height="2160" viewBox="0 0 3840 2160">
+<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#5ad8e6"/><stop offset="1" stop-color="#9b4dff"/></linearGradient></defs>
+<rect width="3840" height="2160" fill="#14181d"/><circle cx="1920" cy="1080" r="720" fill="url(#g)"/>
+</svg>"##;
+    gtk::gdk::Texture::from_bytes(&gtk::glib::Bytes::from_static(HIGH_RESOLUTION_IMAGE))
+        .expect("story attachment is a valid high-resolution image")
 }
 
 fn append_story_attachment(view: &composer::ComposerView, id: u64, name: &str) {
@@ -537,7 +707,7 @@ fn append_story_attachment(view: &composer::ComposerView, id: u64, name: &str) {
 fn composer_attachments_empty() -> gtk::Widget {
     let view = attachment_story_composer();
     view.set_primary_action(true, false);
-    view.widget().clone()
+    workspace_story(view.widget())
 }
 
 fn composer_attachments_populated() -> gtk::Widget {
@@ -545,7 +715,7 @@ fn composer_attachments_populated() -> gtk::Widget {
     view.set_text("Describe what is shown");
     append_story_attachment(&view, 1, "architecture.png");
     view.set_primary_action(true, false);
-    view.widget().clone()
+    workspace_story(view.widget())
 }
 
 fn composer_attachments_multiple() -> gtk::Widget {
@@ -555,7 +725,7 @@ fn composer_attachments_multiple() -> gtk::Widget {
     append_story_attachment(&view, 2, "second.jpg");
     append_story_attachment(&view, 3, "third.png");
     view.set_primary_action(true, false);
-    view.widget().clone()
+    workspace_story(view.widget())
 }
 
 fn composer_attachments_error() -> gtk::Widget {
@@ -569,6 +739,7 @@ fn composer_attachments_error() -> gtk::Widget {
     append_story_attachment(&view, 1, "retained.png");
     view.set_primary_action(true, false);
     let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    root.add_css_class("workspace");
     root.append(conversation.widget());
     root.append(view.widget());
     root.upcast()
@@ -636,20 +807,17 @@ fn todos_abandoned() -> gtk::Widget {
 }
 
 fn todos_active() -> gtk::Widget {
-    todo_story_with_expansion(
-        vec![TodoPhase {
-            name: "Native todos".to_owned(),
-            tasks: vec![
-                todo_item("Read protocol definitions", TodoStatus::Completed),
-                todo_item(
-                    "Implement authoritative reconciliation",
-                    TodoStatus::InProgress,
-                ),
-                todo_item("Add component stories", TodoStatus::Pending),
-            ],
-        }],
-        false,
-    )
+    todo_story(vec![TodoPhase {
+        name: "Native todos".to_owned(),
+        tasks: vec![
+            todo_item("Read protocol definitions", TodoStatus::Completed),
+            todo_item(
+                "Implement authoritative reconciliation",
+                TodoStatus::InProgress,
+            ),
+            todo_item("Add component stories", TodoStatus::Pending),
+        ],
+    }])
 }
 
 fn todos_long_text() -> gtk::Widget {
@@ -667,14 +835,10 @@ fn todos_long_text() -> gtk::Widget {
 }
 
 fn todo_story(phases: Vec<TodoPhase>) -> gtk::Widget {
-    todo_story_with_expansion(phases, true)
-}
-
-fn todo_story_with_expansion(phases: Vec<TodoPhase>, expanded: bool) -> gtk::Widget {
     let panel = todos::TodoPanel::new();
     panel.set_phases(&phases);
-    panel.set_expanded(expanded);
-    panel.root.upcast()
+    panel.set_revealed(true);
+    workspace_story(panel.root.upcast_ref())
 }
 
 fn todo_item(content: &str, status: TodoStatus) -> TodoItem {
@@ -1161,32 +1325,91 @@ fn model(provider: &str, id: &str, name: &str, context_window: u64) -> ModelSumm
     }
 }
 
-fn tool_card_running() -> gtk::Widget {
-    let card = ToolCard::new(
-        "bash",
-        &json!({"command": "cargo test --all-targets"}),
-        Some("Running component tests"),
-    );
-    card.root.clone().upcast()
+fn tool_group_running() -> gtk::Widget {
+    let group = ToolActivityGroup::new();
+    group.set_working(true);
+    for (id, name, args, intent) in [
+        (
+            "read",
+            "read",
+            json!({"path": "src/ui/composer.rs:1-220"}),
+            "Inspecting composer ownership",
+        ),
+        (
+            "glob",
+            "glob",
+            json!({"path": "src/ui/**/*.rs"}),
+            "Mapping UI components",
+        ),
+        (
+            "grep",
+            "grep",
+            json!({"pattern": "ToolCard", "path": "src"}),
+            "Finding tool rendering call sites",
+        ),
+        (
+            "edit",
+            "edit",
+            json!({"input": "[src/ui/tool_components.rs#ABCD]"}),
+            "Grouping tool activity",
+        ),
+        (
+            "bash",
+            "bash",
+            json!({"command": "cargo test tool_components"}),
+            "Running component tests",
+        ),
+    ] {
+        group.ensure_card(id, name, &args, Some(intent));
+        if id != "bash" {
+            group.complete(id, &json!({"text": "Done"}), false);
+        }
+    }
+    group.root.clone().upcast()
 }
 
-fn tool_card_success() -> gtk::Widget {
-    let card = ToolCard::new(
+fn tool_group_completed() -> gtk::Widget {
+    let group = ToolActivityGroup::new();
+    group.append_thinking(
+        "I’ll inspect the current activity flow before updating the renderer.",
+        false,
+    );
+    group.ensure_card(
+        "write",
         "write",
         &json!({"path": "src/ui/gallery.rs", "content": "..."}),
         Some("Creating native gallery"),
     );
-    card.complete(&json!({"text": "Successfully wrote 180 lines"}), false);
-    card.root.clone().upcast()
+    group.complete(
+        "write",
+        &json!({"text": "Successfully wrote 180 lines"}),
+        false,
+    );
+    group.ensure_card(
+        "check",
+        "bash",
+        &json!({"command": "cargo check"}),
+        Some("Checking the grouped display"),
+    );
+    group.complete("check", &json!({"text": "Finished"}), false);
+    group.append_notice(
+        "<system-reminder>\n2 todos remain. Continue working.\n</system-reminder>",
+        false,
+    );
+    group.finish();
+    group.root.clone().upcast()
 }
 
-fn tool_card_read_image() -> gtk::Widget {
-    let card = ToolCard::new(
+fn tool_group_read_image() -> gtk::Widget {
+    let group = ToolActivityGroup::new();
+    group.ensure_card(
+        "read-image",
         "read",
         &json!({"path": "src/assets/omp.svg"}),
         Some("Reading application artwork"),
     );
-    card.complete(
+    group.complete(
+        "read-image",
         &json!({
             "content": [
                 {"type": "text", "text": "Decoded image"},
@@ -1200,20 +1423,25 @@ fn tool_card_read_image() -> gtk::Widget {
         }),
         false,
     );
-    card.root.clone().upcast()
+    group.finish();
+    group.root.clone().upcast()
 }
 
-fn tool_card_error() -> gtk::Widget {
-    let card = ToolCard::new(
+fn tool_group_error() -> gtk::Widget {
+    let group = ToolActivityGroup::new();
+    group.ensure_card(
+        "check",
         "bash",
         &json!({"command": "cargo check"}),
         Some("Checking component boundary"),
     );
-    card.complete(
+    group.complete(
+        "check",
         &json!({"error": "no field `input` on type `WorkspaceView`"}),
         true,
     );
-    card.root.clone().upcast()
+    group.finish();
+    group.root.clone().upcast()
 }
 
 fn thinking_streaming() -> gtk::Widget {

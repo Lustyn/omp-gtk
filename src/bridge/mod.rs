@@ -2,7 +2,6 @@ pub mod protocol;
 
 use std::ffi::{OsStr, OsString};
 use std::io::{self, BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::Arc;
@@ -17,7 +16,7 @@ use serde_json::{Map, Value, json};
 
 use self::protocol::{
     BranchRequest, HandoffRequest, ImageContent, InterruptMode, QueueMode, RpcEvent,
-    RpcFrameDecoder, TodoPhase, decode_event,
+    RpcFrameDecoder, decode_event,
 };
 use crate::commands::unsupported_native_mode_error;
 
@@ -116,11 +115,6 @@ impl BridgeClient {
 
     pub fn set_session_name(&self, name: &str) -> Result<(), BridgeError> {
         self.request("set_session_name", json!({ "name": name }))?;
-        Ok(())
-    }
-
-    pub fn set_todos(&self, phases: &[TodoPhase]) -> Result<(), BridgeError> {
-        self.request("set_todos", json!({ "phases": phases }))?;
         Ok(())
     }
 
@@ -248,24 +242,55 @@ fn resolve_omp_executable(
 }
 
 fn is_executable(path: &Path) -> bool {
-    path.metadata()
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
-fn omp_command(executable: &Path, session_path: Option<&Path>) -> Command {
-    let mut command = Command::new(executable);
-    command.args(["--mode", "rpc-ui"]);
+
+fn omp_command(
+    shell: &Path,
+    executable: &OsStr,
+    session_path: Option<&Path>,
+    workspace: Option<&Path>,
+) -> Command {
+    let mut command = Command::new(shell);
+    command
+        .args(["-l", "-c", r#"exec "$0" "$@""#])
+        .arg(executable)
+        .args(["--mode", "rpc-ui"]);
     if let Some(path) = session_path {
         command.arg("--session").arg(path);
+    }
+    if let Some(workspace) = workspace {
+        command.current_dir(workspace);
     }
     command
 }
 
 impl OmpBridge {
     pub fn spawn() -> io::Result<Self> {
-        Self::spawn_for_session(None)
+        Self::spawn_for_session(None, None)
     }
 
-    pub fn spawn_for_session(session_path: Option<&Path>) -> io::Result<Self> {
+    pub fn spawn_for_session(
+        session_path: Option<&Path>,
+        workspace: Option<&Path>,
+    ) -> io::Result<Self> {
+        let shell: OsString = std::env::var_os("SHELL")
+            .filter(|shell| !shell.is_empty())
+            .unwrap_or_else(|| "/bin/sh".into());
         let override_bin: Option<OsString> = std::env::var_os("OMP_BIN");
         let search_path = std::env::var_os("PATH");
         let home_dir = std::env::var_os("HOME");
@@ -274,11 +299,16 @@ impl OmpBridge {
             search_path.as_deref(),
             home_dir.as_deref(),
         );
-        let mut child = omp_command(&executable, session_path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+        let mut child = omp_command(
+            Path::new(&shell),
+            executable.as_os_str(),
+            session_path,
+            workspace,
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
 
         let stdin = child
             .stdin
@@ -477,9 +507,7 @@ impl std::error::Error for BridgeError {}
 #[cfg(test)]
 mod tests {
     use super::{BridgeClient, WriterMessage, omp_command, resolve_omp_executable};
-    use crate::bridge::protocol::{
-        ImageContent, InterruptMode, QueueMode, TodoItem, TodoPhase, TodoStatus,
-    };
+    use crate::bridge::protocol::{ImageContent, InterruptMode, QueueMode};
     use crate::commands::unsupported_native_mode_error;
     use serde_json::Value;
     use std::ffi::OsStr;
@@ -500,10 +528,10 @@ mod tests {
         directory
     }
 
-    fn create_executable(path: &Path) {
+    fn create_executable(path: &Path, contents: &[u8]) {
         fs::create_dir_all(path.parent().expect("executable has a parent"))
             .expect("create executable directory");
-        fs::write(path, b"").expect("create executable");
+        fs::write(path, contents).expect("create executable");
         let mut permissions = fs::metadata(path)
             .expect("read executable metadata")
             .permissions();
@@ -512,13 +540,13 @@ mod tests {
     }
 
     #[test]
-    fn resolves_omp_from_user_local_bin_when_path_does_not_contain_it() {
+    fn resolves_omp_from_user_local_bin_when_desktop_path_does_not_contain_it() {
         let fixture = fixture_directory("user-local");
         let path_directory = fixture.join("path");
         let home = fixture.join("home");
         fs::create_dir_all(&path_directory).expect("create PATH fixture");
         let expected = home.join(".local/bin/omp");
-        create_executable(&expected);
+        create_executable(&expected, b"");
 
         let resolved = resolve_omp_executable(
             None,
@@ -543,20 +571,64 @@ mod tests {
     }
 
     #[test]
-    fn resumed_session_runtime_starts_on_its_own_transcript() {
+    fn resumed_session_runtime_starts_in_the_user_login_shell_and_workspace() {
         let session = Path::new("/tmp/session with spaces.jsonl");
-        let command = omp_command(Path::new("/opt/omp/bin/omp"), Some(session));
+        let workspace = Path::new("/tmp/existing workspace");
+        let command = omp_command(
+            Path::new("/bin/zsh"),
+            OsStr::new("/opt/omp/bin/omp"),
+            Some(session),
+            Some(workspace),
+        );
 
-        assert_eq!(command.get_program(), OsStr::new("/opt/omp/bin/omp"));
+        assert_eq!(command.get_program(), OsStr::new("/bin/zsh"));
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             [
+                OsStr::new("-l"),
+                OsStr::new("-c"),
+                OsStr::new(r#"exec "$0" "$@""#),
+                OsStr::new("/opt/omp/bin/omp"),
                 OsStr::new("--mode"),
                 OsStr::new("rpc-ui"),
                 OsStr::new("--session"),
                 session.as_os_str(),
             ]
         );
+        assert_eq!(command.get_current_dir(), Some(workspace));
+    }
+
+    #[test]
+    fn omp_inherits_environment_from_the_user_login_shell() {
+        let fixture = fixture_directory("shell-environment");
+        let home = fixture.join("home");
+        let executable = fixture.join("bin/omp");
+        fs::create_dir_all(&home).expect("create home fixture");
+        fs::write(
+            home.join(".profile"),
+            b"export OMP_NATIVE_SHELL_ENV=from-login-shell\n",
+        )
+        .expect("write login profile");
+        create_executable(
+            &executable,
+            b"#!/bin/sh\nprintf '%s\\n' \"$OMP_NATIVE_SHELL_ENV\" \"$@\"\n",
+        );
+
+        let output = omp_command(Path::new("/bin/sh"), executable.as_os_str(), None, None)
+            .env("HOME", &home)
+            .output()
+            .expect("run omp fixture through login shell");
+
+        assert!(
+            output.status.success(),
+            "fixture failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(output.stdout).expect("fixture output is UTF-8"),
+            "from-login-shell\n--mode\nrpc-ui\n"
+        );
+        fs::remove_dir_all(fixture).expect("remove fixture");
     }
 
     #[test]
@@ -702,38 +774,6 @@ mod tests {
         assert_eq!(frame["type"], "follow_up");
         assert_eq!(frame["images"][0]["mimeType"], "image/png");
         assert_eq!(frame["images"][1]["mimeType"], "image/jpeg");
-    }
-
-    #[test]
-    fn sends_complete_todo_state_through_set_todos() {
-        let (writer, receiver) = mpsc::channel();
-        let client = BridgeClient {
-            writer,
-            next_request_id: Arc::new(AtomicU64::new(7)),
-        };
-        let phases = vec![TodoPhase {
-            name: "Build".to_owned(),
-            tasks: vec![TodoItem {
-                content: "Wire the panel".to_owned(),
-                status: TodoStatus::Blocked,
-                blocker: Some("Needs protocol state".to_owned()),
-            }],
-        }];
-
-        client.set_todos(&phases).expect("queue todo request");
-
-        let WriterMessage::Frame(frame) = receiver.recv().expect("receive todo request") else {
-            panic!("expected RPC frame");
-        };
-        let frame = serde_json::from_str::<Value>(&frame).expect("decode todo request");
-        assert_eq!(frame["id"], "native_7");
-        assert_eq!(frame["type"], "set_todos");
-        assert_eq!(frame["phases"][0]["name"], "Build");
-        assert_eq!(frame["phases"][0]["tasks"][0]["status"], "blocked");
-        assert_eq!(
-            frame["phases"][0]["tasks"][0]["blocker"],
-            "Needs protocol state"
-        );
     }
 
     #[test]

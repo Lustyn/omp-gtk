@@ -5,8 +5,9 @@ use crate::sound_registry::{self, RegistryPack};
 use crate::ui::{
     agent_hub as agent_hub_ui,
     attachments::{self, AttachmentId, ComposerAttachments},
-    chat, composer, model_picker, session_actions, sidebar, sound_settings, todos, tool_components,
-    workspace,
+    chat, composer,
+    conversation::ConversationView,
+    model_picker, session_actions, sidebar, sound_settings, todos, tool_components, workspace,
 };
 
 use std::cell::{Cell, RefCell};
@@ -24,27 +25,85 @@ use serde_json::{Value, json};
 use crate::agent_hub::AgentHubState;
 use crate::bridge::protocol::{
     BranchMessagesResponse, BranchResponse, HandoffResponse, InterruptMode, ModelSummary,
-    QueueMode, RpcEvent, RpcResponse, SessionState, SetTodosResponse, SlashCommand,
-    SubagentMessages, SubagentSnapshot, SubagentUpdate, TodoItem, TodoPhase, TodoStatus, ToolEnd,
-    ToolStart, ToolUpdate, message_cost, message_role, message_text, message_thinking,
-    message_tool_calls, tool_result_parts,
+    QueueMode, RpcEvent, RpcResponse, SessionState, SlashCommand, SubagentMessages,
+    SubagentSnapshot, SubagentUpdate, TodoPhase, ToolEnd, ToolStart, ToolUpdate, message_cost,
+    message_role, message_text, message_thinking, message_tool_calls, tool_result_parts,
 };
 use crate::bridge::{BridgeClient, OmpBridge};
 use crate::commands::{CommandCompletion, completions, unsupported_native_mode_error};
 use crate::session_catalog::{self, SessionEntry};
 use chat::{MessageBody, MessageRole, ThinkingBlock};
 use sidebar::SessionRow;
-use todos::{TodoAction, TodoEdit, apply_edit, validate_phases};
-use tool_components::ToolCard;
+use todos::validate_phases;
+use tool_components::{ToolActivityGroup, ToolCard};
 use workspace::WorkspaceView;
 
 const TASK_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 const PROMPT_BURST_WINDOW: Duration = Duration::from_secs(5);
 const PROMPT_BURST_THRESHOLD: usize = 3;
+const WARM_SESSION_VIEW_LIMIT: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolResultSource {
+    Live,
+    History,
+}
+
+impl ToolResultSource {
+    const fn applies_live_effects(self) -> bool {
+        matches!(self, Self::Live)
+    }
+}
+
+fn should_finish_hydrated_tool_group(is_streaming: bool) -> bool {
+    !is_streaming
+}
+
+fn has_visible_text(text: &str) -> bool {
+    !text.trim().is_empty()
+}
+
+fn completion_is_unread(
+    was_running: bool,
+    active_runtime: Option<u64>,
+    completed_runtime: u64,
+    window_active: bool,
+) -> bool {
+    was_running && (active_runtime != Some(completed_runtime) || !window_active)
+}
+
+fn cloned_or_insert_with<T: Clone>(slot: &RefCell<Option<T>>, create: impl FnOnce() -> T) -> T {
+    let existing = slot.borrow().clone();
+    if let Some(existing) = existing {
+        return existing;
+    }
+    let value = create();
+    slot.replace(Some(value.clone()));
+    value
+}
+fn touch_bounded_lru(order: &mut VecDeque<u64>, value: u64, limit: usize) -> Vec<u64> {
+    order.retain(|existing| *existing != value);
+    order.push_back(value);
+    let mut evicted = Vec::new();
+    while order.len() > limit {
+        if let Some(value) = order.pop_front() {
+            evicted.push(value);
+        }
+    }
+    evicted
+}
+fn messages_need_hydration(
+    cached: Option<&[Value]>,
+    view_hydrated: bool,
+    messages: &[Value],
+) -> bool {
+    !view_hydrated || cached != Some(messages)
+}
 
 pub(crate) fn build(app: &adw::Application) {
-    let ui = workspace::build(app);
     let initial_runtime_id = 1;
+    let ui = workspace::build(app, initial_runtime_id);
+    let initial_conversation = ui.conversation();
     let (runtimes, active_runtime, events) = match OmpBridge::spawn() {
         Ok(bridge) => {
             let events = bridge.events.clone();
@@ -56,14 +115,17 @@ pub(crate) fn build(app: &adw::Application) {
                     running: false,
                     ready: false,
                     delivery_target: None,
+                    disconnected: None,
+                    workspace: std::env::current_dir().ok(),
+                    state: None,
                 },
             );
             (runtimes, Some(initial_runtime_id), Some(events))
         }
         Err(error) => {
             ui.composer.set_input_sensitive(false);
-            ui.conversation
-                .append_notice(&format!("Could not start omp: {error}"), true);
+            ui.conversation()
+                .show_disconnected(&format!("The local runtime could not be started. {error}"));
             (HashMap::new(), None, None)
         }
     };
@@ -92,14 +154,25 @@ pub(crate) fn build(app: &adw::Application) {
         pending_submissions: RefCell::new(VecDeque::new()),
         pasted_image_count: Cell::new(0),
         streaming_thinking: RefCell::new(None),
-        tool_cards: RefCell::new(HashMap::new()),
+        active_tool_group: RefCell::new(None),
+        tool_groups_by_call_id: RefCell::new(HashMap::new()),
         agent_hub: RefCell::new(AgentHubState::default()),
         agent_hub_rows: RefCell::new(Vec::new()),
         subagent_transcript: RefCell::new(None),
-        subagent_tool_cards: RefCell::new(HashMap::new()),
+        subagent_active_tool_group: RefCell::new(None),
+        subagent_tool_groups_by_call_id: RefCell::new(HashMap::new()),
         session_rows: RefCell::new(Vec::new()),
-        todo_phases: RefCell::new(Vec::new()),
         active_sessions: RefCell::new(Vec::new()),
+        conversation_views: RefCell::new(HashMap::from([(
+            initial_runtime_id,
+            WarmConversation {
+                view: initial_conversation,
+                messages: None,
+                hydrated: false,
+            },
+        )])),
+        conversation_view_lru: RefCell::new(VecDeque::from([initial_runtime_id])),
+        unread_runtimes: RefCell::new(HashSet::new()),
         current_session_file: RefCell::new(None),
         current_session_title: RefCell::new("New conversation".to_owned()),
         pending_session_notice: RefCell::new(None),
@@ -310,7 +383,69 @@ struct SessionRuntime {
     bridge: OmpBridge,
     running: bool,
     ready: bool,
+    disconnected: Option<String>,
     delivery_target: Option<DeliveryModes>,
+    workspace: Option<PathBuf>,
+    state: Option<SessionState>,
+}
+// Retains the rendered widget tree, scroll position, and matching RPC snapshot as one LRU entry.
+struct WarmConversation {
+    view: ConversationView,
+    messages: Option<Vec<Value>>,
+    hydrated: bool,
+}
+
+fn insert_session_by_creation(entries: &mut Vec<SessionEntry>, entry: SessionEntry) {
+    let position = entries
+        .iter()
+        .position(|existing| {
+            (entry.created_at, entry.runtime_id) > (existing.created_at, existing.runtime_id)
+        })
+        .unwrap_or(entries.len());
+    entries.insert(position, entry);
+}
+
+fn update_current_session(entries: &mut Vec<SessionEntry>, mut current: SessionEntry) {
+    for entry in entries.iter_mut() {
+        entry.current = false;
+    }
+    if let Some(position) = entries
+        .iter()
+        .position(|entry| entry.runtime_id == current.runtime_id)
+    {
+        current.created_at = entries[position].created_at;
+        entries[position] = current;
+    } else {
+        insert_session_by_creation(entries, current);
+    }
+}
+
+fn reorder_session_entries(
+    entries: &mut Vec<SessionEntry>,
+    source_runtime_id: u64,
+    target_runtime_id: u64,
+    insert_after: bool,
+) -> bool {
+    if source_runtime_id == target_runtime_id {
+        return false;
+    }
+    let Some(source_position) = entries
+        .iter()
+        .position(|entry| entry.runtime_id == Some(source_runtime_id))
+    else {
+        return false;
+    };
+    let source = entries.remove(source_position);
+    let Some(target_position) = entries
+        .iter()
+        .position(|entry| entry.runtime_id == Some(target_runtime_id))
+    else {
+        entries.insert(source_position, source);
+        return false;
+    };
+    let destination = target_position + usize::from(insert_after);
+    entries.insert(destination, source);
+    destination != source_position
 }
 
 struct AppController {
@@ -328,17 +463,21 @@ struct AppController {
     pending_user_messages: RefCell<VecDeque<String>>,
     streaming_message: RefCell<Option<StreamingMessage>>,
     attachments: RefCell<ComposerAttachments>,
+    unread_runtimes: RefCell<HashSet<u64>>,
     pending_submissions: RefCell<VecDeque<PendingSubmission>>,
     pasted_image_count: Cell<u64>,
     streaming_thinking: RefCell<Option<ThinkingBlock>>,
-    tool_cards: RefCell<HashMap<String, ToolCard>>,
+    active_tool_group: RefCell<Option<ToolActivityGroup>>,
+    tool_groups_by_call_id: RefCell<HashMap<String, ToolActivityGroup>>,
     agent_hub: RefCell<AgentHubState>,
     agent_hub_rows: RefCell<Vec<agent_hub_ui::AgentHubRow>>,
     subagent_transcript: RefCell<Option<SubagentTranscriptState>>,
-    subagent_tool_cards: RefCell<HashMap<String, ToolCard>>,
+    subagent_active_tool_group: RefCell<Option<ToolActivityGroup>>,
+    subagent_tool_groups_by_call_id: RefCell<HashMap<String, ToolActivityGroup>>,
     session_rows: RefCell<Vec<SessionRow>>,
-    todo_phases: RefCell<Vec<TodoPhase>>,
     active_sessions: RefCell<Vec<SessionEntry>>,
+    conversation_views: RefCell<HashMap<u64, WarmConversation>>,
+    conversation_view_lru: RefCell<VecDeque<u64>>,
     current_session_file: RefCell<Option<PathBuf>>,
     current_session_title: RefCell<String>,
     pending_session_notice: RefCell<Option<String>>,
@@ -364,13 +503,6 @@ struct AppController {
 
 impl AppController {
     fn wire_interactions(self: &Rc<Self>) {
-        let weak = Rc::downgrade(self);
-        self.ui.todos.connect_action(move |action| {
-            if let Some(controller) = weak.upgrade() {
-                controller.handle_todo_action(action);
-            }
-        });
-
         let weak = Rc::downgrade(self);
         self.ui.composer.connect_changed(move || {
             let Some(controller) = weak.upgrade() else {
@@ -481,13 +613,13 @@ impl AppController {
         });
 
         let weak = Rc::downgrade(self);
-        self.ui.branch_button.connect_clicked(move |_| {
+        self.ui.composer.connect_branch_clicked(move || {
             if let Some(controller) = weak.upgrade() {
                 controller.present_branch_picker();
             }
         });
         let weak = Rc::downgrade(self);
-        self.ui.handoff_button.connect_clicked(move |_| {
+        self.ui.composer.connect_handoff_clicked(move || {
             if let Some(controller) = weak.upgrade() {
                 controller.present_handoff();
             }
@@ -502,10 +634,17 @@ impl AppController {
 
         let weak = Rc::downgrade(self);
         self.ui.window.connect_is_active_notify(move |window| {
-            if window.is_active()
-                && let Some(controller) = weak.upgrade()
+            if !window.is_active() {
+                return;
+            }
+            let Some(controller) = weak.upgrade() else {
+                return;
+            };
+            controller.alerts.withdraw();
+            if let Some(runtime_id) = controller.active_runtime.get()
+                && controller.unread_runtimes.borrow_mut().remove(&runtime_id)
             {
-                controller.alerts.withdraw();
+                controller.update_activity_counts();
             }
         });
 
@@ -609,6 +748,53 @@ impl AppController {
             .get(&runtime_id)
             .map(|runtime| runtime.bridge.client.clone())
     }
+    fn show_runtime_conversation(&self, runtime_id: u64) -> bool {
+        let cached = self
+            .conversation_views
+            .borrow()
+            .get(&runtime_id)
+            .map(|conversation| conversation.view.clone());
+        let was_cached = cached.is_some();
+        let conversation = cached.unwrap_or_else(|| {
+            let view = ConversationView::main();
+            view.show_loading(
+                "Opening conversation",
+                "Restoring messages, tools, and session state.",
+                "Reading conversation history",
+            );
+            self.conversation_views.borrow_mut().insert(
+                runtime_id,
+                WarmConversation {
+                    view: view.clone(),
+                    messages: None,
+                    hydrated: false,
+                },
+            );
+            view
+        });
+        self.ui.show_session_conversation(runtime_id, &conversation);
+        let evicted = touch_bounded_lru(
+            &mut self.conversation_view_lru.borrow_mut(),
+            runtime_id,
+            WARM_SESSION_VIEW_LIMIT,
+        );
+        for evicted_runtime_id in evicted {
+            self.conversation_views
+                .borrow_mut()
+                .remove(&evicted_runtime_id);
+            self.ui.remove_session_conversation(evicted_runtime_id);
+        }
+        was_cached
+    }
+
+    fn remove_runtime_conversation(&self, runtime_id: u64) {
+        self.conversation_views.borrow_mut().remove(&runtime_id);
+        self.conversation_view_lru
+            .borrow_mut()
+            .retain(|existing| *existing != runtime_id);
+        self.ui.remove_session_conversation(runtime_id);
+    }
+
     fn apply_global_delivery_preferences(&self, runtime_id: u64, state: &SessionState) {
         let preferences = self.alerts.preferences();
         let desired = DeliveryModes::from(&preferences);
@@ -705,18 +891,29 @@ impl AppController {
         self.send_to_ready_runtimes(desired, |client| client.set_interrupt_mode(mode));
     }
 
-    fn spawn_runtime(self: &Rc<Self>, session_path: Option<&Path>) -> std::io::Result<u64> {
-        let bridge = OmpBridge::spawn_for_session(session_path)?;
+    fn spawn_runtime(
+        self: &Rc<Self>,
+        session_path: Option<&Path>,
+        workspace: Option<&Path>,
+    ) -> std::io::Result<u64> {
+        let bridge = OmpBridge::spawn_for_session(session_path, workspace)?;
         let events = bridge.events.clone();
         let runtime_id = self.next_runtime_id.get();
         self.next_runtime_id.set(runtime_id + 1);
+        let workspace = session_path
+            .and_then(|path| session_catalog::session_entry(Some(path), "", false, None).cwd)
+            .or_else(|| workspace.map(Path::to_owned))
+            .or_else(|| std::env::current_dir().ok());
         self.runtimes.borrow_mut().insert(
             runtime_id,
             SessionRuntime {
                 bridge,
                 running: false,
                 ready: false,
+                disconnected: None,
                 delivery_target: None,
+                workspace,
+                state: None,
             },
         );
         Self::run_event_loop(self, runtime_id, events);
@@ -727,7 +924,13 @@ impl AppController {
         if let Some(runtime) = self.runtimes.borrow_mut().get_mut(&runtime_id) {
             runtime.ready = true;
             runtime.running = state.is_streaming;
+            runtime.state = Some(state.clone());
         }
+        let fallback_workspace = self
+            .runtimes
+            .borrow()
+            .get(&runtime_id)
+            .and_then(|runtime| runtime.workspace.clone());
         self.apply_global_delivery_preferences(runtime_id, &state);
         let path = state.session_file.as_deref().map(PathBuf::from);
         let disk_title = path
@@ -746,9 +949,18 @@ impl AppController {
         );
         let title =
             session_catalog::authoritative_title(Some(&resolved), Some(entry.title.as_str()));
-        let mut refreshed = session_catalog::session_entry(path.as_deref(), &title, false);
+        let mut refreshed = session_catalog::session_entry(
+            path.as_deref(),
+            &title,
+            false,
+            fallback_workspace.as_deref(),
+        );
         refreshed.runtime_id = Some(runtime_id);
+        refreshed.created_at = entry.created_at;
         refreshed.running = state.is_streaming;
+        if let Some(runtime) = self.runtimes.borrow_mut().get_mut(&runtime_id) {
+            runtime.workspace = refreshed.cwd.clone();
+        }
         *entry = refreshed;
     }
 
@@ -758,12 +970,14 @@ impl AppController {
                 if let Some(runtime) = self.runtimes.borrow_mut().get_mut(&runtime_id) {
                     runtime.ready = true;
                     runtime.delivery_target = None;
+                    runtime.disconnected = None;
                 }
             }
-            RpcEvent::Disconnected(_) => {
+            RpcEvent::Disconnected(message) => {
                 if let Some(runtime) = self.runtimes.borrow_mut().get_mut(&runtime_id) {
                     runtime.ready = false;
                     runtime.delivery_target = None;
+                    runtime.disconnected = Some(message.clone());
                 }
             }
             RpcEvent::Response(response)
@@ -789,6 +1003,22 @@ impl AppController {
             return;
         }
 
+        let was_running = self
+            .runtimes
+            .borrow()
+            .get(&runtime_id)
+            .is_some_and(|runtime| runtime.running);
+        if matches!(event, RpcEvent::AgentEnd)
+            && completion_is_unread(
+                was_running,
+                self.active_runtime.get(),
+                runtime_id,
+                self.ui.window.is_active(),
+            )
+        {
+            self.unread_runtimes.borrow_mut().insert(runtime_id);
+        }
+
         let running = match &event {
             RpcEvent::AgentStart => Some(true),
             RpcEvent::AgentEnd | RpcEvent::Disconnected(_) => Some(false),
@@ -803,6 +1033,22 @@ impl AppController {
                     entry.running = running;
                 }
             }
+        }
+
+        if self.active_runtime.get() != Some(runtime_id)
+            && matches!(
+                event,
+                RpcEvent::MessageStart(_)
+                    | RpcEvent::TextDelta(_)
+                    | RpcEvent::ThinkingDelta(_)
+                    | RpcEvent::MessageEnd(_)
+                    | RpcEvent::ToolStart(_)
+                    | RpcEvent::ToolUpdate(_)
+                    | RpcEvent::ToolEnd(_)
+            )
+            && let Some(conversation) = self.conversation_views.borrow_mut().get_mut(&runtime_id)
+        {
+            conversation.hydrated = false;
         }
 
         if self.active_runtime.get() != Some(runtime_id) {
@@ -832,6 +1078,7 @@ impl AppController {
                 || matches!(event, RpcEvent::Response(_) | RpcEvent::SessionInfo { .. })
             {
                 self.render_session_sidebar(self.active_sessions.borrow().clone());
+                self.update_activity_counts();
             }
             return;
         }
@@ -859,6 +1106,7 @@ impl AppController {
             RpcEvent::ThinkingDelta(delta) => self.append_thinking_delta(&delta),
             RpcEvent::MessageEnd(message) => self.message_ended(&message),
             RpcEvent::AgentStart => {
+                self.finish_active_tool_group();
                 self.running.set(true);
                 self.goal_completed_this_run.set(false);
                 self.goal_completion_calls.borrow_mut().clear();
@@ -874,7 +1122,9 @@ impl AppController {
                 self.last_task_progress.set(None);
                 if let Some(thinking) = self.streaming_thinking.borrow_mut().take() {
                     thinking.finish(None);
+                    self.refresh_active_activity_summary();
                 }
+                self.finish_active_tool_group();
                 self.streaming_message.borrow_mut().take();
                 self.ui.chat_status.idle();
                 let goal_completed = self.goal_completed_this_run.get();
@@ -895,14 +1145,12 @@ impl AppController {
             }
             RpcEvent::ToolStart(tool) => self.tool_started(tool),
             RpcEvent::ToolUpdate(tool) => self.tool_updated(tool),
-            RpcEvent::ToolEnd(tool) => self.tool_ended(tool),
+            RpcEvent::ToolEnd(tool) => self.tool_ended(tool, ToolResultSource::Live),
             RpcEvent::Subagent(update) => self.subagent_updated(update),
             RpcEvent::CommandOutput(text) => {
                 if !text.is_empty() {
                     self.remove_empty_state();
-                    self.ui
-                        .conversation
-                        .append_message(MessageRole::Assistant, &text);
+                    self.append_grouped_notice(&text, false);
                     self.scroll_to_bottom();
                 }
             }
@@ -924,7 +1172,7 @@ impl AppController {
             }
             RpcEvent::Notice { level, message } => {
                 self.ui
-                    .conversation
+                    .conversation()
                     .append_notice(&message, level == "error");
                 self.scroll_to_bottom();
             }
@@ -983,10 +1231,6 @@ impl AppController {
                 .error
                 .as_deref()
                 .unwrap_or("omp rejected the request");
-            if response.command == "set_todos" {
-                self.ui.todos.set_pending(false);
-                self.ui.todos.set_error(Some(error));
-            }
             match response.command.as_str() {
                 "get_branch_messages" | "branch" => {
                     self.branch_busy.set(false);
@@ -1024,7 +1268,6 @@ impl AppController {
         }
         let Some(data) = response.data else {
             match response.command.as_str() {
-                "set_todos" => self.reject_todo_reconciliation("omp returned no todo state."),
                 "get_branch_messages" | "branch" => {
                     self.branch_busy.set(false);
                     if let Some(picker) = self.branch_picker.borrow().as_ref() {
@@ -1134,14 +1377,43 @@ impl AppController {
                 }
             }
             "get_messages" => {
-                let messages = data
+                let mut messages = data
                     .get("messages")
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default();
-                self.hydrate_messages(&messages);
+                if let Some(persisted) = self
+                    .current_session_file
+                    .borrow()
+                    .as_deref()
+                    .and_then(|path| session_catalog::read_session_messages(path).ok())
+                    .filter(|persisted| persisted.len() > messages.len())
+                {
+                    messages = persisted;
+                }
+                let runtime_id = self.active_runtime.get();
+                let should_hydrate = runtime_id.is_none_or(|runtime_id| {
+                    let conversations = self.conversation_views.borrow();
+                    let Some(conversation) = conversations.get(&runtime_id) else {
+                        return true;
+                    };
+                    messages_need_hydration(
+                        conversation.messages.as_deref(),
+                        conversation.hydrated,
+                        &messages,
+                    )
+                });
+                if should_hydrate {
+                    self.hydrate_messages(&messages);
+                }
+                if let Some(runtime_id) = runtime_id
+                    && let Some(conversation) =
+                        self.conversation_views.borrow_mut().get_mut(&runtime_id)
+                {
+                    conversation.messages = Some(messages);
+                }
                 if let Some(notice) = self.pending_session_notice.borrow_mut().take() {
-                    self.ui.conversation.append_notice(&notice, false);
+                    self.ui.conversation().append_notice(&notice, false);
                     self.scroll_to_bottom();
                 }
             }
@@ -1168,12 +1440,6 @@ impl AppController {
                     self.pending_user_messages.borrow_mut().pop_front();
                 }
             }
-            "set_todos" => match serde_json::from_value::<SetTodosResponse>(data) {
-                Ok(response) => self.reconcile_todos(response.todo_phases),
-                Err(error) => self.reject_todo_reconciliation(&format!(
-                    "omp returned invalid todo state: {error}"
-                )),
-            },
             "set_session_name" => self.refresh_after_session_change(),
             _ => {}
         }
@@ -1218,7 +1484,9 @@ impl AppController {
         self.clear_messages();
         self.clear_subagents();
         self.ui.chat_status.activity(activity);
-        self.ui.conversation.append_notice(notice, false);
+        self.ui
+            .conversation()
+            .show_loading(activity, notice, "Syncing conversation state");
         self.update_send_state();
         self.refresh_after_session_change();
     }
@@ -1243,7 +1511,7 @@ impl AppController {
         self.remove_empty_state();
         if !submission.message.is_empty() {
             self.ui
-                .conversation
+                .conversation()
                 .append_message(MessageRole::User, &submission.message);
         }
         if self.ui.composer.text() == submission.draft_text {
@@ -1275,15 +1543,44 @@ impl AppController {
         }
     }
 
+    fn render_workspace(&self, cwd: Option<&Path>) {
+        if let Some(cwd) = cwd {
+            self.ui.telemetry.cwd.set_text(&compact_path(cwd));
+            self.ui
+                .telemetry
+                .cwd
+                .set_tooltip_text(Some(&cwd.to_string_lossy()));
+        } else {
+            self.ui.telemetry.cwd.set_text("No workspace");
+            self.ui.telemetry.cwd.set_tooltip_text(None);
+        }
+    }
+
+    fn current_workspace(&self) -> Option<PathBuf> {
+        self.active_runtime
+            .get()
+            .and_then(|runtime_id| {
+                self.runtimes
+                    .borrow()
+                    .get(&runtime_id)
+                    .and_then(|runtime| runtime.workspace.clone())
+            })
+            .or_else(|| std::env::current_dir().ok())
+    }
+
     fn apply_state(self: &Rc<Self>, state: SessionState) {
         self.ready.set(true);
         self.running.set(state.is_streaming);
+        if let Some(group) = self.active_tool_group.borrow().as_ref() {
+            group.set_working(state.is_streaming);
+        }
         let runtime_id = self.active_runtime.get();
         if let Some(runtime_id) = runtime_id
             && let Some(runtime) = self.runtimes.borrow_mut().get_mut(&runtime_id)
         {
             runtime.ready = true;
             runtime.running = state.is_streaming;
+            runtime.state = Some(state.clone());
         }
         self.ui.composer.set_input_sensitive(true);
         self.queued_message_count.set(state.queued_message_count);
@@ -1307,17 +1604,20 @@ impl AppController {
             Some(&self.current_session_title.borrow()),
         );
         self.set_session_title(&title);
-        let current_entry = session_catalog::session_entry(session_file.as_deref(), &title, true);
-        if let Some(cwd) = current_entry.cwd.as_deref() {
-            self.ui.telemetry.cwd.set_text(&compact_path(cwd));
-            self.ui
-                .telemetry
-                .cwd
-                .set_tooltip_text(Some(&cwd.to_string_lossy()));
-        } else {
-            self.ui.telemetry.cwd.set_text("No workspace");
-            self.ui.telemetry.cwd.set_tooltip_text(None);
+        let fallback_workspace = runtime_id
+            .and_then(|runtime_id| self.runtimes.borrow().get(&runtime_id)?.workspace.clone());
+        let current_entry = session_catalog::session_entry(
+            session_file.as_deref(),
+            &title,
+            true,
+            fallback_workspace.as_deref(),
+        );
+        if let Some(runtime_id) = runtime_id
+            && let Some(runtime) = self.runtimes.borrow_mut().get_mut(&runtime_id)
+        {
+            runtime.workspace = current_entry.cwd.clone();
         }
+        self.render_workspace(current_entry.cwd.as_deref());
 
         let mut model_window = 0;
         if let Some(model) = state.model {
@@ -1369,222 +1669,13 @@ impl AppController {
             self.reject_todo_reconciliation(&format!("omp returned invalid todo state: {error}"));
             return;
         }
-        self.todo_phases.replace(phases.clone());
         self.ui.todos.set_phases(&phases);
-        self.ui.todos.set_pending(false);
         self.ui.todos.set_error(None);
     }
 
     fn reject_todo_reconciliation(&self, message: &str) {
-        self.ui.todos.set_pending(false);
         self.ui.todos.set_error(Some(message));
         self.show_error(message);
-    }
-
-    fn handle_todo_action(self: &Rc<Self>, action: TodoAction) {
-        match action {
-            TodoAction::AddPhase => self.present_add_todo_phase_dialog(),
-            TodoAction::AddTask { phase } => self.present_add_todo_task_dialog(phase),
-            TodoAction::Start { phase, task } => {
-                self.submit_todo_edit(TodoEdit::Start { phase, task });
-            }
-            TodoAction::Complete { phase, task } => {
-                self.submit_todo_edit(TodoEdit::Complete { phase, task });
-            }
-            TodoAction::Drop { phase, task } => {
-                self.submit_todo_edit(TodoEdit::Drop { phase, task });
-            }
-            TodoAction::Block { phase, task } => {
-                self.present_block_todo_dialog(phase, task);
-            }
-            TodoAction::Unblock { phase, task } => {
-                self.submit_todo_edit(TodoEdit::Unblock { phase, task });
-            }
-            TodoAction::Remove { phase, task } => {
-                self.submit_todo_edit(TodoEdit::Remove { phase, task });
-            }
-            TodoAction::Clear => self.present_clear_todos_dialog(),
-        }
-    }
-
-    fn submit_todo_edit(&self, edit: TodoEdit) {
-        let next = match apply_edit(&self.todo_phases.borrow(), edit) {
-            Ok(next) => next,
-            Err(error) => {
-                self.ui.todos.set_error(Some(&error));
-                return;
-            }
-        };
-        let Some(client) = self.active_client() else {
-            let error = "omp bridge is not running";
-            self.ui.todos.set_error(Some(error));
-            self.show_error(error);
-            return;
-        };
-        self.ui.todos.set_error(None);
-        match client.set_todos(&next) {
-            Ok(()) => self.ui.todos.set_pending(true),
-            Err(error) => {
-                self.ui.todos.set_pending(false);
-                self.ui.todos.set_error(Some(&error.to_string()));
-                self.show_error(&error.to_string());
-            }
-        }
-    }
-
-    fn present_add_todo_phase_dialog(self: &Rc<Self>) {
-        let phase_name = gtk::Entry::new();
-        phase_name.set_placeholder_text(Some("Phase name"));
-        phase_name.set_max_length(160);
-        let task_content = gtk::Entry::new();
-        task_content.set_placeholder_text(Some("First task"));
-        task_content.set_max_length(2_000);
-        task_content.set_activates_default(true);
-        let form = todo_form(&[("_Phase name", &phase_name), ("_First task", &task_content)]);
-        let dialog = adw::AlertDialog::builder()
-            .heading("Add todo phase")
-            .body("Add the first task now; more tasks can be appended from the phase.")
-            .extra_child(&form)
-            .build();
-        dialog.add_responses(&[("cancel", "Cancel"), ("add", "Add phase")]);
-        dialog.set_default_response(Some("add"));
-        dialog.set_close_response("cancel");
-        dialog.set_response_appearance("add", adw::ResponseAppearance::Suggested);
-        let weak = Rc::downgrade(self);
-        dialog.connect_response(None, move |_, response| {
-            if response != "add" {
-                return;
-            }
-            let Some(controller) = weak.upgrade() else {
-                return;
-            };
-            let phase = phase_name.text().trim().to_owned();
-            let content = task_content.text().trim().to_owned();
-            let confirmed = controller.todo_phases.borrow();
-            if !confirmed.is_empty() && confirmed.iter().any(|candidate| candidate.name == phase) {
-                drop(confirmed);
-                controller
-                    .ui
-                    .todos
-                    .set_error(Some("A phase with that name already exists."));
-                return;
-            }
-            let empty = confirmed.is_empty();
-            drop(confirmed);
-            if empty {
-                controller.submit_todo_edit(TodoEdit::Initialize(vec![TodoPhase {
-                    name: phase,
-                    tasks: vec![TodoItem {
-                        content,
-                        status: TodoStatus::Pending,
-                        blocker: None,
-                    }],
-                }]));
-            } else {
-                controller.submit_todo_edit(TodoEdit::Append { phase, content });
-            }
-        });
-        dialog.present(Some(&self.ui.window));
-    }
-
-    fn present_add_todo_task_dialog(self: &Rc<Self>, phase_index: usize) {
-        let Some(phase_name) = self
-            .todo_phases
-            .borrow()
-            .get(phase_index)
-            .map(|phase| phase.name.clone())
-        else {
-            self.ui
-                .todos
-                .set_error(Some("That todo phase no longer exists."));
-            return;
-        };
-        let content = gtk::Entry::new();
-        content.set_placeholder_text(Some("Task description"));
-        content.set_max_length(2_000);
-        content.set_activates_default(true);
-        let form = todo_form(&[("_Task", &content)]);
-        let dialog = adw::AlertDialog::builder()
-            .heading(format!("Add task to {phase_name}"))
-            .body("The task will be appended after the existing tasks in this phase.")
-            .extra_child(&form)
-            .build();
-        dialog.add_responses(&[("cancel", "Cancel"), ("add", "Add task")]);
-        dialog.set_default_response(Some("add"));
-        dialog.set_close_response("cancel");
-        dialog.set_response_appearance("add", adw::ResponseAppearance::Suggested);
-        let weak = Rc::downgrade(self);
-        dialog.connect_response(None, move |_, response| {
-            if response == "add"
-                && let Some(controller) = weak.upgrade()
-            {
-                controller.submit_todo_edit(TodoEdit::Append {
-                    phase: phase_name.clone(),
-                    content: content.text().trim().to_owned(),
-                });
-            }
-        });
-        dialog.present(Some(&self.ui.window));
-    }
-
-    fn present_block_todo_dialog(self: &Rc<Self>, phase: usize, task: usize) {
-        let Some(content) = self
-            .todo_phases
-            .borrow()
-            .get(phase)
-            .and_then(|phase| phase.tasks.get(task))
-            .map(|task| task.content.clone())
-        else {
-            self.ui.todos.set_error(Some("That todo no longer exists."));
-            return;
-        };
-        let blocker = gtk::Entry::new();
-        blocker.set_placeholder_text(Some("Optional reason"));
-        blocker.set_max_length(2_000);
-        blocker.set_activates_default(true);
-        let form = todo_form(&[("_Blocked by", &blocker)]);
-        let dialog = adw::AlertDialog::builder()
-            .heading("Block todo")
-            .body(format!("Mark “{content}” as blocked."))
-            .extra_child(&form)
-            .build();
-        dialog.add_responses(&[("cancel", "Cancel"), ("block", "Block")]);
-        dialog.set_default_response(Some("block"));
-        dialog.set_close_response("cancel");
-        dialog.set_response_appearance("block", adw::ResponseAppearance::Suggested);
-        let weak = Rc::downgrade(self);
-        dialog.connect_response(None, move |_, response| {
-            if response == "block"
-                && let Some(controller) = weak.upgrade()
-            {
-                controller.submit_todo_edit(TodoEdit::Block {
-                    phase,
-                    task,
-                    blocker: Some(blocker.text().to_string()),
-                });
-            }
-        });
-        dialog.present(Some(&self.ui.window));
-    }
-
-    fn present_clear_todos_dialog(self: &Rc<Self>) {
-        let dialog = adw::AlertDialog::builder()
-            .heading("Clear all todos?")
-            .body("This removes every phase and task from the current session.")
-            .build();
-        dialog.add_responses(&[("cancel", "Cancel"), ("clear", "Clear todos")]);
-        dialog.set_default_response(Some("cancel"));
-        dialog.set_close_response("cancel");
-        dialog.set_response_appearance("clear", adw::ResponseAppearance::Destructive);
-        let weak = Rc::downgrade(self);
-        dialog.connect_response(None, move |_, response| {
-            if response == "clear"
-                && let Some(controller) = weak.upgrade()
-            {
-                controller.submit_todo_edit(TodoEdit::Clear);
-            }
-        });
-        dialog.present(Some(&self.ui.window));
     }
 
     fn set_session_title(&self, title: &str) {
@@ -1626,6 +1717,7 @@ impl AppController {
                         &entry.title
                     },
                     current,
+                    entry.cwd.as_deref(),
                 );
                 refreshed.title = session_catalog::authoritative_title(
                     Some(&refreshed.title),
@@ -1637,6 +1729,7 @@ impl AppController {
                 );
                 refreshed.runtime_id = entry.runtime_id;
                 refreshed.running = entry.running;
+                refreshed.created_at = entry.created_at;
                 refreshed
             })
             .collect::<Vec<_>>();
@@ -1662,24 +1755,22 @@ impl AppController {
                     .map(|runtime| runtime.running)
             })
             .unwrap_or(false);
+        let fallback_workspace = runtime_id.and_then(|runtime_id| {
+            self.runtimes
+                .borrow()
+                .get(&runtime_id)
+                .and_then(|runtime| runtime.workspace.clone())
+        });
         let mut current = session_catalog::session_entry(
             self.current_session_file.borrow().as_deref(),
             &self.current_session_title.borrow(),
             true,
+            fallback_workspace.as_deref(),
         );
         current.runtime_id = runtime_id;
         current.running = running;
         let mut entries = self.active_sessions.borrow_mut();
-        for entry in entries.iter_mut() {
-            entry.current = false;
-        }
-        if let Some(position) = entries
-            .iter()
-            .position(|entry| entry.runtime_id == runtime_id)
-        {
-            entries.remove(position);
-        }
-        entries.insert(0, current);
+        update_current_session(&mut entries, current);
         let rendered = entries.clone();
         drop(entries);
         self.render_session_sidebar(rendered);
@@ -1693,6 +1784,22 @@ impl AppController {
         for entry in entries {
             let session = sidebar::session_row(entry);
             session.open_action.set_sensitive(!session.entry.current);
+            if let Some(target_runtime_id) = session.entry.runtime_id {
+                let weak = Rc::downgrade(self);
+                sidebar::make_session_draggable(
+                    &session.row,
+                    target_runtime_id,
+                    move |source_runtime_id, insert_after| {
+                        if let Some(controller) = weak.upgrade() {
+                            controller.reorder_session(
+                                source_runtime_id,
+                                target_runtime_id,
+                                insert_after,
+                            );
+                        }
+                    },
+                );
+            }
             let open_entry = session.entry.clone();
             let weak = Rc::downgrade(self);
             session.open_action.connect_clicked(move |_| {
@@ -1728,6 +1835,26 @@ impl AppController {
             self.session_rows.borrow_mut().push(session);
         }
         self.update_activity_counts();
+    }
+
+    fn reorder_session(
+        self: &Rc<Self>,
+        source_runtime_id: u64,
+        target_runtime_id: u64,
+        insert_after: bool,
+    ) {
+        let mut entries = self.active_sessions.borrow_mut();
+        if !reorder_session_entries(
+            &mut entries,
+            source_runtime_id,
+            target_runtime_id,
+            insert_after,
+        ) {
+            return;
+        }
+        let rendered = entries.clone();
+        drop(entries);
+        self.render_session_sidebar(rendered);
     }
 
     fn present_image_picker(self: &Rc<Self>) {
@@ -1861,13 +1988,22 @@ impl AppController {
         image: crate::bridge::protocol::ImageContent,
         bytes: Vec<u8>,
     ) {
-        let texture = match gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)) {
-            Ok(texture) => texture,
+        let bytes = glib::Bytes::from_owned(bytes);
+        let stream = gio::MemoryInputStream::from_bytes(&bytes);
+        let preview = match gdk_pixbuf::Pixbuf::from_stream_at_scale(
+            &stream,
+            76,
+            64,
+            true,
+            None::<&gio::Cancellable>,
+        ) {
+            Ok(preview) => preview,
             Err(error) => {
                 self.show_error(&format!("Could not preview {name}: {error}"));
                 return;
             }
         };
+        let texture = composer::texture_from_pixbuf(&preview);
         let id = self.attachments.borrow_mut().add(&name, image);
         let weak = Rc::downgrade(self);
         self.ui
@@ -1892,13 +2028,7 @@ impl AppController {
             return;
         }
 
-        let current_workspace = session_catalog::session_entry(
-            self.current_session_file.borrow().as_deref(),
-            &self.current_session_title.borrow(),
-            true,
-        )
-        .cwd
-        .or_else(|| std::env::current_dir().ok());
+        let current_workspace = self.current_workspace();
         let dialog = gtk::FileDialog::builder()
             .title("Select workspace")
             .modal(true)
@@ -1922,17 +2052,36 @@ impl AppController {
                     controller.show_error("Only local workspace directories are supported");
                     return;
                 };
-                if current_workspace.as_deref() == Some(path.as_path()) {
-                    return;
-                }
-                let Some(client) = controller.active_client() else {
-                    return;
-                };
-                if let Err(error) = client.move_session(&path) {
-                    controller.show_error(&error.to_string());
-                }
+                controller.move_current_session_to(&path);
             },
         );
+    }
+
+    fn move_current_session_to(self: &Rc<Self>, path: &Path) {
+        if !self.ready.get()
+            || self.running.get()
+            || self.current_workspace().as_deref() == Some(path)
+        {
+            return;
+        }
+        let Some(client) = self.active_client() else {
+            return;
+        };
+        match client.move_session(path) {
+            Ok(()) => {
+                if let Some(runtime_id) = self.active_runtime.get()
+                    && let Some(runtime) = self.runtimes.borrow_mut().get_mut(&runtime_id)
+                {
+                    runtime.workspace = Some(path.to_owned());
+                }
+                self.render_workspace(Some(path));
+                self.refresh_session_sidebar();
+                if self.ui.conversation().is_empty() {
+                    self.show_empty_state();
+                }
+            }
+            Err(error) => self.show_error(&error.to_string()),
+        }
     }
 
     fn present_branch_picker(self: &Rc<Self>) {
@@ -2038,15 +2187,20 @@ impl AppController {
     }
 
     fn activate_runtime(self: &Rc<Self>, runtime_id: u64, entry: &SessionEntry) {
-        let Some((ready, running)) = self
-            .runtimes
-            .borrow()
-            .get(&runtime_id)
-            .map(|runtime| (runtime.ready, runtime.running))
+        let Some((ready, running, disconnected, cached_state)) =
+            self.runtimes.borrow().get(&runtime_id).map(|runtime| {
+                (
+                    runtime.ready,
+                    runtime.running,
+                    runtime.disconnected.clone(),
+                    runtime.state.clone(),
+                )
+            })
         else {
             return;
         };
         self.active_runtime.set(Some(runtime_id));
+        self.unread_runtimes.borrow_mut().remove(&runtime_id);
         self.ready.set(ready);
         self.running.set(running);
         self.branch_busy.set(false);
@@ -2054,19 +2208,33 @@ impl AppController {
         self.pending_submissions.borrow_mut().clear();
         self.current_session_file.replace(entry.path.clone());
         self.current_session_title.replace(entry.title.clone());
-        self.clear_messages();
+        self.reset_message_bindings();
+        let was_cached = self.show_runtime_conversation(runtime_id);
         self.clear_subagents();
         self.set_session_title(&entry.title);
+        if let Some(state) = cached_state {
+            self.apply_state(state);
+        }
         self.ui.composer.set_input_sensitive(ready);
-        self.ui.chat_status.activity("Opening conversation");
-        self.ui
-            .conversation
-            .append_notice("Loading conversation…", false);
-        self.refresh_session_sidebar();
-        if ready {
-            self.refresh_after_session_change();
+        if let Some(message) = disconnected {
+            self.set_window_status(WindowStatus::Disconnected);
+            self.ui.chat_status.disconnected();
+            self.ui.conversation().show_disconnected(&message);
+        } else {
+            self.ui.chat_status.activity("Opening conversation");
+            if !was_cached {
+                self.ui.conversation().show_loading(
+                    "Opening conversation",
+                    "Restoring messages, tools, and session state.",
+                    "Reading conversation history",
+                );
+            }
+            if ready {
+                self.refresh_after_session_change();
+            }
         }
         self.update_send_state();
+        self.update_activity_counts();
     }
 
     fn open_session(self: &Rc<Self>, entry: &SessionEntry) {
@@ -2080,13 +2248,13 @@ impl AppController {
         let Some(path) = entry.path.as_deref() else {
             return;
         };
-        match self.spawn_runtime(Some(path)) {
+        match self.spawn_runtime(Some(path), entry.cwd.as_deref()) {
             Ok(runtime_id) => {
                 let mut opened = entry.clone();
                 opened.runtime_id = Some(runtime_id);
                 opened.current = true;
                 opened.running = false;
-                self.active_sessions.borrow_mut().insert(0, opened.clone());
+                insert_session_by_creation(&mut self.active_sessions.borrow_mut(), opened.clone());
                 self.activate_runtime(runtime_id, &opened);
             }
             Err(error) => self.show_error(&format!("Could not start omp: {error}")),
@@ -2099,6 +2267,8 @@ impl AppController {
         }
         if let Some(runtime_id) = entry.runtime_id {
             self.runtimes.borrow_mut().remove(&runtime_id);
+            self.unread_runtimes.borrow_mut().remove(&runtime_id);
+            self.remove_runtime_conversation(runtime_id);
         }
         self.active_sessions
             .borrow_mut()
@@ -2111,10 +2281,11 @@ impl AppController {
             self.open_session(&next);
         } else if entry.current {
             self.active_runtime.set(None);
-            self.start_new_session();
+            self.start_new_session_in(entry.cwd.as_deref());
         } else {
             self.render_session_sidebar(self.active_sessions.borrow().clone());
         }
+        self.update_activity_counts();
     }
 
     fn present_delete_dialog(self: &Rc<Self>, entry: &SessionEntry) {
@@ -2146,10 +2317,12 @@ impl AppController {
                 }
                 if let Some(runtime_id) = previous_runtime {
                     controller.runtimes.borrow_mut().remove(&runtime_id);
+                    controller.unread_runtimes.borrow_mut().remove(&runtime_id);
                     controller
                         .active_sessions
                         .borrow_mut()
                         .retain(|entry| entry.runtime_id != Some(runtime_id));
+                    controller.remove_runtime_conversation(runtime_id);
                 }
                 controller.delete_closed_session(&path);
             } else {
@@ -2373,50 +2546,58 @@ impl AppController {
             match message_role(message) {
                 Some("user") => {
                     let text = message_text(message);
-                    if !text.is_empty() {
+                    if has_visible_text(&text) {
+                        self.finish_active_tool_group();
                         self.ui
-                            .conversation
+                            .conversation()
                             .append_message(MessageRole::User, &text);
                     }
                 }
                 Some("assistant") => {
                     let thinking = message_thinking(message);
-                    if !thinking.is_empty() {
-                        self.ui.conversation.append_thinking(&thinking, false);
-                    }
-                    let text = message_text(message);
-                    if !text.is_empty() {
-                        self.ui
-                            .conversation
-                            .append_message(MessageRole::Assistant, &text);
+                    if has_visible_text(&thinking) {
+                        self.append_grouped_thinking(&thinking, false);
                     }
                     for tool in message_tool_calls(message) {
-                        self.ensure_tool_card(&tool);
+                        self.ensure_grouped_tool(&tool);
+                    }
+                    let text = message_text(message);
+                    if has_visible_text(&text) {
+                        self.finish_active_tool_group();
+                        self.ui
+                            .conversation()
+                            .append_message(MessageRole::Assistant, &text);
                     }
                     cost += message_cost(message);
                 }
                 Some("toolResult") => {
                     if let Some((id, name, result, is_error)) = tool_result_parts(message) {
-                        self.tool_ended(ToolEnd {
-                            id,
-                            name,
-                            result,
-                            is_error,
-                        });
+                        self.tool_ended(
+                            ToolEnd {
+                                id,
+                                name,
+                                result,
+                                is_error,
+                            },
+                            ToolResultSource::History,
+                        );
                     }
                 }
                 Some("custom") | Some("developer") => {
                     let text = message_text(message);
-                    if !text.is_empty() {
-                        self.ui.conversation.append_notice(&text, false);
+                    if has_visible_text(&text) {
+                        self.append_grouped_notice(&text, false);
                     }
                 }
                 _ => {}
             }
         }
+        if should_finish_hydrated_tool_group(self.running.get()) {
+            self.finish_active_tool_group();
+        }
         self.session_cost.set(cost);
         self.ui.telemetry.set_cost(cost);
-        if self.ui.conversation.is_empty() {
+        if self.ui.conversation().is_empty() {
             self.show_empty_state();
         } else {
             self.remove_empty_state();
@@ -2424,6 +2605,11 @@ impl AppController {
         self.refresh_session_sidebar();
         self.scroll_to_bottom();
         self.update_send_state();
+        if let Some(runtime_id) = self.active_runtime.get()
+            && let Some(conversation) = self.conversation_views.borrow_mut().get_mut(&runtime_id)
+        {
+            conversation.hydrated = true;
+        }
     }
 
     fn message_started(&self, message: &Value) {
@@ -2433,6 +2619,10 @@ impl AppController {
         match message_role(message) {
             Some("user") => {
                 let text = message_text(message);
+                if !has_visible_text(&text) {
+                    return;
+                }
+                self.finish_active_tool_group();
                 let matches_pending = {
                     let mut pending = self.pending_user_messages.borrow_mut();
                     if let Some(index) = pending.iter().position(|pending| pending == &text) {
@@ -2442,9 +2632,9 @@ impl AppController {
                         false
                     }
                 };
-                if !matches_pending && !text.is_empty() {
+                if !matches_pending {
                     self.ui
-                        .conversation
+                        .conversation()
                         .append_message(MessageRole::User, &text);
                     self.scroll_to_bottom();
                 }
@@ -2452,17 +2642,18 @@ impl AppController {
             Some("assistant") => {
                 let thinking = message_thinking(message);
                 self.streaming_thinking.borrow_mut().take();
-                if !thinking.is_empty() {
+                if has_visible_text(&thinking) {
                     self.streaming_thinking
-                        .replace(Some(self.ui.conversation.append_thinking(&thinking, true)));
+                        .replace(Some(self.append_grouped_thinking(&thinking, true)));
                 }
                 let text = message_text(message);
                 self.streaming_message.borrow_mut().take();
-                if !text.is_empty() {
+                if has_visible_text(&text) {
+                    self.finish_active_tool_group();
                     let body = self
                         .ui
-                        .conversation
-                        .append_message(MessageRole::Assistant, &text);
+                        .conversation()
+                        .append_streaming_message(MessageRole::Assistant, &text);
                     self.streaming_message
                         .replace(Some(StreamingMessage { body, text }));
                     self.scroll_to_bottom();
@@ -2476,13 +2667,17 @@ impl AppController {
         if delta.is_empty() {
             return;
         }
-        self.remove_empty_state();
         let mut slot = self.streaming_message.borrow_mut();
+        if slot.is_none() && !has_visible_text(delta) {
+            return;
+        }
+        self.remove_empty_state();
         if slot.is_none() {
+            self.finish_active_tool_group();
             let body = self
                 .ui
-                .conversation
-                .append_message(MessageRole::Assistant, "");
+                .conversation()
+                .append_streaming_message(MessageRole::Assistant, "");
             *slot = Some(StreamingMessage {
                 body,
                 text: String::new(),
@@ -2490,7 +2685,7 @@ impl AppController {
         }
         let streaming = slot.as_mut().expect("streaming message exists");
         streaming.text.push_str(delta);
-        streaming.body.set_text(&streaming.text);
+        streaming.body.set_streaming_text(&streaming.text);
         drop(slot);
         self.scroll_to_bottom();
     }
@@ -2499,15 +2694,19 @@ impl AppController {
         if delta.is_empty() {
             return;
         }
+        let mut slot = self.streaming_thinking.borrow_mut();
+        if slot.is_none() && !has_visible_text(delta) {
+            return;
+        }
         self.remove_empty_state();
         self.ui.chat_status.activity("Reasoning");
-        let mut slot = self.streaming_thinking.borrow_mut();
         if slot.is_none() {
-            *slot = Some(self.ui.conversation.append_thinking("", true));
+            *slot = Some(self.append_grouped_thinking("", true));
         }
         slot.as_ref()
             .expect("streaming thinking exists")
             .append(delta);
+        self.refresh_active_activity_summary();
         drop(slot);
         self.scroll_to_bottom();
     }
@@ -2518,22 +2717,29 @@ impl AppController {
                 let final_thinking = message_thinking(message);
                 if let Some(thinking) = self.streaming_thinking.borrow_mut().take() {
                     thinking.finish(Some(&final_thinking));
-                } else if !final_thinking.is_empty() {
-                    self.ui.conversation.append_thinking(&final_thinking, false);
-                }
-                let final_text = message_text(message);
-                if let Some(mut streaming) = self.streaming_message.borrow_mut().take() {
-                    if !final_text.is_empty() && final_text != streaming.text {
-                        streaming.text = final_text;
-                        streaming.body.set_text(&streaming.text);
-                    }
-                } else if !final_text.is_empty() {
-                    self.ui
-                        .conversation
-                        .append_message(MessageRole::Assistant, &final_text);
+                    self.refresh_active_activity_summary();
+                } else if has_visible_text(&final_thinking) {
+                    self.append_grouped_thinking(&final_thinking, false);
                 }
                 for tool in message_tool_calls(message) {
-                    self.ensure_tool_card(&tool);
+                    self.ensure_grouped_tool(&tool);
+                }
+                let final_text = message_text(message);
+                let has_final_text = has_visible_text(&final_text);
+                if has_final_text {
+                    self.finish_active_tool_group();
+                }
+                if let Some(mut streaming) = self.streaming_message.borrow_mut().take() {
+                    if has_final_text {
+                        streaming.text = final_text;
+                    }
+                    if has_visible_text(&streaming.text) {
+                        streaming.body.set_text(&streaming.text);
+                    }
+                } else if has_final_text {
+                    self.ui
+                        .conversation()
+                        .append_message(MessageRole::Assistant, &final_text);
                 }
                 let cost = self.session_cost.get() + message_cost(message);
                 self.session_cost.set(cost);
@@ -2541,18 +2747,21 @@ impl AppController {
             }
             Some("toolResult") => {
                 if let Some((id, name, result, is_error)) = tool_result_parts(message) {
-                    self.tool_ended(ToolEnd {
-                        id,
-                        name,
-                        result,
-                        is_error,
-                    });
+                    self.tool_ended(
+                        ToolEnd {
+                            id,
+                            name,
+                            result,
+                            is_error,
+                        },
+                        ToolResultSource::Live,
+                    );
                 }
             }
             Some("custom") | Some("developer") => {
                 let text = message_text(message);
-                if !text.is_empty() {
-                    self.ui.conversation.append_notice(&text, false);
+                if has_visible_text(&text) {
+                    self.append_grouped_notice(&text, false);
                 }
             }
             _ => {}
@@ -2566,10 +2775,7 @@ impl AppController {
                 .borrow_mut()
                 .insert(tool.id.clone());
         }
-        let card = self.ensure_tool_card(&tool);
-        card.status.set_text("Running");
-        card.spinner.set_visible(true);
-        card.spinner.start();
+        let (_, card) = self.ensure_grouped_tool(&tool);
         self.ui
             .chat_status
             .activity(&format!("Using {}", card.title.text()));
@@ -2577,29 +2783,34 @@ impl AppController {
     }
 
     fn tool_updated(&self, tool: ToolUpdate) {
-        let existing = self.tool_cards.borrow().get(&tool.id).cloned();
-        let card = existing.unwrap_or_else(|| {
-            self.ensure_tool_card(&ToolStart {
+        let existing = self.tool_groups_by_call_id.borrow().get(&tool.id).cloned();
+        let group = existing.unwrap_or_else(|| {
+            self.ensure_grouped_tool(&ToolStart {
                 id: tool.id.clone(),
                 name: tool.name.clone(),
                 args: Value::Null,
                 intent: None,
             })
+            .0
         });
-        card.update_partial(&tool.partial_result);
+        group.update_partial(&tool.id, &tool.partial_result);
     }
 
-    fn tool_ended(&self, tool: ToolEnd) {
-        let existing = self.tool_cards.borrow().get(&tool.id).cloned();
-        let card = existing.unwrap_or_else(|| {
-            self.ensure_tool_card(&ToolStart {
+    fn tool_ended(&self, tool: ToolEnd, source: ToolResultSource) {
+        let existing = self.tool_groups_by_call_id.borrow().get(&tool.id).cloned();
+        let group = existing.unwrap_or_else(|| {
+            self.ensure_grouped_tool(&ToolStart {
                 id: tool.id.clone(),
                 name: tool.name.clone(),
                 args: Value::Null,
                 intent: None,
             })
+            .0
         });
-        card.complete(&tool.result, tool.is_error);
+        group.complete(&tool.id, &tool.result, tool.is_error);
+        if !source.applies_live_effects() {
+            return;
+        }
         if tool.is_error {
             self.alerts
                 .play(alerts::sound_event_for_error(&tool.result.to_string()));
@@ -2624,16 +2835,50 @@ impl AppController {
         self.scroll_to_bottom();
     }
 
-    fn ensure_tool_card(&self, tool: &ToolStart) -> ToolCard {
-        if let Some(card) = self.tool_cards.borrow().get(&tool.id) {
-            return card.clone();
+    fn active_activity_group(&self) -> ToolActivityGroup {
+        cloned_or_insert_with(&self.active_tool_group, || {
+            let group = ToolActivityGroup::new();
+            group.set_working(self.running.get());
+            self.ui.conversation().append(&group.root);
+            group
+        })
+    }
+
+    fn append_grouped_thinking(&self, text: &str, streaming: bool) -> ThinkingBlock {
+        let group = self.active_activity_group();
+        group.append_thinking(text, streaming)
+    }
+
+    fn append_grouped_notice(&self, text: &str, is_error: bool) {
+        let group = self.active_activity_group();
+        group.append_notice(text, is_error);
+    }
+
+    fn refresh_active_activity_summary(&self) {
+        if let Some(group) = self.active_tool_group.borrow().as_ref() {
+            group.refresh_summary();
         }
-        let card = ToolCard::new(&tool.name, &tool.args, tool.intent.as_deref());
-        self.ui.conversation.append(&card.root);
-        self.tool_cards
+    }
+
+    fn ensure_grouped_tool(&self, tool: &ToolStart) -> (ToolActivityGroup, ToolCard) {
+        if let Some(group) = self.tool_groups_by_call_id.borrow().get(&tool.id) {
+            let group = group.clone();
+            let card = group.ensure_card(&tool.id, &tool.name, &tool.args, tool.intent.as_deref());
+            return (group, card);
+        }
+
+        let group = self.active_activity_group();
+        let card = group.ensure_card(&tool.id, &tool.name, &tool.args, tool.intent.as_deref());
+        self.tool_groups_by_call_id
             .borrow_mut()
-            .insert(tool.id.clone(), card.clone());
-        card
+            .insert(tool.id.clone(), group.clone());
+        (group, card)
+    }
+
+    fn finish_active_tool_group(&self) {
+        if let Some(group) = self.active_tool_group.borrow_mut().take() {
+            group.finish();
+        }
     }
 
     fn subagent_updated(self: &Rc<Self>, update: SubagentUpdate) {
@@ -2718,7 +2963,7 @@ impl AppController {
         } else {
             self.active_subagent.borrow_mut().take();
             self.subagent_transcript.borrow_mut().take();
-            self.subagent_tool_cards.borrow_mut().clear();
+            self.clear_subagent_tool_groups();
             self.ui.agent_hub.show_placeholder();
         }
         self.update_activity_counts();
@@ -2736,9 +2981,7 @@ impl AppController {
         }
         self.ui.title.set_text("Agent Hub");
         self.ui.back_button.set_visible(true);
-        self.ui.session_actions_button.set_visible(false);
-        self.ui.branch_button.set_visible(false);
-        self.ui.handoff_button.set_visible(false);
+        self.ui.composer.set_session_actions_visible(false);
         self.ui.composer_clamp.set_visible(false);
         self.ui.content_stack.set_visible_child_name("agent-hub");
     }
@@ -2758,7 +3001,7 @@ impl AppController {
         }
 
         self.active_subagent.replace(Some(id.to_owned()));
-        self.subagent_tool_cards.borrow_mut().clear();
+        self.clear_subagent_tool_groups();
         self.ui.subagent_conversation.clear();
         self.ui.subagent_conversation.append_notice(
             &format!("Loading {}’s transcript…", agent.display_name()),
@@ -2859,7 +3102,7 @@ impl AppController {
         if clear_first {
             self.ui.subagent_conversation.clear();
             if replace {
-                self.subagent_tool_cards.borrow_mut().clear();
+                self.clear_subagent_tool_groups();
             }
         }
         if !messages.is_empty() {
@@ -2889,16 +3132,17 @@ impl AppController {
             transcript.pending_refresh = false;
         }
         self.ui.subagent_conversation.clear();
+        self.clear_subagent_tool_groups();
         self.ui.subagent_conversation.append_notice(error, true);
     }
 
     fn append_subagent_messages(&self, messages: &[Value]) {
-        let mut cards = self.subagent_tool_cards.borrow_mut();
         for message in messages {
             match message_role(message) {
                 Some("user") => {
                     let text = message_text(message);
-                    if !text.is_empty() {
+                    if has_visible_text(&text) {
+                        self.finish_subagent_tool_group();
                         self.ui
                             .subagent_conversation
                             .append_message(MessageRole::User, &text);
@@ -2906,42 +3150,120 @@ impl AppController {
                 }
                 Some("assistant") => {
                     let thinking = message_thinking(message);
-                    if !thinking.is_empty() {
-                        self.ui
-                            .subagent_conversation
-                            .append_thinking(&thinking, false);
+                    if has_visible_text(&thinking) {
+                        self.append_subagent_grouped_thinking(&thinking);
+                    }
+                    for tool in message_tool_calls(message) {
+                        self.ensure_subagent_grouped_tool(&tool);
                     }
                     let text = message_text(message);
-                    if !text.is_empty() {
+                    if has_visible_text(&text) {
+                        self.finish_subagent_tool_group();
                         self.ui
                             .subagent_conversation
                             .append_message(MessageRole::Assistant, &text);
                     }
-                    for tool in message_tool_calls(message) {
-                        let card = ToolCard::new(&tool.name, &tool.args, tool.intent.as_deref());
-                        self.ui.subagent_conversation.append(&card.root);
-                        cards.insert(tool.id, card);
-                    }
                 }
                 Some("toolResult") => {
                     if let Some((id, name, result, is_error)) = tool_result_parts(message) {
-                        let card = cards.entry(id).or_insert_with(|| {
-                            let card = ToolCard::new(&name, &Value::Null, None);
-                            self.ui.subagent_conversation.append(&card.root);
-                            card
+                        let existing = self
+                            .subagent_tool_groups_by_call_id
+                            .borrow()
+                            .get(&id)
+                            .cloned();
+                        let group = existing.unwrap_or_else(|| {
+                            self.ensure_subagent_grouped_tool(&ToolStart {
+                                id: id.clone(),
+                                name,
+                                args: Value::Null,
+                                intent: None,
+                            })
                         });
-                        card.complete(&result, is_error);
+                        group.complete(&id, &result, is_error);
+                    }
+                }
+                Some("custom") | Some("developer") => {
+                    let text = message_text(message);
+                    if has_visible_text(&text) {
+                        self.append_subagent_grouped_notice(&text, false);
                     }
                 }
                 _ => {}
             }
         }
+        let agent_active = self
+            .active_subagent
+            .borrow()
+            .as_deref()
+            .and_then(|id| {
+                self.agent_hub
+                    .borrow()
+                    .get(id)
+                    .map(|agent| agent.is_active())
+            })
+            .unwrap_or(false);
+        if !agent_active {
+            self.finish_subagent_tool_group();
+        }
+    }
+
+    fn active_subagent_activity_group(&self) -> ToolActivityGroup {
+        cloned_or_insert_with(&self.subagent_active_tool_group, || {
+            let working = self
+                .active_subagent
+                .borrow()
+                .as_deref()
+                .and_then(|id| {
+                    self.agent_hub
+                        .borrow()
+                        .get(id)
+                        .map(|agent| agent.is_active())
+                })
+                .unwrap_or(false);
+            let group = ToolActivityGroup::new();
+            group.set_working(working);
+            self.ui.subagent_conversation.append(&group.root);
+            group
+        })
+    }
+
+    fn append_subagent_grouped_thinking(&self, text: &str) {
+        let group = self.active_subagent_activity_group();
+        group.append_thinking(text, false);
+    }
+
+    fn append_subagent_grouped_notice(&self, text: &str, is_error: bool) {
+        let group = self.active_subagent_activity_group();
+        group.append_notice(text, is_error);
+    }
+
+    fn ensure_subagent_grouped_tool(&self, tool: &ToolStart) -> ToolActivityGroup {
+        if let Some(group) = self.subagent_tool_groups_by_call_id.borrow().get(&tool.id) {
+            return group.clone();
+        }
+        let group = self.active_subagent_activity_group();
+        group.ensure_card(&tool.id, &tool.name, &tool.args, tool.intent.as_deref());
+        self.subagent_tool_groups_by_call_id
+            .borrow_mut()
+            .insert(tool.id.clone(), group.clone());
+        group
+    }
+
+    fn finish_subagent_tool_group(&self) {
+        if let Some(group) = self.subagent_active_tool_group.borrow_mut().take() {
+            group.finish();
+        }
+    }
+
+    fn clear_subagent_tool_groups(&self) {
+        self.subagent_active_tool_group.borrow_mut().take();
+        self.subagent_tool_groups_by_call_id.borrow_mut().clear();
     }
 
     fn close_subagent_view(&self) {
         self.active_subagent.borrow_mut().take();
         self.subagent_transcript.borrow_mut().take();
-        self.subagent_tool_cards.borrow_mut().clear();
+        self.clear_subagent_tool_groups();
         self.ui.content_stack.set_visible_child_name("chat");
         self.ui.back_button.set_visible(false);
         self.ui.composer_clamp.set_visible(true);
@@ -2954,7 +3276,7 @@ impl AppController {
         self.agent_hub_rows.borrow_mut().clear();
         self.active_subagent.borrow_mut().take();
         self.subagent_transcript.borrow_mut().take();
-        self.subagent_tool_cards.borrow_mut().clear();
+        self.clear_subagent_tool_groups();
         self.ui.agent_hub.clear_rows();
         self.ui.agent_hub.set_counts(0, 0);
         self.ui.agent_hub.show_placeholder();
@@ -2985,12 +3307,54 @@ impl AppController {
             .values()
             .filter(|runtime| runtime.running)
             .count();
+        let unread_sessions = self.unread_runtimes.borrow().len();
         let active_items = active_agents + running_sessions;
-        self.ui.sidebar_activity_count.set_visible(active_items > 0);
         self.ui
             .sidebar_activity_count
-            .set_text(&format!("{active_items} active"));
+            .set_text(&format!("{running_sessions} active"));
+        self.ui
+            .sidebar_activity_count
+            .set_tooltip_text(Some(&format!(
+                "{running_sessions} active {}",
+                if running_sessions == 1 {
+                    "session"
+                } else {
+                    "sessions"
+                }
+            )));
+        if running_sessions > 0 {
+            self.ui.sidebar_activity_count.add_css_class("has-items");
+        } else {
+            self.ui.sidebar_activity_count.remove_css_class("has-items");
+        }
+        self.ui
+            .sidebar_unread_count
+            .set_text(&format!("{unread_sessions} unread"));
+        self.ui.sidebar_unread_count.set_tooltip_text(Some(&format!(
+            "{unread_sessions} unread {}",
+            if unread_sessions == 1 {
+                "session"
+            } else {
+                "sessions"
+            }
+        )));
+        if unread_sessions > 0 {
+            self.ui.sidebar_unread_count.add_css_class("has-items");
+        } else {
+            self.ui.sidebar_unread_count.remove_css_class("has-items");
+        }
+        let unread_runtimes = self.unread_runtimes.borrow();
         for session in self.session_rows.borrow().iter() {
+            let unread = session
+                .entry
+                .runtime_id
+                .is_some_and(|runtime_id| unread_runtimes.contains(&runtime_id));
+            if unread {
+                session.row.add_css_class("unread-session");
+            } else {
+                session.row.remove_css_class("unread-session");
+            }
+            session.indicator.queue_draw();
             if session.entry.current {
                 session.badge.set_visible(active_agents > 0);
                 session.badge.set_text(&active_agents.to_string());
@@ -3019,22 +3383,37 @@ impl AppController {
     }
 
     fn start_new_session(self: &Rc<Self>) {
+        let workspace = self.current_workspace();
+        self.start_new_session_in(workspace.as_deref());
+    }
+
+    fn start_new_session_in(self: &Rc<Self>, workspace: Option<&Path>) {
         if self.branch_busy.get() || self.handoff_busy.get() {
             return;
         }
-        match self.spawn_runtime(None) {
+        let workspace = workspace
+            .map(Path::to_owned)
+            .or_else(|| std::env::current_dir().ok());
+        match self.spawn_runtime(None, workspace.as_deref()) {
             Ok(runtime_id) => {
                 self.goal_completed_this_run.set(false);
                 self.goal_completion_calls.borrow_mut().clear();
                 self.current_session_file.borrow_mut().take();
-                let mut entry = session_catalog::session_entry(None, "New conversation", true);
+                let mut entry = session_catalog::session_entry(
+                    None,
+                    "New conversation",
+                    true,
+                    workspace.as_deref(),
+                );
                 entry.runtime_id = Some(runtime_id);
-                self.active_sessions.borrow_mut().insert(0, entry.clone());
+                insert_session_by_creation(&mut self.active_sessions.borrow_mut(), entry.clone());
                 self.activate_runtime(runtime_id, &entry);
                 self.ui.chat_status.activity("Starting conversation");
-                self.ui
-                    .conversation
-                    .append_notice("Starting a new conversation…", false);
+                self.ui.conversation().show_loading(
+                    "Creating a new conversation",
+                    "Preparing a fresh omp session in this workspace.",
+                    "Starting the local runtime",
+                );
             }
             Err(error) => self.show_error(&format!("Could not start omp: {error}")),
         }
@@ -3105,7 +3484,7 @@ impl AppController {
         session_actions_are_relevant(
             self.ready.get(),
             self.current_session_file.borrow().is_some(),
-            !self.ui.conversation.is_empty(),
+            !self.ui.conversation().is_empty(),
             self.running.get(),
             self.branch_busy.get() || self.handoff_busy.get(),
             self.active_subagent.borrow().is_some(),
@@ -3131,12 +3510,8 @@ impl AppController {
             .set_sensitive(ready && !running && !session_busy);
         let session_actions_available = self.session_actions_available();
         self.ui
-            .session_actions_button
-            .set_visible(session_actions_available);
-        self.ui.branch_button.set_visible(session_actions_available);
-        self.ui
-            .handoff_button
-            .set_visible(session_actions_available);
+            .composer
+            .set_session_actions_visible(session_actions_available);
     }
 
     fn update_completions(&self) {
@@ -3191,24 +3566,56 @@ impl AppController {
         self.ui.composer.hide_completions();
     }
 
-    fn clear_messages(&self) {
-        self.ui.conversation.clear();
+    fn reset_message_bindings(&self) {
         self.streaming_message.borrow_mut().take();
         self.streaming_thinking.borrow_mut().take();
-        self.tool_cards.borrow_mut().clear();
+        self.active_tool_group.borrow_mut().take();
+        self.tool_groups_by_call_id.borrow_mut().clear();
         self.pending_user_messages.borrow_mut().clear();
     }
 
-    fn show_empty_state(&self) {
-        self.ui.conversation.show_empty();
+    fn clear_messages(&self) {
+        self.ui.conversation().clear();
+        self.reset_message_bindings();
+        if let Some(runtime_id) = self.active_runtime.get()
+            && let Some(conversation) = self.conversation_views.borrow_mut().get_mut(&runtime_id)
+        {
+            conversation.hydrated = false;
+        }
+    }
+
+    fn show_empty_state(self: &Rc<Self>) {
+        let current_workspace = self.current_workspace();
+        let sessions =
+            session_catalog::discover_all_sessions(self.current_session_file.borrow().as_deref());
+        let recent_workspaces =
+            session_catalog::recent_workspaces(&sessions, current_workspace.as_deref(), 3);
+        let weak = Rc::downgrade(self);
+        let select_workspace = move |path: PathBuf| {
+            if let Some(controller) = weak.upgrade() {
+                controller.move_current_session_to(&path);
+            }
+        };
+        let weak = Rc::downgrade(self);
+        let browse = move || {
+            if let Some(controller) = weak.upgrade() {
+                controller.present_workspace_picker();
+            }
+        };
+        self.ui.conversation().show_workspace_onboarding(
+            &recent_workspaces,
+            current_workspace.as_deref(),
+            select_workspace,
+            browse,
+        );
     }
 
     fn remove_empty_state(&self) {
-        self.ui.conversation.hide_empty();
+        self.ui.conversation().hide_empty();
     }
 
     fn scroll_to_bottom(&self) {
-        self.ui.conversation.scroll_to_bottom();
+        self.ui.conversation().scroll_to_bottom();
     }
 
     fn tick_sound_events(&self) {
@@ -3244,8 +3651,12 @@ impl AppController {
 
     fn show_error(&self, message: &str) {
         self.alerts.play(alerts::sound_event_for_error(message));
-        self.ui.conversation.append_notice(message, true);
-        self.scroll_to_bottom();
+        if !self.ready.get() && self.ui.conversation().is_empty() {
+            self.ui.conversation().show_disconnected(message);
+        } else {
+            self.ui.conversation().append_notice(message, true);
+            self.scroll_to_bottom();
+        }
     }
     fn set_window_status(&self, status: WindowStatus) {
         self.window_status.set(status);
@@ -3476,7 +3887,7 @@ impl AppController {
                 if is_error {
                     self.alerts.play(alerts::sound_event_for_error(message));
                 }
-                self.ui.conversation.append_notice(message, is_error);
+                self.ui.conversation().append_notice(message, is_error);
             }
             "setTitle" => {
                 if let Some(title) = request.get("title").and_then(Value::as_str) {
@@ -3692,21 +4103,6 @@ impl AppController {
     }
 }
 
-fn todo_form(fields: &[(&str, &gtk::Entry)]) -> gtk::Box {
-    let form = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    for (label, entry) in fields {
-        let field = gtk::Box::new(gtk::Orientation::Vertical, 4);
-        let label = gtk::Label::with_mnemonic(label);
-        label.set_xalign(0.0);
-        label.set_mnemonic_widget(Some(*entry));
-        label.add_css_class("todo-dialog-label");
-        field.append(&label);
-        field.append(*entry);
-        form.append(&field);
-    }
-    form
-}
-
 fn completion_row(completion: &CommandCompletion) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
     let content = gtk::Box::new(gtk::Orientation::Vertical, 3);
@@ -3785,17 +4181,87 @@ async fn encode_image_in_background(
     .await
     .map_err(|_| "Image encoding task panicked".to_owned())?
 }
-
 #[cfg(test)]
 mod tests {
     use super::{
-        ComposerKeyAction, DeliveryModes, SubmissionAction, SubmissionIntent, composer_key_action,
-        delivery_preference_updates, gdk, session_actions_are_relevant,
-        should_send_delivery_preference_updates,
+        ComposerKeyAction, DeliveryModes, SubmissionAction, SubmissionIntent, ToolResultSource,
+        WARM_SESSION_VIEW_LIMIT, cloned_or_insert_with, completion_is_unread, composer_key_action,
+        delivery_preference_updates, gdk, has_visible_text, insert_session_by_creation,
+        messages_need_hydration, reorder_session_entries, session_actions_are_relevant,
+        should_finish_hydrated_tool_group, should_send_delivery_preference_updates,
+        touch_bounded_lru, update_current_session,
     };
     use crate::alerts::Preferences;
     use crate::bridge::protocol::{InterruptMode, QueueMode, SessionState};
+    use crate::session_catalog::{SessionEntry, session_entry};
     use serde_json::json;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn tabbing_back_to_streaming_session_keeps_rolling_tool_group_open() {
+        assert!(!should_finish_hydrated_tool_group(true));
+        assert!(should_finish_hydrated_tool_group(false));
+    }
+
+    #[test]
+    fn warm_session_cache_evicts_the_least_recently_viewed_session() {
+        let mut order = VecDeque::from([1, 2, 3, 4]);
+
+        assert!(touch_bounded_lru(&mut order, 2, WARM_SESSION_VIEW_LIMIT).is_empty());
+        assert_eq!(order, [1, 3, 4, 2]);
+        assert_eq!(
+            touch_bounded_lru(&mut order, 5, WARM_SESSION_VIEW_LIMIT),
+            [1]
+        );
+        assert_eq!(order, [3, 4, 2, 5]);
+    }
+
+    #[test]
+    fn unchanged_messages_keep_the_warm_view_intact() {
+        let messages = vec![json!({"role": "user", "content": "hello"})];
+
+        assert!(!messages_need_hydration(Some(&messages), true, &messages));
+        assert!(messages_need_hydration(Some(&messages), false, &messages));
+        assert!(messages_need_hydration(
+            Some(&messages),
+            true,
+            &[json!({"role": "assistant", "content": "updated"})],
+        ));
+    }
+
+    #[test]
+    fn whitespace_only_messages_do_not_split_tool_activity() {
+        assert!(!has_visible_text(""));
+        assert!(!has_visible_text(" \n\t"));
+        assert!(has_visible_text("\nResult ready\n"));
+    }
+
+    #[test]
+    fn completed_sessions_are_unread_until_viewed() {
+        assert!(completion_is_unread(true, Some(1), 2, true));
+        assert!(completion_is_unread(true, Some(1), 1, false));
+        assert!(!completion_is_unread(true, Some(1), 1, true));
+        assert!(!completion_is_unread(false, Some(1), 2, true));
+    }
+
+    #[test]
+    fn hydrated_tool_results_do_not_apply_live_completion_effects() {
+        assert!(!ToolResultSource::History.applies_live_effects());
+        assert!(ToolResultSource::Live.applies_live_effects());
+    }
+    #[test]
+    fn active_group_initializer_can_access_its_refcell() {
+        let slot = RefCell::new(None);
+        let value = cloned_or_insert_with(&slot, || {
+            assert!(slot.try_borrow_mut().is_ok());
+            42
+        });
+
+        assert_eq!(value, 42);
+        assert_eq!(*slot.borrow(), Some(42));
+    }
 
     #[test]
     fn composer_shortcuts_choose_delivery_without_persistent_view_state() {
@@ -3854,6 +4320,37 @@ mod tests {
     }
 
     #[test]
+    fn sessions_start_newest_first_and_focus_does_not_reorder_them() {
+        let mut entries = Vec::new();
+        insert_session_by_creation(&mut entries, test_session(1, 10, false));
+        insert_session_by_creation(&mut entries, test_session(3, 30, false));
+        insert_session_by_creation(&mut entries, test_session(2, 20, false));
+        assert_eq!(runtime_order(&entries), [3, 2, 1]);
+
+        update_current_session(&mut entries, test_session(1, 99, true));
+        assert_eq!(runtime_order(&entries), [3, 2, 1]);
+        assert!(entries[2].current);
+        assert_eq!(
+            entries[2].created_at,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn dragged_sessions_move_before_or_after_the_drop_target() {
+        let mut entries = vec![
+            test_session(3, 30, false),
+            test_session(2, 20, false),
+            test_session(1, 10, true),
+        ];
+
+        assert!(reorder_session_entries(&mut entries, 1, 3, false));
+        assert_eq!(runtime_order(&entries), [1, 3, 2]);
+        assert!(reorder_session_entries(&mut entries, 1, 2, true));
+        assert_eq!(runtime_order(&entries), [3, 2, 1]);
+    }
+
+    #[test]
     fn global_delivery_preferences_override_different_session_values_only() {
         let preferences: Preferences = serde_json::from_value(json!({
             "steering_mode": "all",
@@ -3881,5 +4378,19 @@ mod tests {
             desired,
             updates,
         ));
+    }
+
+    fn test_session(runtime_id: u64, created_at: u64, current: bool) -> SessionEntry {
+        let mut entry = session_entry(None, &format!("Session {runtime_id}"), current, None);
+        entry.runtime_id = Some(runtime_id);
+        entry.created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(created_at);
+        entry
+    }
+
+    fn runtime_order(entries: &[SessionEntry]) -> Vec<u64> {
+        entries
+            .iter()
+            .map(|entry| entry.runtime_id.expect("test session runtime"))
+            .collect()
     }
 }

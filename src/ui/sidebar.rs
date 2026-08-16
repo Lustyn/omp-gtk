@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -10,6 +9,12 @@ use libadwaita as adw;
 
 use super::icons;
 use crate::session_catalog::SessionEntry;
+
+const INDICATOR_CYCLE_MICROS: i64 = 2_400_000;
+
+fn indicator_gradient_phase(frame_time_micros: i64) -> f64 {
+    frame_time_micros.rem_euclid(INDICATOR_CYCLE_MICROS) as f64 / INDICATOR_CYCLE_MICROS as f64
+}
 
 #[derive(Clone)]
 pub struct SidebarWidgets {
@@ -20,12 +25,14 @@ pub struct SidebarWidgets {
     pub collapse: gtk::Button,
     pub preferences: gtk::Button,
     pub active_count: gtk::Label,
+    pub unread_count: gtk::Label,
 }
 
 #[derive(Clone)]
 pub struct SessionRow {
     pub row: gtk::ListBoxRow,
     pub badge: gtk::Label,
+    pub indicator: gtk::DrawingArea,
     pub open_action: gtk::Button,
     pub rename_action: gtk::Button,
     pub close_action: gtk::Button,
@@ -46,13 +53,22 @@ pub fn build() -> SidebarWidgets {
     brand_row.append(&icons::omp_logo(29));
     let brand_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     brand_spacer.set_hexpand(true);
-    let active_count = gtk::Label::new(None);
-    active_count.set_visible(false);
-    active_count.add_css_class("sidebar-activity-count");
+    let session_counts = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    session_counts.add_css_class("sidebar-session-counts");
+    let active_count = gtk::Label::new(Some("0 active"));
+    active_count.add_css_class("sidebar-session-count");
+    active_count.add_css_class("active");
+    active_count.set_tooltip_text(Some("No active sessions"));
+    let unread_count = gtk::Label::new(Some("0 unread"));
+    unread_count.add_css_class("sidebar-session-count");
+    unread_count.add_css_class("unread");
+    unread_count.set_tooltip_text(Some("No unread sessions"));
+    session_counts.append(&active_count);
+    session_counts.append(&unread_count);
     let collapse = icons::icon_button(icons::Icon::PanelLeftClose, "Collapse sidebar");
     collapse.add_css_class("sidebar-toggle");
     brand_row.append(&brand_spacer);
-    brand_row.append(&active_count);
+    brand_row.append(&session_counts);
     brand_row.append(&collapse);
     let brand_handle = gtk::WindowHandle::new();
     brand_handle.set_child(Some(&brand_row));
@@ -98,12 +114,12 @@ pub fn build() -> SidebarWidgets {
         .vexpand(true)
         .child(&list)
         .build();
-    let preferences = icons::labeled_button(icons::Icon::Settings, "Settings");
-    preferences.set_margin_top(8);
-    preferences.set_margin_bottom(12);
-    preferences.set_margin_start(12);
-    preferences.set_margin_end(12);
-    preferences.set_tooltip_text(Some("Configure notifications and sound packs"));
+    let preferences = icons::icon_button(icons::Icon::Settings, "Settings");
+    preferences.set_halign(gtk::Align::End);
+    preferences.set_margin_top(6);
+    preferences.set_margin_bottom(10);
+    preferences.set_margin_end(10);
+    preferences.set_tooltip_text(Some("Settings"));
     preferences.add_css_class("sidebar-preferences");
     sidebar.append(&brand_handle);
     sidebar.append(&new_chat);
@@ -119,6 +135,7 @@ pub fn build() -> SidebarWidgets {
         collapse,
         preferences,
         active_count,
+        unread_count,
     }
 }
 
@@ -221,6 +238,7 @@ pub fn session_row(entry: SessionEntry) -> SessionRow {
 
     SessionRow {
         row,
+        indicator,
         badge,
         open_action,
         rename_action,
@@ -230,8 +248,60 @@ pub fn session_row(entry: SessionEntry) -> SessionRow {
     }
 }
 
+pub fn make_session_draggable(
+    row: &gtk::ListBoxRow,
+    runtime_id: u64,
+    on_drop: impl Fn(u64, bool) + 'static,
+) {
+    let drag_source = gtk::DragSource::builder()
+        .actions(gdk::DragAction::MOVE)
+        .build();
+    drag_source.connect_prepare(move |_, _, _| {
+        Some(gdk::ContentProvider::for_value(&runtime_id.to_value()))
+    });
+    row.add_controller(drag_source);
+
+    let drop_target = gtk::DropTarget::new(u64::static_type(), gdk::DragAction::MOVE);
+    let row_for_motion = row.clone();
+    drop_target.connect_motion(move |_, _, y| {
+        let insert_after = y >= f64::from(row_for_motion.height()) / 2.0;
+        row_for_motion.remove_css_class(if insert_after {
+            "session-drop-before"
+        } else {
+            "session-drop-after"
+        });
+        row_for_motion.add_css_class(if insert_after {
+            "session-drop-after"
+        } else {
+            "session-drop-before"
+        });
+        gdk::DragAction::MOVE
+    });
+    let row_for_leave = row.clone();
+    drop_target.connect_leave(move |_| {
+        row_for_leave.remove_css_class("session-drop-before");
+        row_for_leave.remove_css_class("session-drop-after");
+    });
+    let row_for_drop = row.clone();
+    drop_target.connect_drop(move |_, value, _, y| {
+        row_for_drop.remove_css_class("session-drop-before");
+        row_for_drop.remove_css_class("session-drop-after");
+        let Ok(source_runtime_id) = value.get::<u64>() else {
+            return false;
+        };
+        if source_runtime_id == runtime_id {
+            return false;
+        }
+        let insert_after = y >= f64::from(row_for_drop.height()) / 2.0;
+        on_drop(source_runtime_id, insert_after);
+        true
+    });
+    row.add_controller(drop_target);
+}
+
 fn session_indicator(row: &gtk::ListBoxRow, current: bool, running: bool) -> gtk::DrawingArea {
-    const CYCLE_SECONDS: f64 = 2.4;
+    // Use GTK's stable frame timeline so rebuilding a row does not restart its
+    // gradient and make an unrelated render look like a jump.
     const PINK: (f64, f64, f64) = (
         0xed as f64 / 255.0,
         0x4a as f64 / 255.0,
@@ -257,8 +327,8 @@ fn session_indicator(row: &gtk::ListBoxRow, current: bool, running: bool) -> gtk
     indicator.set_content_width(3);
     indicator.add_css_class("session-indicator");
     let row = row.downgrade();
-    let started = Instant::now();
-    indicator.set_draw_func(move |_, context, width, height| {
+
+    indicator.set_draw_func(move |indicator, context, width, height| {
         if width <= 0 || height <= 0 {
             return;
         }
@@ -271,7 +341,9 @@ fn session_indicator(row: &gtk::ListBoxRow, current: bool, running: bool) -> gtk
         context.line_to(width / 2.0, height - stroke_width / 2.0);
 
         if running {
-            let phase = (started.elapsed().as_secs_f64() / CYCLE_SECONDS) % 1.0;
+            let phase = indicator
+                .frame_clock()
+                .map_or(0.0, |clock| indicator_gradient_phase(clock.frame_time()));
             let start = -phase * height;
             let gradient = gtk::cairo::LinearGradient::new(0.0, start, 0.0, start + height);
             gradient.add_color_stop_rgb(0.0, PINK.0, PINK.1, PINK.2);
@@ -282,6 +354,11 @@ fn session_indicator(row: &gtk::ListBoxRow, current: bool, running: bool) -> gtk
             let _ = context.set_source(&gradient);
         } else if current || row.upgrade().is_some_and(|row| row.is_selected()) {
             context.set_source_rgb(BLUE.0, BLUE.1, BLUE.2);
+        } else if row
+            .upgrade()
+            .is_some_and(|row| row.has_css_class("unread-session"))
+        {
+            context.set_source_rgb(PURPLE.0, PURPLE.1, PURPLE.2);
         } else {
             context.set_source_rgb(IDLE.0, IDLE.1, IDLE.2);
         }
@@ -289,11 +366,7 @@ fn session_indicator(row: &gtk::ListBoxRow, current: bool, running: bool) -> gtk
     });
 
     if running {
-        let indicator_weak = indicator.downgrade();
-        glib::timeout_add_local(Duration::from_millis(33), move || {
-            let Some(indicator) = indicator_weak.upgrade() else {
-                return glib::ControlFlow::Break;
-            };
+        indicator.add_tick_callback(|indicator, _| {
             indicator.queue_draw();
             glib::ControlFlow::Continue
         });
@@ -435,4 +508,19 @@ fn context_button(icon: icons::Icon, text: &str) -> gtk::Button {
     let button = icons::labeled_button(icon, text);
     button.add_css_class("context-action");
     button
+}
+#[cfg(test)]
+mod tests {
+    use super::{INDICATOR_CYCLE_MICROS, indicator_gradient_phase};
+
+    #[test]
+    fn indicator_gradient_phase_loops_on_the_frame_timeline() {
+        let quarter_cycle = INDICATOR_CYCLE_MICROS / 4;
+
+        assert_eq!(indicator_gradient_phase(quarter_cycle), 0.25);
+        assert_eq!(
+            indicator_gradient_phase(INDICATOR_CYCLE_MICROS + quarter_cycle),
+            0.25
+        );
+    }
 }

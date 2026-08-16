@@ -1,11 +1,17 @@
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gtk::prelude::*;
 use gtk::{gdk, glib};
 use gtk4 as gtk;
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use ratex_layout::{LayoutOptions, layout, to_display_list};
+use ratex_parser::parse as parse_latex;
+use ratex_svg::{SvgOptions, render_to_svg};
+use ratex_types::{Color, MathStyle};
 
 use super::icons;
 
@@ -45,6 +51,21 @@ pub struct TelemetryWidgets {
     pub context_progress: gtk::ProgressBar,
     pub cost: gtk::Label,
     pub throughput: gtk::Label,
+}
+
+#[derive(Clone)]
+pub struct ChatHero {
+    pub root: gtk::Box,
+    logo: gtk::Image,
+    title: gtk::Label,
+    detail: gtk::Label,
+    hint: gtk::Label,
+    workspace_choices: gtk::Box,
+    state_line: gtk::Box,
+    spinner: gtk::Spinner,
+    state_dot: gtk::Box,
+    state_label: gtk::Label,
+    animation_generation: Rc<Cell<u64>>,
 }
 
 impl ThinkingBlock {
@@ -112,6 +133,12 @@ impl ThinkingBlock {
         let summary = thinking_summary(&text);
         self.summary_text.replace(summary.clone());
         self.summary.set_text(&summary);
+    }
+    pub fn summary(&self) -> String {
+        self.summary_text.borrow().clone()
+    }
+    pub fn is_active(&self) -> bool {
+        self.active.get()
     }
 
     pub fn finish(&self, final_text: Option<&str>) {
@@ -308,15 +335,102 @@ struct ListState {
     first_item: bool,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum EmbeddedMarkdownContent {
+    InlineCode(String),
+    CodeBlock(String),
+    InlineMath(String),
+    DisplayMath(String),
+    Table(MarkdownTable),
+    Mermaid(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct EmbeddedMarkdown {
+    offset: i32,
+    content: EmbeddedMarkdownContent,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct MarkdownTable {
+    alignments: Vec<Alignment>,
+    rows: Vec<Vec<String>>,
+    header_rows: usize,
+}
+
+struct TableState {
+    table: MarkdownTable,
+}
+
+impl TableState {
+    fn new(alignments: Vec<Alignment>) -> Self {
+        Self {
+            table: MarkdownTable {
+                alignments,
+                rows: Vec::new(),
+                header_rows: 0,
+            },
+        }
+    }
+
+    fn start_row(&mut self) {
+        self.table.rows.push(Vec::new());
+    }
+
+    fn start_cell(&mut self) {
+        if self.table.rows.is_empty() {
+            self.start_row();
+        }
+        self.table
+            .rows
+            .last_mut()
+            .expect("table row exists")
+            .push(String::new());
+    }
+
+    fn append(&mut self, text: &str) {
+        if self.table.rows.last().is_none_or(|row| row.is_empty()) {
+            self.start_cell();
+        }
+        self.table
+            .rows
+            .last_mut()
+            .and_then(|row| row.last_mut())
+            .expect("table cell exists")
+            .push_str(text);
+    }
+}
+
+struct CodeBlockState {
+    language: Option<String>,
+    text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MarkdownLink {
+    start: i32,
+    end: i32,
+    destination: String,
+}
+
+struct RenderedMarkdown {
+    markup: String,
+    embedded: Vec<EmbeddedMarkdown>,
+    links: Vec<MarkdownLink>,
+}
+
 struct MarkdownRenderer {
     markup: String,
     lists: Vec<ListState>,
-    links: Vec<bool>,
+    active_links: Vec<Option<(i32, String)>>,
+    links: Vec<MarkdownLink>,
+    embedded: Vec<EmbeddedMarkdown>,
+    code_block: Option<CodeBlockState>,
+    table: Option<TableState>,
+    text_offset: i32,
     line_breaks: usize,
     after_block_marker: bool,
     quote_depth: usize,
-    table_cell: usize,
-    table_rows: usize,
 }
 
 impl MarkdownRenderer {
@@ -324,12 +438,15 @@ impl MarkdownRenderer {
         Self {
             markup: String::new(),
             lists: Vec::new(),
+            active_links: Vec::new(),
             links: Vec::new(),
+            embedded: Vec::new(),
+            code_block: None,
+            table: None,
+            text_offset: 0,
             line_breaks: 0,
             after_block_marker: false,
             quote_depth: 0,
-            table_cell: 0,
-            table_rows: 0,
         }
     }
 
@@ -337,36 +454,58 @@ impl MarkdownRenderer {
         match event {
             Event::Start(tag) => self.start(tag),
             Event::End(tag) => self.end(tag),
-            Event::Text(text) => self.text(&text),
+            Event::Text(text) => {
+                if !self.append_captured(&text) {
+                    self.text(&text);
+                }
+            }
             Event::Code(code) => {
-                self.tag("<span font_family=\"monospace\" background=\"#20242c\">");
-                self.text(&code);
-                self.tag("</span>");
+                if !self.append_captured(&code) {
+                    self.embed(EmbeddedMarkdownContent::InlineCode(code.into_string()));
+                }
             }
             Event::InlineMath(math) => {
-                self.tag("<span font_family=\"monospace\">");
-                self.text(&math);
-                self.tag("</span>");
+                if !self.append_captured(&math) {
+                    self.embed(EmbeddedMarkdownContent::InlineMath(math.into_string()));
+                }
             }
             Event::DisplayMath(math) => {
-                self.block();
-                self.tag("<span font_family=\"monospace\">");
-                self.text(&math);
-                self.tag("</span>");
+                if !self.append_captured(&math) {
+                    self.block();
+                    self.embed(EmbeddedMarkdownContent::DisplayMath(math.into_string()));
+                }
             }
-            Event::Html(html) | Event::InlineHtml(html) => self.text(&html),
+            Event::Html(html) | Event::InlineHtml(html) => {
+                if !self.append_captured(&html) {
+                    self.text(&html);
+                }
+            }
             Event::FootnoteReference(name) => {
-                self.text("[");
-                self.text(&name);
-                self.text("]");
+                let reference = format!("[{name}]");
+                if !self.append_captured(&reference) {
+                    self.text(&reference);
+                }
             }
-            Event::SoftBreak => self.text(" "),
-            Event::HardBreak => self.breaks(1),
+            Event::SoftBreak => {
+                if !self.append_captured(" ") {
+                    self.text(" ");
+                }
+            }
+            Event::HardBreak => {
+                if !self.append_captured("\n") {
+                    self.breaks(1);
+                }
+            }
             Event::Rule => {
                 self.block();
                 self.tag("<span foreground=\"#565d69\">────────────────────────</span>");
             }
-            Event::TaskListMarker(checked) => self.text(if checked { "☑ " } else { "☐ " }),
+            Event::TaskListMarker(checked) => {
+                let marker = if checked { "☑ " } else { "☐ " };
+                if !self.append_captured(marker) {
+                    self.text(marker);
+                }
+            }
         }
         self
     }
@@ -399,12 +538,21 @@ impl MarkdownRenderer {
                 self.quote_prefix();
                 self.after_block_marker = true;
             }
-            Tag::CodeBlock(_) => {
+            Tag::CodeBlock(kind) => {
                 self.block();
                 self.quote_prefix();
-                self.tag(
-                    "<span font_family=\"monospace\" foreground=\"#e4e8ef\" background=\"#171a20\">",
-                );
+                let language = match kind {
+                    CodeBlockKind::Indented => None,
+                    CodeBlockKind::Fenced(info) => info
+                        .split_whitespace()
+                        .next()
+                        .filter(|language| !language.is_empty())
+                        .map(|language| language.to_ascii_lowercase()),
+                };
+                self.code_block = Some(CodeBlockState {
+                    language,
+                    text: String::new(),
+                });
             }
             Tag::HtmlBlock => self.block(),
             Tag::List(start) => {
@@ -452,46 +600,48 @@ impl MarkdownRenderer {
             Tag::DefinitionList => self.block(),
             Tag::DefinitionListTitle => self.tag("<b>"),
             Tag::DefinitionListDefinition => self.text(" — "),
-            Tag::Table(_) => {
+            Tag::Table(alignments) => {
                 self.block();
-                self.table_rows = 0;
-                self.tag("<span font_family=\"monospace\">");
-            }
-            Tag::TableHead => self.tag("<b>"),
-            Tag::TableRow => {
-                if self.table_rows > 0 {
-                    self.breaks(1);
-                }
-                self.table_rows += 1;
-                self.table_cell = 0;
                 self.quote_prefix();
+                self.table = Some(TableState::new(alignments));
+            }
+            Tag::TableHead | Tag::TableRow => {
+                if let Some(table) = &mut self.table {
+                    table.start_row();
+                }
             }
             Tag::TableCell => {
-                if self.table_cell > 0 {
-                    self.text("  │  ");
-                }
-                self.table_cell += 1;
-            }
-            Tag::Emphasis => self.tag("<i>"),
-            Tag::Strong => self.tag("<b>"),
-            Tag::Strikethrough => self.tag("<span strikethrough=\"true\">"),
-            Tag::Superscript => self.tag("<sup>"),
-            Tag::Subscript => self.tag("<sub>"),
-            Tag::Link { dest_url, .. } => {
-                let active = safe_link(&dest_url);
-                self.links.push(active);
-                if active {
-                    let destination = glib::markup_escape_text(&dest_url);
-                    self.tag(&format!(
-                        "<a href=\"{destination}\"><span foreground=\"#8ab4f8\" underline=\"single\">"
-                    ));
-                } else {
-                    self.tag("<span foreground=\"#8ab4f8\" underline=\"single\">");
+                if let Some(table) = &mut self.table {
+                    table.start_cell();
                 }
             }
-            Tag::Image { .. } => {
+            Tag::Emphasis if self.table.is_none() => self.tag("<i>"),
+            Tag::Strong if self.table.is_none() => self.tag("<b>"),
+            Tag::Strikethrough if self.table.is_none() => {
+                self.tag("<span strikethrough=\"true\">");
+            }
+            Tag::Superscript if self.table.is_none() => self.tag("<sup>"),
+            Tag::Subscript if self.table.is_none() => self.tag("<sub>"),
+            Tag::Link { dest_url, .. } if self.table.is_none() => {
+                let active =
+                    safe_link(&dest_url).then(|| (self.text_offset, dest_url.into_string()));
+                self.active_links.push(active);
+                self.tag("<span foreground=\"#8ab4f8\" underline=\"single\">");
+            }
+            Tag::Image { .. } if self.table.is_none() => {
                 self.tag("<span foreground=\"#9299a6\"><i>Image: ");
             }
+            Tag::Image { .. } => {
+                if let Some(table) = &mut self.table {
+                    table.append("Image: ");
+                }
+            }
+            Tag::Emphasis
+            | Tag::Strong
+            | Tag::Strikethrough
+            | Tag::Superscript
+            | Tag::Subscript
+            | Tag::Link { .. } => {}
             Tag::MetadataBlock(_) => {}
         }
     }
@@ -504,7 +654,18 @@ impl MarkdownRenderer {
                 self.tag("</span>");
                 self.quote_depth = self.quote_depth.saturating_sub(1);
             }
-            TagEnd::CodeBlock => self.tag("</span>"),
+            TagEnd::CodeBlock => {
+                let code = self.code_block.take().unwrap_or(CodeBlockState {
+                    language: None,
+                    text: String::new(),
+                });
+                let text = code.text.trim_end_matches('\n').to_owned();
+                if code.language.as_deref() == Some("mermaid") {
+                    self.embed(EmbeddedMarkdownContent::Mermaid(text));
+                } else {
+                    self.embed(EmbeddedMarkdownContent::CodeBlock(text));
+                }
+            }
             TagEnd::List(_) => {
                 self.lists.pop();
             }
@@ -512,22 +673,40 @@ impl MarkdownRenderer {
             TagEnd::DefinitionList => {}
             TagEnd::DefinitionListTitle => self.tag("</b>"),
             TagEnd::DefinitionListDefinition => {}
-            TagEnd::Table => self.tag("</span>"),
-            TagEnd::TableHead => self.tag("</b>"),
-            TagEnd::TableRow | TagEnd::TableCell => {}
-            TagEnd::Emphasis => self.tag("</i>"),
-            TagEnd::Strong => self.tag("</b>"),
-            TagEnd::Strikethrough => self.tag("</span>"),
-            TagEnd::Superscript => self.tag("</sup>"),
-            TagEnd::Subscript => self.tag("</sub>"),
-            TagEnd::Link => {
-                if self.links.pop().unwrap_or(false) {
-                    self.tag("</span></a>");
-                } else {
-                    self.tag("</span>");
+            TagEnd::Table => {
+                if let Some(table) = self.table.take() {
+                    self.embed(EmbeddedMarkdownContent::Table(table.table));
                 }
             }
-            TagEnd::Image => self.tag("</i></span>"),
+            TagEnd::TableHead => {
+                if let Some(table) = &mut self.table {
+                    table.table.header_rows = table.table.rows.len();
+                }
+            }
+            TagEnd::TableRow | TagEnd::TableCell => {}
+            TagEnd::Emphasis if self.table.is_none() => self.tag("</i>"),
+            TagEnd::Strong if self.table.is_none() => self.tag("</b>"),
+            TagEnd::Strikethrough if self.table.is_none() => self.tag("</span>"),
+            TagEnd::Superscript if self.table.is_none() => self.tag("</sup>"),
+            TagEnd::Subscript if self.table.is_none() => self.tag("</sub>"),
+            TagEnd::Emphasis
+            | TagEnd::Strong
+            | TagEnd::Strikethrough
+            | TagEnd::Superscript
+            | TagEnd::Subscript => {}
+            TagEnd::Link if self.table.is_none() => {
+                self.tag("</span>");
+                if let Some(Some((start, destination))) = self.active_links.pop() {
+                    self.links.push(MarkdownLink {
+                        start,
+                        end: self.text_offset,
+                        destination,
+                    });
+                }
+            }
+            TagEnd::Link => {}
+            TagEnd::Image if self.table.is_none() => self.tag("</i></span>"),
+            TagEnd::Image => {}
             TagEnd::MetadataBlock(_) => {}
         }
     }
@@ -547,6 +726,7 @@ impl MarkdownRenderer {
     fn breaks(&mut self, count: usize) {
         while self.line_breaks < count {
             self.markup.push('\n');
+            self.text_offset += 1;
             self.line_breaks += 1;
         }
     }
@@ -557,22 +737,242 @@ impl MarkdownRenderer {
 
     fn text(&mut self, text: &str) {
         self.markup.push_str(&glib::markup_escape_text(text));
+        self.text_offset += text.chars().count() as i32;
         self.line_breaks = text
             .chars()
             .rev()
             .take_while(|character| *character == '\n')
             .count();
     }
+
+    fn append_captured(&mut self, text: &str) -> bool {
+        if let Some(table) = &mut self.table {
+            table.append(text);
+            true
+        } else if let Some(code_block) = &mut self.code_block {
+            code_block.text.push_str(text);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn embed(&mut self, content: EmbeddedMarkdownContent) {
+        self.embedded.push(EmbeddedMarkdown {
+            offset: self.text_offset,
+            content,
+        });
+        self.text("\u{fffc}");
+    }
 }
 
-fn markdown_markup(markdown: &str) -> String {
+fn render_markdown(markdown: &str) -> RenderedMarkdown {
+    let markdown = normalize_omp_math(markdown);
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_MATH
         | Options::ENABLE_SMART_PUNCTUATION;
-    Parser::new_ext(markdown, options)
-        .fold(MarkdownRenderer::new(), MarkdownRenderer::render)
-        .markup
+    let renderer =
+        Parser::new_ext(&markdown, options).fold(MarkdownRenderer::new(), MarkdownRenderer::render);
+    RenderedMarkdown {
+        markup: renderer.markup,
+        embedded: renderer.embedded,
+        links: renderer.links,
+    }
+}
+
+fn normalize_omp_math(markdown: &str) -> Cow<'_, str> {
+    if !markdown.contains("\\(")
+        && !markdown.contains("\\[")
+        && !markdown.contains("\\begin{")
+        && !markdown.contains("$$")
+    {
+        return Cow::Borrowed(markdown);
+    }
+
+    let bytes = markdown.as_bytes();
+    let mut output = String::with_capacity(markdown.len());
+    let mut index = 0;
+    let mut fence = None;
+    let mut inline_ticks = 0;
+    while index < markdown.len() {
+        let at_line_start = index == 0 || bytes[index - 1] == b'\n';
+        if at_line_start {
+            let line_end = markdown[index..]
+                .find('\n')
+                .map_or(markdown.len(), |offset| index + offset + 1);
+            let content_end = line_end
+                .checked_sub(1)
+                .filter(|end| bytes[*end] == b'\n')
+                .unwrap_or(line_end);
+            let line = markdown[index..content_end].trim_end_matches('\r');
+            let marker = markdown_fence_marker(line);
+            if let Some((open_marker, open_length)) = fence {
+                if marker.is_some_and(|(marker, length, marker_end)| {
+                    marker == open_marker
+                        && length >= open_length
+                        && line[marker_end..].trim().is_empty()
+                }) {
+                    fence = None;
+                }
+                output.push_str(&markdown[index..line_end]);
+                index = line_end;
+                continue;
+            }
+            if let Some((marker, length, _)) = marker {
+                fence = Some((marker, length));
+                output.push_str(&markdown[index..line_end]);
+                index = line_end;
+                continue;
+            }
+            if inline_ticks == 0
+                && let Some(environment_end) = bare_math_environment_end(markdown, index)
+            {
+                output.push_str("$$");
+                push_collapsed_math(&mut output, &markdown[index..environment_end]);
+                output.push_str("$$");
+                index = environment_end;
+                continue;
+            }
+        }
+
+        if bytes[index] == b'`' {
+            let run = bytes[index..]
+                .iter()
+                .take_while(|byte| **byte == b'`')
+                .count();
+            if inline_ticks == 0 {
+                inline_ticks = run;
+            } else if inline_ticks == run {
+                inline_ticks = 0;
+            }
+            output.push_str(&markdown[index..index + run]);
+            index += run;
+            continue;
+        }
+        if inline_ticks == 0 {
+            if markdown[index..].starts_with("$$")
+                && let Some(close) = markdown[index + 2..].find("$$")
+            {
+                let close = index + 2 + close;
+                output.push_str("$$");
+                push_collapsed_math(&mut output, &markdown[index + 2..close]);
+                output.push_str("$$");
+                index = close + 2;
+                continue;
+            }
+            if markdown[index..].starts_with("\\(")
+                && let Some(close) = markdown[index + 2..].find("\\)")
+            {
+                let close = index + 2 + close;
+                output.push('$');
+                output.push_str(&markdown[index + 2..close]);
+                output.push('$');
+                index = close + 2;
+                continue;
+            }
+            if markdown[index..].starts_with("\\[")
+                && let Some(close) = markdown[index + 2..].find("\\]")
+            {
+                let close = index + 2 + close;
+                output.push_str("$$");
+                push_collapsed_math(&mut output, &markdown[index + 2..close]);
+                output.push_str("$$");
+                index = close + 2;
+                continue;
+            }
+        }
+
+        let character = markdown[index..]
+            .chars()
+            .next()
+            .expect("index stays on a character boundary");
+        output.push(character);
+        index += character.len_utf8();
+    }
+    Cow::Owned(output)
+}
+
+fn push_collapsed_math(output: &mut String, source: &str) {
+    let mut previous_was_whitespace = output.chars().next_back().is_some_and(char::is_whitespace);
+    for character in source.chars() {
+        if matches!(character, '\n' | '\r') {
+            if !previous_was_whitespace {
+                output.push(' ');
+                previous_was_whitespace = true;
+            }
+        } else {
+            output.push(character);
+            previous_was_whitespace = character.is_whitespace();
+        }
+    }
+}
+
+fn markdown_fence_marker(line: &str) -> Option<(u8, usize, usize)> {
+    let bytes = line.as_bytes();
+    let indentation = bytes.iter().take_while(|byte| **byte == b' ').count();
+    if indentation > 3 {
+        return None;
+    }
+    let marker = *bytes.get(indentation)?;
+    if !matches!(marker, b'`' | b'~') {
+        return None;
+    }
+    let length = bytes[indentation..]
+        .iter()
+        .take_while(|byte| **byte == marker)
+        .count();
+    (length >= 3).then_some((marker, length, indentation + length))
+}
+
+fn bare_math_environment_end(markdown: &str, line_start: usize) -> Option<usize> {
+    let line_end = markdown[line_start..]
+        .find('\n')
+        .map_or(markdown.len(), |offset| line_start + offset);
+    let line = &markdown[line_start..line_end];
+    let indentation = line.bytes().take_while(|byte| *byte == b' ').count();
+    if indentation > 3 {
+        return None;
+    }
+    let begin = line.get(indentation..)?.strip_prefix("\\begin{")?;
+    let name_end = begin.find('}')?;
+    let name = &begin[..name_end];
+    let base_name = name.strip_suffix('*').unwrap_or(name);
+    if !matches!(
+        base_name,
+        "matrix"
+            | "smallmatrix"
+            | "pmatrix"
+            | "bmatrix"
+            | "Bmatrix"
+            | "vmatrix"
+            | "Vmatrix"
+            | "cases"
+            | "dcases"
+            | "rcases"
+            | "drcases"
+            | "aligned"
+            | "alignedat"
+            | "align"
+            | "alignat"
+            | "split"
+            | "gathered"
+            | "gatheredat"
+            | "gather"
+            | "multline"
+            | "equation"
+            | "eqnarray"
+            | "array"
+            | "subarray"
+    ) {
+        return None;
+    }
+    let close = format!("\\end{{{name}}}");
+    let search_start = line_start + indentation + "\\begin{".len() + name_end + 1;
+    markdown[search_start..]
+        .find(&close)
+        .map(|offset| search_start + offset + close.len())
 }
 
 fn safe_link(destination: &str) -> bool {
@@ -583,30 +983,279 @@ fn safe_link(destination: &str) -> bool {
 
 #[derive(Clone)]
 pub(crate) struct MessageBody {
-    label: gtk::Label,
+    view: gtk::TextView,
     source: Rc<RefCell<String>>,
+    links: Rc<RefCell<Vec<MarkdownLink>>>,
 }
 
 impl MessageBody {
-    fn new(text: &str) -> Self {
+    fn new(text: &str, rich: bool) -> Self {
+        let view = gtk::TextView::builder()
+            .accepts_tab(false)
+            .cursor_visible(false)
+            .editable(false)
+            .focusable(true)
+            .hexpand(true)
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .build();
+        view.add_css_class("message-body");
         let body = Self {
-            label: read_only_label("", "message-body"),
+            view,
             source: Rc::new(RefCell::new(String::new())),
+            links: Rc::new(RefCell::new(Vec::new())),
         };
-        body.set_text(text);
+        wire_markdown_links(&body.view, &body.links);
+        if rich {
+            body.set_text(text);
+        } else {
+            body.set_streaming_text(text);
+        }
         body
     }
 
     pub(crate) fn set_text(&self, text: &str) {
-        let mut source = self.source.borrow_mut();
-        source.clear();
-        source.push_str(text);
-        drop(source);
-        self.label.set_markup(&markdown_markup(text));
+        self.source.replace(text.to_owned());
+        let rendered = render_markdown(text);
+        let buffer = gtk::TextBuffer::new(None::<&gtk::TextTagTable>);
+        buffer.insert_markup(&mut buffer.end_iter(), &rendered.markup);
+        self.view.set_buffer(Some(&buffer));
+        for embedded in rendered.embedded {
+            let mut start = buffer.iter_at_offset(embedded.offset);
+            let mut end = start;
+            end.forward_char();
+            buffer.delete(&mut start, &mut end);
+            let anchor = gtk::TextChildAnchor::new();
+            buffer.insert_child_anchor(&mut start, &anchor);
+            let widget = embedded_markdown_widget(embedded.content);
+            self.view.add_child_at_anchor(&widget, &anchor);
+        }
+        self.links.replace(rendered.links);
+    }
+
+    pub(crate) fn set_streaming_text(&self, text: &str) {
+        self.source.replace(text.to_owned());
+        let buffer = gtk::TextBuffer::new(None::<&gtk::TextTagTable>);
+        buffer.set_text(text);
+        self.view.set_buffer(Some(&buffer));
+        self.links.borrow_mut().clear();
     }
 }
 
+fn embedded_markdown_widget(content: EmbeddedMarkdownContent) -> gtk::Widget {
+    match content {
+        EmbeddedMarkdownContent::InlineCode(text) => {
+            let label = markdown_code_label(&text, false);
+            label.upcast()
+        }
+        EmbeddedMarkdownContent::CodeBlock(text) => {
+            let label = markdown_code_label(&text, true);
+            label.upcast()
+        }
+        EmbeddedMarkdownContent::InlineMath(source) => latex_widget(&source, false),
+        EmbeddedMarkdownContent::DisplayMath(source) => latex_widget(&source, true),
+        EmbeddedMarkdownContent::Table(table) => markdown_table_widget(table).upcast(),
+        EmbeddedMarkdownContent::Mermaid(source) => mermaid_widget(&source),
+    }
+}
+
+fn markdown_code_label(text: &str, block: bool) -> gtk::Label {
+    let label = gtk::Label::new(Some(text));
+    label.set_xalign(0.0);
+    if block {
+        label.set_valign(gtk::Align::Center);
+        label.set_halign(gtk::Align::Fill);
+        label.set_hexpand(true);
+        label.set_wrap(true);
+        label.set_wrap_mode(gtk::pango::WrapMode::Char);
+        label.set_width_chars(48);
+        label.add_css_class("markdown-code-block");
+    } else {
+        label.set_valign(gtk::Align::BaselineCenter);
+        label.add_css_class("markdown-inline-code");
+    }
+    label
+}
+
+fn latex_widget(source: &str, display: bool) -> gtk::Widget {
+    match render_latex_svg(source, display).and_then(|svg| {
+        svg_picture(
+            svg,
+            "markdown-latex",
+            &format!("LaTeX formula: {source}"),
+            560,
+        )
+    }) {
+        Ok(widget) => {
+            widget.add_css_class(if display {
+                "markdown-latex-display"
+            } else {
+                "markdown-latex-inline"
+            });
+            widget
+        }
+        Err(error) => rich_render_fallback(
+            source,
+            "markdown-latex-error",
+            &format!("Could not render LaTeX: {error}"),
+        ),
+    }
+}
+
+fn render_latex_svg(source: &str, display: bool) -> Result<String, String> {
+    let ast = parse_latex(source).map_err(|error| error.to_string())?;
+    let style = if display {
+        MathStyle::Display
+    } else {
+        MathStyle::Text
+    };
+    let options = LayoutOptions::default()
+        .with_style(style)
+        .with_color(Color::rgb(0.87, 0.89, 0.92));
+    let layout_box = layout(&ast, &options);
+    let display_list = to_display_list(&layout_box);
+    let base_font_size = if display { 22.0 } else { 18.0 };
+    let base_padding = if display { 6.0 } else { 2.0 };
+    let natural_width = display_list.width * base_font_size + base_padding * 2.0;
+    let natural_height =
+        (display_list.height + display_list.depth) * base_font_size + base_padding * 2.0;
+    let raster_scale = (720.0 / natural_width.max(1.0))
+        .min(480.0 / natural_height.max(1.0))
+        .min(1.0);
+    let svg_options = SvgOptions {
+        font_size: base_font_size * raster_scale,
+        padding: base_padding * raster_scale,
+        embed_glyphs: true,
+        ..SvgOptions::default()
+    };
+    Ok(render_to_svg(&display_list, &svg_options))
+}
+
+fn markdown_table_widget(table: MarkdownTable) -> gtk::Grid {
+    let grid = gtk::Grid::new();
+    grid.add_css_class("markdown-table");
+    grid.set_halign(gtk::Align::Fill);
+    grid.set_hexpand(true);
+    let row_count = table.rows.len();
+    let column_count = table.rows.iter().map(Vec::len).max().unwrap_or(1);
+    let cell_width_chars = (48 / column_count as i32).clamp(10, 24);
+    for (row_index, row) in table.rows.into_iter().enumerate() {
+        let column_count = row.len();
+        for (column_index, text) in row.into_iter().enumerate() {
+            let cell = gtk::Label::new(Some(&text));
+            cell.set_xalign(
+                match table
+                    .alignments
+                    .get(column_index)
+                    .copied()
+                    .unwrap_or(Alignment::None)
+                {
+                    Alignment::Center => 0.5,
+                    Alignment::Right => 1.0,
+                    Alignment::None | Alignment::Left => 0.0,
+                },
+            );
+            cell.set_yalign(0.0);
+            cell.set_hexpand(true);
+            cell.set_wrap(true);
+            cell.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+            cell.set_max_width_chars(24);
+            cell.set_width_chars(cell_width_chars);
+            cell.set_selectable(true);
+            cell.add_css_class("markdown-table-cell");
+            if row_index < table.header_rows {
+                cell.add_css_class("header");
+            }
+            if row_index + 1 == row_count {
+                cell.add_css_class("last-row");
+            }
+            if column_index + 1 == column_count {
+                cell.add_css_class("last-column");
+            }
+            grid.attach(&cell, column_index as i32, row_index as i32, 1, 1);
+        }
+    }
+    grid
+}
+
+fn mermaid_widget(source: &str) -> gtk::Widget {
+    match render_mermaid_svg(source)
+        .and_then(|svg| svg_picture(svg, "markdown-mermaid", "Mermaid diagram", 560))
+    {
+        Ok(widget) => widget,
+        Err(error) => rich_render_fallback(
+            source,
+            "markdown-diagram-error",
+            &format!("Could not render Mermaid diagram: {error}"),
+        ),
+    }
+}
+
+fn render_mermaid_svg(source: &str) -> Result<String, String> {
+    let parsed = mermaid_rs_renderer::parse_mermaid(source).map_err(|error| error.to_string())?;
+    let theme = mermaid_rs_renderer::Theme::dark();
+    let config = mermaid_rs_renderer::LayoutConfig::default();
+    let layout = mermaid_rs_renderer::compute_layout(&parsed.graph, &theme, &config);
+    let dimensions = mermaid_rs_renderer::measure_svg_dimensions(&layout, &config, None);
+    let scale = (720.0 / dimensions.width.max(1.0))
+        .min(640.0 / dimensions.height.max(1.0))
+        .min(1.0);
+    Ok(mermaid_rs_renderer::render::render_svg_with_dimensions(
+        &layout,
+        &theme,
+        &config,
+        Some((dimensions.width * scale, dimensions.height * scale)),
+    ))
+}
+
+fn svg_picture(
+    svg: String,
+    css_class: &str,
+    alternative_text: &str,
+    max_width: i32,
+) -> Result<gtk::Widget, String> {
+    let texture = gdk::Texture::from_bytes(&glib::Bytes::from_owned(svg.into_bytes()))
+        .map_err(|error| error.to_string())?;
+    let picture = gtk::Picture::for_paintable(&texture);
+    picture.set_alternative_text(Some(alternative_text));
+    picture.set_content_fit(gtk::ContentFit::Contain);
+    picture.set_can_shrink(true);
+    picture.set_halign(gtk::Align::Start);
+    picture.add_css_class(css_class);
+    let natural_width = texture.width().max(1);
+    let natural_height = texture.height().max(1);
+    let display_width = natural_width.min(max_width);
+    let display_height = (f64::from(natural_height) * f64::from(display_width)
+        / f64::from(natural_width))
+    .ceil() as i32;
+    picture.set_size_request(display_width, display_height);
+    Ok(picture.upcast())
+}
+
+fn rich_render_fallback(text: &str, css_class: &str, tooltip: &str) -> gtk::Widget {
+    let label = markdown_code_label(text, true);
+    label.add_css_class(css_class);
+    label.set_tooltip_text(Some(tooltip));
+    label.upcast()
+}
+
 pub fn append_message(messages: &gtk::Box, role: MessageRole, text: &str) -> MessageBody {
+    append_message_with_mode(messages, role, text, true)
+}
+
+pub(crate) fn append_streaming_message(
+    messages: &gtk::Box,
+    role: MessageRole,
+    text: &str,
+) -> MessageBody {
+    append_message_with_mode(messages, role, text, false)
+}
+
+fn append_message_with_mode(
+    messages: &gtk::Box,
+    role: MessageRole,
+    text: &str,
+    rich: bool,
+) -> MessageBody {
     let row = gtk::Box::new(gtk::Orientation::Vertical, 7);
     row.add_css_class("message-row");
     row.add_css_class(match role {
@@ -627,14 +1276,15 @@ pub fn append_message(messages: &gtk::Box, role: MessageRole, text: &str) -> Mes
         }
     }
 
-    let body = MessageBody::new(text);
+    let body = MessageBody::new(text, rich);
     row.append(&author);
-    row.append(&body.label);
+    row.append(&body.view);
     messages.append(&row);
     wire_message_menu(&row, &body, role);
     body
 }
 
+#[cfg(feature = "ui-stories")]
 pub fn append_thinking(messages: &gtk::Box, text: &str, streaming: bool) -> ThinkingBlock {
     let block = ThinkingBlock::new(text, streaming);
     messages.append(&block.root);
@@ -661,6 +1311,68 @@ pub fn append_notice(messages: &gtk::Box, text: &str, error: bool) -> gtk::Box {
     messages.append(&notice);
     wire_copy_menu(&notice, &label, "Copy notice");
     notice
+}
+
+fn wire_markdown_links(view: &gtk::TextView, links: &Rc<RefCell<Vec<MarkdownLink>>>) {
+    let click = gtk::GestureClick::new();
+    click.set_button(1);
+    let weak_view = view.downgrade();
+    let links_for_click = links.clone();
+    click.connect_released(move |gesture, presses, x, y| {
+        let Some(view) = weak_view.upgrade() else {
+            return;
+        };
+        if presses != 1 {
+            return;
+        }
+        let Some(destination) = markdown_link_at(&view, &links_for_click.borrow(), x, y) else {
+            return;
+        };
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        if let Err(error) = gtk::gio::AppInfo::launch_default_for_uri(
+            &destination,
+            gtk::gio::AppLaunchContext::NONE,
+        ) {
+            eprintln!("Could not open link {destination}: {error}");
+        }
+    });
+    view.add_controller(click);
+
+    let motion = gtk::EventControllerMotion::new();
+    let weak_view = view.downgrade();
+    let links_for_motion = links.clone();
+    motion.connect_motion(move |_, x, y| {
+        let Some(view) = weak_view.upgrade() else {
+            return;
+        };
+        let cursor = markdown_link_at(&view, &links_for_motion.borrow(), x, y).map(|_| "pointer");
+        view.set_cursor_from_name(cursor);
+    });
+    let weak_view = view.downgrade();
+    motion.connect_leave(move |_| {
+        if let Some(view) = weak_view.upgrade() {
+            view.set_cursor_from_name(None);
+        }
+    });
+    view.add_controller(motion);
+}
+
+fn markdown_link_at(
+    view: &gtk::TextView,
+    links: &[MarkdownLink],
+    x: f64,
+    y: f64,
+) -> Option<String> {
+    let (x, y) = view.window_to_buffer_coords(
+        gtk::TextWindowType::Widget,
+        x.round() as i32,
+        y.round() as i32,
+    );
+    let offset = view.iter_at_location(x, y)?.offset();
+    links
+        .iter()
+        .find(|link| link.start <= offset && offset < link.end)
+        .map(|link| link.destination.clone())
 }
 
 pub fn read_only_label(text: &str, css_class: &str) -> gtk::Label {
@@ -757,34 +1469,255 @@ fn set_clipboard(text: &str) {
     }
 }
 
-pub fn empty_chat_hero() -> gtk::Box {
-    let root = gtk::Box::new(gtk::Orientation::Vertical, 9);
-    root.set_halign(gtk::Align::Center);
-    root.set_valign(gtk::Align::Center);
-    root.set_vexpand(true);
-    root.set_margin_start(32);
-    root.set_margin_end(32);
-    root.add_css_class("empty-chat-hero");
-    let logo = icons::omp_logo(88);
-    logo.add_css_class("empty-chat-logo");
-    let title = gtk::Label::new(Some("What should we work on?"));
-    title.set_justify(gtk::Justification::Center);
-    title.add_css_class("empty-chat-title");
-    let detail = gtk::Label::new(Some(
-        "Bring a goal, a question, or a complex workflow. omp can plan, delegate, and carry it through.",
-    ));
-    detail.set_justify(gtk::Justification::Center);
-    detail.set_wrap(true);
-    detail.set_max_width_chars(58);
-    detail.add_css_class("empty-chat-detail");
-    let hint = gtk::Label::new(Some("Type / to explore commands"));
-    hint.set_halign(gtk::Align::Center);
-    hint.add_css_class("empty-chat-hint");
-    root.append(&logo);
-    root.append(&title);
-    root.append(&detail);
-    root.append(&hint);
-    root
+fn workspace_button(workspace: &Path) -> gtk::Button {
+    let button = gtk::Button::new();
+    button.set_hexpand(true);
+    button.set_tooltip_text(Some(&workspace.to_string_lossy()));
+    button.update_property(&[gtk::accessible::Property::Label(&format!(
+        "Start in {}",
+        workspace.to_string_lossy()
+    ))]);
+    button.add_css_class("conversation-workspace-button");
+
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 11);
+    content.append(&icons::icon(icons::Icon::Folder, 17));
+    let labels = gtk::Box::new(gtk::Orientation::Vertical, 1);
+    labels.set_hexpand(true);
+    let name = workspace
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| workspace.to_string_lossy().into_owned());
+    let title = gtk::Label::new(Some(&name));
+    title.set_xalign(0.0);
+    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    title.add_css_class("conversation-workspace-title");
+    let path = gtk::Label::new(Some(&workspace.to_string_lossy()));
+    path.set_xalign(0.0);
+    path.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    path.add_css_class("conversation-workspace-path");
+    labels.append(&title);
+    labels.append(&path);
+    content.append(&labels);
+    button.set_child(Some(&content));
+    button
+}
+
+impl ChatHero {
+    pub fn new() -> Self {
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 9);
+        root.set_halign(gtk::Align::Center);
+        root.set_valign(gtk::Align::Center);
+        root.set_vexpand(true);
+        root.set_margin_start(32);
+        root.set_margin_end(32);
+        root.add_css_class("conversation-hero");
+
+        let logo = icons::omp_logo(88);
+        logo.add_css_class("conversation-hero-logo");
+        let title = gtk::Label::new(None);
+        title.set_justify(gtk::Justification::Center);
+        title.add_css_class("conversation-hero-title");
+        let detail = gtk::Label::new(None);
+        detail.set_justify(gtk::Justification::Center);
+        detail.set_wrap(true);
+        detail.set_max_width_chars(58);
+        detail.add_css_class("conversation-hero-detail");
+
+        let workspace_choices = gtk::Box::new(gtk::Orientation::Vertical, 7);
+        workspace_choices.set_size_request(440, -1);
+        workspace_choices.set_margin_top(10);
+        workspace_choices.add_css_class("conversation-workspace-choices");
+        workspace_choices.set_visible(false);
+
+        let state_line = gtk::Box::new(gtk::Orientation::Horizontal, 7);
+        state_line.set_halign(gtk::Align::Center);
+        state_line.add_css_class("conversation-hero-state");
+        let spinner = gtk::Spinner::new();
+        spinner.set_size_request(16, 16);
+        let state_dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        state_dot.set_size_request(7, 7);
+        state_dot.set_valign(gtk::Align::Center);
+        state_dot.add_css_class("conversation-hero-state-dot");
+        let state_label = gtk::Label::new(None);
+        state_label.add_css_class("conversation-hero-state-label");
+        state_line.append(&spinner);
+        state_line.append(&state_dot);
+        state_line.append(&state_label);
+
+        let hint = gtk::Label::new(None);
+        hint.set_halign(gtk::Align::Center);
+        hint.add_css_class("conversation-hero-hint");
+
+        root.append(&logo);
+        root.append(&title);
+        root.append(&detail);
+        root.append(&workspace_choices);
+        root.append(&state_line);
+        root.append(&hint);
+
+        let hero = Self {
+            root,
+            logo,
+            title,
+            detail,
+            workspace_choices,
+            hint,
+            state_line,
+            spinner,
+            state_dot,
+            state_label,
+            animation_generation: Rc::new(Cell::new(0)),
+        };
+        hero.show_empty();
+        hero
+    }
+
+    pub fn show_empty(&self) {
+        self.stop_loading_animation();
+        self.root.remove_css_class("loading");
+        self.root.remove_css_class("offline");
+        self.logo.set_opacity(1.0);
+        self.workspace_choices.set_visible(false);
+        self.title.set_text("What should we work on?");
+        self.detail.set_text(
+            "Bring a goal, a question, or a complex workflow. omp can plan, delegate, and carry it through.",
+        );
+        self.state_line.set_visible(false);
+        self.spinner.stop();
+        self.hint.set_text("Type / to explore commands");
+        self.hint.set_visible(true);
+    }
+
+    pub fn show_workspace_onboarding<F, G>(
+        &self,
+        recent_workspaces: &[PathBuf],
+        current_workspace: Option<&Path>,
+        on_select: F,
+        on_browse: G,
+    ) where
+        F: Fn(PathBuf) + Clone + 'static,
+        G: Fn() + 'static,
+    {
+        self.show_empty();
+        self.title.set_text("Choose where to start");
+        self.detail.set_text(if recent_workspaces.is_empty() {
+            "Choose a folder for this conversation, or start typing to use the current workspace."
+        } else {
+            "Pick a recent folder, browse somewhere else, or start typing to use the current workspace."
+        });
+        self.hint.set_visible(false);
+        while let Some(child) = self.workspace_choices.first_child() {
+            self.workspace_choices.remove(&child);
+        }
+
+        if !recent_workspaces.is_empty() {
+            let heading = gtk::Label::new(Some("RECENT FOLDERS"));
+            heading.set_xalign(0.0);
+            heading.add_css_class("conversation-workspace-heading");
+            self.workspace_choices.append(&heading);
+        }
+        for workspace in recent_workspaces {
+            let button = workspace_button(workspace);
+            let selected_workspace = workspace.clone();
+            let on_select = on_select.clone();
+            button.connect_clicked(move |_| on_select(selected_workspace.clone()));
+            self.workspace_choices.append(&button);
+        }
+
+        let browse = icons::labeled_button(icons::Icon::FolderOpen, "Browse folders");
+        browse.set_halign(gtk::Align::Fill);
+        browse.update_property(&[gtk::accessible::Property::Label("Browse folders")]);
+        browse.add_css_class("conversation-workspace-browse");
+        browse.connect_clicked(move |_| on_browse());
+        self.workspace_choices.append(&browse);
+        self.workspace_choices.set_visible(true);
+
+        if let Some(current_workspace) = current_workspace {
+            self.workspace_choices.set_tooltip_text(Some(&format!(
+                "Current workspace: {}",
+                current_workspace.to_string_lossy()
+            )));
+        } else {
+            self.workspace_choices.set_tooltip_text(None);
+        }
+    }
+
+    pub fn show_loading(&self, title: &str, detail: &str, activity: &str) {
+        self.stop_loading_animation();
+        self.root.remove_css_class("offline");
+        self.root.add_css_class("loading");
+        self.title.set_text(title);
+        self.detail.set_text(detail);
+        self.state_label.set_text(activity);
+        self.state_dot.set_visible(false);
+        self.workspace_choices.set_visible(false);
+        self.spinner.set_visible(true);
+        self.spinner.start();
+        self.state_line.set_visible(true);
+        self.hint.set_visible(false);
+        self.start_loading_animation(title);
+    }
+
+    pub fn show_disconnected(&self, detail: &str) {
+        self.stop_loading_animation();
+        self.root.remove_css_class("loading");
+        self.root.add_css_class("offline");
+        self.logo.set_opacity(0.82);
+        self.title.set_text("Can’t connect to omp");
+        self.detail.set_text(detail);
+        self.workspace_choices.set_visible(false);
+        self.spinner.stop();
+        self.spinner.set_visible(false);
+        self.state_dot.set_visible(true);
+        self.state_label.set_text("Runtime unavailable");
+        self.state_line.set_visible(true);
+        self.hint.set_visible(false);
+    }
+
+    pub fn hide(&self) {
+        self.stop_loading_animation();
+        self.spinner.stop();
+        self.root.set_visible(false);
+    }
+    fn start_loading_animation(&self, text: &str) {
+        let animations_enabled = gtk::Settings::default()
+            .map(|settings| settings.is_gtk_enable_animations())
+            .unwrap_or(true);
+        if !animations_enabled {
+            self.logo.set_opacity(1.0);
+            self.title.set_text(text);
+            return;
+        }
+
+        let generation = self.animation_generation.get();
+        let animation_generation = self.animation_generation.clone();
+        let title = self.title.downgrade();
+        let logo = self.logo.downgrade();
+        let text = text.to_owned();
+        let started = Instant::now();
+        self.title
+            .set_markup(&shimmer_markup(&text, Duration::ZERO));
+        glib::timeout_add_local(Duration::from_millis(33), move || {
+            let (Some(title), Some(logo)) = (title.upgrade(), logo.upgrade()) else {
+                return glib::ControlFlow::Break;
+            };
+            if animation_generation.get() != generation {
+                return glib::ControlFlow::Break;
+            }
+            let elapsed = started.elapsed();
+            title.set_markup(&shimmer_markup(&text, elapsed));
+            let pulse = (elapsed.as_secs_f64() * 2.4).sin().mul_add(0.08, 0.9);
+            logo.set_opacity(pulse);
+            glib::ControlFlow::Continue
+        });
+    }
+
+    fn stop_loading_animation(&self) {
+        self.animation_generation
+            .set(self.animation_generation.get().wrapping_add(1));
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -888,35 +1821,213 @@ fn format_tokens(value: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{markdown_markup, shimmer_markup, thinking_summary};
+    use super::{
+        EmbeddedMarkdownContent, render_latex_svg, render_markdown, render_mermaid_svg,
+        shimmer_markup, thinking_summary,
+    };
     use gtk4::pango;
     use std::time::Duration;
 
     #[test]
     fn markdown_renders_common_chat_content_as_valid_pango_markup() {
-        let markup = markdown_markup(
+        let rendered = render_markdown(
             "# Result\n\nUse **bold**, *italic*, and `code`.\n\n- first\n- [x] done\n\n> quoted",
         );
-        let (_, plain_text, _) =
-            pango::parse_markup(&markup, '\0').expect("renderer must produce valid Pango markup");
+        let (_, plain_text, _) = pango::parse_markup(&rendered.markup, '\0')
+            .expect("renderer must produce valid Pango markup");
 
         assert_eq!(
             plain_text,
-            "Result\n\nUse bold, italic, and code.\n\n• first\n• ☑ done\n\n│ quoted"
+            "Result\n\nUse bold, italic, and \u{fffc}.\n\n• first\n• ☑ done\n\n│ quoted"
         );
-        assert!(markup.contains("weight=\"bold\""));
-        assert!(markup.contains("<b>bold</b>"));
-        assert!(markup.contains("font_family=\"monospace\""));
+        assert!(rendered.markup.contains("weight=\"bold\""));
+        assert!(rendered.markup.contains("<b>bold</b>"));
+        assert_eq!(rendered.embedded.len(), 1);
+        assert_eq!(
+            rendered.embedded[0].content,
+            EmbeddedMarkdownContent::InlineCode("code".to_owned())
+        );
     }
 
     #[test]
     fn markdown_escapes_html_and_only_activates_safe_links() {
-        let markup = markdown_markup(
+        let rendered = render_markdown(
             "[docs](https://example.com/docs) [unsafe](javascript:alert(1)) <button>",
         );
-        assert!(markup.contains("href=\"https://example.com/docs\""));
-        assert!(!markup.contains("href=\"javascript:"));
-        assert!(markup.contains("&lt;button&gt;"));
+        assert_eq!(rendered.links.len(), 1);
+        assert_eq!(rendered.links[0].destination, "https://example.com/docs");
+        assert!(rendered.markup.contains("&lt;button&gt;"));
+    }
+
+    #[test]
+    fn markdown_embeds_code_blocks_without_losing_their_contents() {
+        let rendered = render_markdown("Before `x`.\n\n```\nlet y = 1;\n```\n\nAfter.");
+        assert_eq!(rendered.embedded.len(), 2);
+        assert_eq!(
+            rendered.embedded[0].content,
+            EmbeddedMarkdownContent::InlineCode("x".to_owned())
+        );
+        assert_eq!(
+            rendered.embedded[1].content,
+            EmbeddedMarkdownContent::CodeBlock("let y = 1;".to_owned())
+        );
+    }
+
+    #[test]
+    fn markdown_embeds_latex_tables_and_mermaid_as_rich_content() {
+        let rendered = render_markdown(
+            "Inline $x^2$.\n\n$$\\frac{1}{2}$$\n\n\
+             | Name | Value |\n| :--- | ---: |\n| Alpha | 42 |\n\n\
+             ```mermaid\nflowchart LR\n    A --> B\n```",
+        );
+
+        assert!(matches!(
+            &rendered.embedded[0].content,
+            EmbeddedMarkdownContent::InlineMath(source) if source == "x^2"
+        ));
+        assert!(matches!(
+            &rendered.embedded[1].content,
+            EmbeddedMarkdownContent::DisplayMath(source) if source == "\\frac{1}{2}"
+        ));
+        let EmbeddedMarkdownContent::Table(table) = &rendered.embedded[2].content else {
+            panic!("third embedded block should be a table");
+        };
+        assert_eq!(table.header_rows, 1);
+        assert_eq!(
+            table.rows,
+            vec![
+                vec!["Name".to_owned(), "Value".to_owned()],
+                vec!["Alpha".to_owned(), "42".to_owned()]
+            ]
+        );
+        assert!(matches!(
+            &rendered.embedded[3].content,
+            EmbeddedMarkdownContent::Mermaid(source)
+                if source == "flowchart LR\n    A --> B"
+        ));
+    }
+
+    #[test]
+    fn markdown_accepts_omp_math_delimiters_and_preserves_code_fences() {
+        let rendered = render_markdown(
+            r#"Inline \(x + 1\).
+
+\[\frac{1}{2}\]
+
+\begin{align}
+x &= y + 1
+\end{align}
+
+```text
+\(literal\)
+```"#,
+        );
+
+        assert!(matches!(
+            &rendered.embedded[0].content,
+            EmbeddedMarkdownContent::InlineMath(source) if source == "x + 1"
+        ));
+        assert!(matches!(
+            &rendered.embedded[1].content,
+            EmbeddedMarkdownContent::DisplayMath(source) if source == "\\frac{1}{2}"
+        ));
+        assert!(matches!(
+            &rendered.embedded[2].content,
+            EmbeddedMarkdownContent::DisplayMath(source)
+                if source == "\\begin{align} x &= y + 1 \\end{align}"
+        ));
+        assert!(matches!(
+            &rendered.embedded[3].content,
+            EmbeddedMarkdownContent::CodeBlock(source) if source == "\\(literal\\)"
+        ));
+    }
+
+    #[test]
+    fn markdown_keeps_multiline_display_math_in_single_render_blocks() {
+        let rendered = render_markdown(
+            r#"$$
+\begin{aligned}
+\mathcal{L}(x,\lambda,\mu) &= f(x), \\
+\nabla_x\mathcal{L}(x^\star,\lambda^\star,\mu^\star) &= 0
+\end{aligned}
+$$
+
+\[
+A=
+\begin{pmatrix}
+4 & 12 & -16 \\
+12 & 37 & -43 \\
+-16 & -43 & 98
+\end{pmatrix}
+\]"#,
+        );
+
+        assert_eq!(rendered.embedded.len(), 2);
+        for embedded in &rendered.embedded {
+            let EmbeddedMarkdownContent::DisplayMath(source) = &embedded.content else {
+                panic!("multiline formula should remain one display-math block");
+            };
+            render_latex_svg(source, true).expect("complex display math should render");
+        }
+        let (_, plain_text, _) = pango::parse_markup(&rendered.markup, '\0')
+            .expect("renderer must produce valid Pango markup");
+        assert_eq!(plain_text, "\u{fffc}\n\n\u{fffc}");
+    }
+
+    #[test]
+    fn reported_complex_formulas_render_without_fallbacks() {
+        let formulas = [
+            r"\text{Euler's identity is } e^{i\pi}+1=0",
+            r"E^2=p^2c^2+m^2c^4",
+            r"x=\frac{-b\pm\sqrt{b^2-4ac}}{2a}",
+            r"\begin{align}\nabla \cdot \mathbf{E} &= \frac{\rho}{\varepsilon_0}, \\\nabla \cdot \mathbf{B} &= 0, \\\nabla \times \mathbf{E} &= -\frac{\partial \mathbf{B}}{\partial t}, \\\nabla \times \mathbf{B} &= \mu_0\mathbf{J}+\mu_0\varepsilon_0\frac{\partial \mathbf{E}}{\partial t}\end{align}",
+            r"\mathcal{L}(x,\lambda,\mu)=f(x)+\sum_{i=1}^{m}\lambda_i h_i(x)+\sum_{j=1}^{p}\mu_j g_j(x)",
+            r"f(x)=\begin{cases}\displaystyle \int_0^x e^{-t^2}\,dt,&x\ge 0,\\[8pt]-\displaystyle \int_x^0 e^{-t^2}\,dt,&x<0.\end{cases}\qquad \lim_{x\to\infty}f(x)=\frac{\sqrt{\pi}}{2}",
+        ];
+
+        for formula in formulas {
+            render_latex_svg(formula, true)
+                .unwrap_or_else(|error| panic!("formula did not render: {error}\n{formula}"));
+        }
+    }
+
+    #[test]
+    fn native_rich_renderers_produce_svg_images() {
+        let latex = render_latex_svg(r"\frac{1}{2}", true).expect("LaTeX should render");
+        assert!(latex.starts_with("<svg"));
+        assert!(latex.contains("<path"));
+
+        let mermaid =
+            render_mermaid_svg("flowchart LR\n    A --> B").expect("Mermaid should render");
+        assert!(mermaid.starts_with("<svg"));
+        assert!(mermaid.contains("A"));
+        assert!(mermaid.contains("B"));
+    }
+
+    #[test]
+    fn native_rich_renderers_bound_large_svg_rasters() {
+        let formula = std::iter::repeat_n("x_i", 180)
+            .collect::<Vec<_>>()
+            .join("+");
+        let latex = render_latex_svg(&formula, true).expect("wide formula should render");
+        assert!(svg_dimension(&latex, "width") <= 720.0);
+        assert!(svg_dimension(&latex, "height") <= 480.0);
+
+        let mut diagram = String::from("flowchart LR\n");
+        for index in 0..32 {
+            diagram.push_str(&format!("N{index}[Stage {index}] --> N{}\n", index + 1));
+        }
+        let mermaid = render_mermaid_svg(&diagram).expect("wide Mermaid diagram should render");
+        assert!(svg_dimension(&mermaid, "width") <= 720.0);
+        assert!(svg_dimension(&mermaid, "height") <= 640.0);
+    }
+
+    fn svg_dimension(svg: &str, attribute: &str) -> f32 {
+        let marker = format!("{attribute}=\"");
+        svg.split_once(&marker)
+            .and_then(|(_, suffix)| suffix.split_once('"'))
+            .and_then(|(value, _)| value.trim_end_matches("pt").parse().ok())
+            .expect("SVG root should have a numeric dimension")
     }
 
     #[test]

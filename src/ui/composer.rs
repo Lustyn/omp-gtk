@@ -7,11 +7,30 @@ use gtk4 as gtk;
 
 use super::icons;
 
+pub(crate) fn texture_from_pixbuf(pixbuf: &gdk_pixbuf::Pixbuf) -> gtk::gdk::Texture {
+    let format = if pixbuf.has_alpha() {
+        gtk::gdk::MemoryFormat::R8g8b8a8
+    } else {
+        gtk::gdk::MemoryFormat::R8g8b8
+    };
+    gtk::gdk::MemoryTexture::new(
+        pixbuf.width(),
+        pixbuf.height(),
+        format,
+        &pixbuf.read_pixel_bytes(),
+        pixbuf.rowstride() as usize,
+    )
+    .upcast()
+}
+
 #[derive(Clone)]
 pub(crate) struct ComposerView {
     root: gtk::Box,
     input: gtk::TextView,
     attach: gtk::Button,
+    session_actions: gtk::MenuButton,
+    branch: gtk::Button,
+    handoff: gtk::Button,
     attachment_strip: gtk::ScrolledWindow,
     attachment_list: gtk::Box,
     attachment_previews: Rc<RefCell<HashMap<u64, gtk::Box>>>,
@@ -89,9 +108,10 @@ pub(crate) fn build() -> ComposerView {
     let attachment_strip = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Automatic)
         .vscrollbar_policy(gtk::PolicyType::Never)
-        .propagate_natural_height(true)
+        .propagate_natural_height(false)
         .child(&attachment_list)
         .build();
+    attachment_strip.set_size_request(-1, 96);
     attachment_strip.set_margin_top(7);
     attachment_strip.set_margin_start(10);
     attachment_strip.set_margin_end(10);
@@ -109,6 +129,7 @@ pub(crate) fn build() -> ComposerView {
     attach.set_sensitive(false);
     attach.add_css_class("composer-affordance");
     attach.add_css_class("attachment-button");
+    let (session_actions, branch, handoff) = build_session_actions();
 
     let model_icon = icons::provider_icon("", 15);
     model_icon.root.add_css_class("provider-icon");
@@ -205,6 +226,7 @@ pub(crate) fn build() -> ComposerView {
     controls.append(&queue_count);
     controls.append(&spacer);
     controls.append(&attach);
+    controls.append(&session_actions);
     controls.append(&stop);
     controls.append(&send);
     composer.append(&subagent_bar);
@@ -248,6 +270,9 @@ pub(crate) fn build() -> ComposerView {
         root: composer,
         input,
         attach,
+        session_actions,
+        branch,
+        handoff,
         attachment_strip,
         attachment_list,
         attachment_previews,
@@ -295,6 +320,14 @@ impl ComposerView {
 
     pub(crate) fn connect_attach_clicked(&self, callback: impl Fn() + 'static) {
         self.attach.connect_clicked(move |_| callback());
+    }
+
+    pub(crate) fn connect_branch_clicked(&self, callback: impl Fn() + 'static) {
+        self.branch.connect_clicked(move |_| callback());
+    }
+
+    pub(crate) fn connect_handoff_clicked(&self, callback: impl Fn() + 'static) {
+        self.handoff.connect_clicked(move |_| callback());
     }
 
     pub(crate) fn connect_model_clicked(&self, callback: impl Fn() + 'static) {
@@ -359,6 +392,12 @@ impl ComposerView {
         self.attach.set_sensitive(sensitive);
     }
 
+    pub(crate) fn set_session_actions_visible(&self, visible: bool) {
+        self.session_actions.set_visible(visible);
+        self.branch.set_visible(visible);
+        self.handoff.set_visible(visible);
+    }
+
     pub(crate) fn append_attachment_preview(
         &self,
         id: u64,
@@ -366,7 +405,11 @@ impl ComposerView {
         texture: &gtk::gdk::Texture,
         callback: impl Fn(u64) + 'static,
     ) {
-        let picture = gtk::Picture::for_paintable(texture);
+        let texture = Self::attachment_preview_texture(texture);
+        let picture = gtk::Picture::for_paintable(&texture);
+        picture.set_can_shrink(true);
+        picture.set_hexpand(false);
+        picture.set_vexpand(false);
         picture.set_content_fit(gtk::ContentFit::Cover);
         picture.set_size_request(76, 64);
         picture.update_property(&[gtk::accessible::Property::Description(&format!(
@@ -411,6 +454,23 @@ impl ComposerView {
         }
         self.attachment_previews.borrow_mut().clear();
         self.attachment_strip.set_visible(false);
+    }
+
+    fn attachment_preview_texture(texture: &gtk::gdk::Texture) -> gtk::gdk::Texture {
+        if texture.width() <= 76 && texture.height() <= 64 {
+            return texture.clone();
+        }
+        let bytes = texture.save_to_png_bytes();
+        let stream = gtk::gio::MemoryInputStream::from_bytes(&bytes);
+        gdk_pixbuf::Pixbuf::from_stream_at_scale(
+            &stream,
+            76,
+            64,
+            true,
+            None::<&gtk::gio::Cancellable>,
+        )
+        .map(|preview| texture_from_pixbuf(&preview))
+        .unwrap_or_else(|_| texture.clone())
     }
 
     pub(crate) fn has_attachments(&self) -> bool {
@@ -546,6 +606,92 @@ impl ComposerView {
         container.append(label);
         container.set_visible(true);
     }
+}
+
+fn build_session_actions() -> (gtk::MenuButton, gtk::Button, gtk::Button) {
+    let root = gtk::MenuButton::new();
+    root.set_visible(false);
+    root.set_tooltip_text(Some("Choose how to continue in a new conversation"));
+    root.update_property(&[gtk::accessible::Property::Label(
+        "Continue in a new conversation",
+    )]);
+    root.add_css_class("session-actions");
+    root.set_child(Some(&icons::icon(icons::Icon::MessageSquareShare, 16)));
+
+    let popover = gtk::Popover::builder()
+        .has_arrow(true)
+        .autohide(true)
+        .position(gtk::PositionType::Top)
+        .build();
+    popover.add_css_class("session-actions-popover");
+    let actions = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    actions.add_css_class("session-actions-menu");
+    let heading = gtk::Label::new(Some("Continue in a new conversation"));
+    heading.set_xalign(0.0);
+    heading.add_css_class("session-actions-heading");
+    let help = gtk::Label::new(Some("Choose how much of this conversation moves forward."));
+    help.set_xalign(0.0);
+    help.set_wrap(true);
+    help.add_css_class("session-actions-help");
+    actions.append(&heading);
+    actions.append(&help);
+
+    let branch = gtk::Button::new();
+    branch.set_tooltip_text(Some(
+        "Copy history through a user message into an independent conversation",
+    ));
+    branch.update_property(&[gtk::accessible::Property::Label(
+        "Branch into an independent conversation from a user message",
+    )]);
+    branch.add_css_class("session-action");
+    let branch_content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    branch_content.append(&icons::icon(icons::Icon::GitBranchPlus, 17));
+    let branch_copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    branch_copy.set_hexpand(true);
+    let branch_title = gtk::Label::new(Some("Branch from a message"));
+    branch_title.set_xalign(0.0);
+    branch_title.add_css_class("session-action-title");
+    let branch_detail = gtk::Label::new(Some("Copy full history through a point"));
+    branch_detail.set_xalign(0.0);
+    branch_detail.add_css_class("session-action-detail");
+    branch_copy.append(&branch_title);
+    branch_copy.append(&branch_detail);
+    branch_content.append(&branch_copy);
+    branch.set_child(Some(&branch_content));
+
+    let handoff = gtk::Button::new();
+    handoff.set_tooltip_text(Some(
+        "Summarize this conversation and continue in a fresh one",
+    ));
+    handoff.update_property(&[gtk::accessible::Property::Label(
+        "Continue in a new conversation with a focused summary",
+    )]);
+    handoff.add_css_class("session-action");
+    let handoff_content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    handoff_content.append(&icons::icon(icons::Icon::MessageSquareShare, 17));
+    let handoff_copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    handoff_copy.set_hexpand(true);
+    let handoff_title = gtk::Label::new(Some("Summarize and continue"));
+    handoff_title.set_xalign(0.0);
+    handoff_title.add_css_class("session-action-title");
+    let handoff_detail = gtk::Label::new(Some("Carry a focused summary into a fresh conversation"));
+    handoff_detail.set_xalign(0.0);
+    handoff_detail.set_wrap(true);
+    handoff_detail.add_css_class("session-action-detail");
+    handoff_copy.append(&handoff_title);
+    handoff_copy.append(&handoff_detail);
+    handoff_content.append(&handoff_copy);
+    handoff.set_child(Some(&handoff_content));
+
+    actions.append(&branch);
+    actions.append(&handoff);
+    popover.set_child(Some(&actions));
+    root.set_popover(Some(&popover));
+    let popover_for_branch = popover.clone();
+    branch.connect_clicked(move |_| popover_for_branch.popdown());
+    handoff.connect_clicked(move |_| popover.popdown());
+
+    (root, branch, handoff)
 }
 
 pub fn thinking_option(level: &str) -> gtk::Button {
