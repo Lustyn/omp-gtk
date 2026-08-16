@@ -690,7 +690,7 @@ pub fn presentation(
         .map(ToOwned::to_owned)
         .unwrap_or(summary);
     ToolPresentation {
-        title: tool_title(&normalized),
+        title: tool_title(&normalized, args),
         summary: compact(&summary, 150),
         details: detail_text(args, result),
         icon: tool_icon(&normalized),
@@ -882,7 +882,7 @@ fn result_suffix(summary: String, result: Option<&Value>) -> String {
     }
 }
 
-fn tool_title(name: &str) -> String {
+fn tool_title(name: &str, args: &Value) -> String {
     match name {
         "read" => "Read file",
         "bash" => "Terminal",
@@ -903,7 +903,7 @@ fn tool_title(name: &str) -> String {
         "rewind" => "Rewind",
         "security_scan" => "Security scan",
         "task" => "Delegate tasks",
-        "hub" => "Agent hub",
+        "hub" => hub_title(args),
         "todo" => "Task list",
         "web_search" => "Web search",
         "write" => "Write file",
@@ -920,6 +920,30 @@ fn tool_title(name: &str) -> String {
         _ => return title_case(&name.replace(['_', '-'], " ")),
     }
     .to_owned()
+}
+
+fn hub_title(args: &Value) -> &'static str {
+    match string(args, "op") {
+        Some("start") => "Start process",
+        Some("ps") => "List processes",
+        Some("logs") => "Read process output",
+        Some("stop") => "Stop process",
+        Some("restart") => "Restart process",
+        Some("describe") => "Inspect process",
+        Some("send") if string(args, "name").is_some() && string(args, "signal").is_some() => {
+            "Signal process"
+        }
+        Some("send") if string(args, "name").is_some() => "Send process input",
+        Some("send") if string(args, "to") == Some("all") => "Message agents",
+        Some("send") => "Message agent",
+        Some("wait") if string(args, "name").is_some() => "Wait for process",
+        Some("wait") => "Wait for agent activity",
+        Some("inbox") => "Read agent messages",
+        Some("list") => "List agents",
+        Some("jobs") => "List agent jobs",
+        Some("cancel") => "Cancel agent jobs",
+        _ => "Agent hub",
+    }
 }
 
 fn tool_icon(name: &str) -> icons::Icon {
@@ -1266,6 +1290,57 @@ mod tests {
         assert!(mcp.summary.contains("linear"));
         let custom = presentation("deploy_preview", &json!({"name": "staging"}), None, None);
         assert_eq!(custom.summary, "staging");
+    }
+
+    #[test]
+    fn hub_operations_get_specific_titles() {
+        let cases = [
+            (json!({"op": "start", "name": "web"}), "Start process"),
+            (json!({"op": "ps"}), "List processes"),
+            (json!({"op": "logs", "name": "web"}), "Read process output"),
+            (json!({"op": "stop", "name": "web"}), "Stop process"),
+            (json!({"op": "restart", "name": "web"}), "Restart process"),
+            (json!({"op": "describe", "name": "web"}), "Inspect process"),
+            (
+                json!({"op": "send", "name": "web", "text": "y"}),
+                "Send process input",
+            ),
+            (
+                json!({"op": "send", "name": "web", "signal": "SIGINT"}),
+                "Signal process",
+            ),
+            (json!({"op": "send", "to": "Worker"}), "Message agent"),
+            (json!({"op": "send", "to": "all"}), "Message agents"),
+            (json!({"op": "wait", "name": "web"}), "Wait for process"),
+            (
+                json!({"op": "wait", "from": "Worker"}),
+                "Wait for agent activity",
+            ),
+            (json!({"op": "inbox"}), "Read agent messages"),
+            (json!({"op": "list"}), "List agents"),
+            (json!({"op": "jobs"}), "List agent jobs"),
+            (
+                json!({"op": "cancel", "ids": ["job-1"]}),
+                "Cancel agent jobs",
+            ),
+            (json!({"op": "unknown"}), "Agent hub"),
+        ];
+
+        for (args, expected) in cases {
+            assert_eq!(presentation("hub", &args, None, None).title, expected);
+        }
+    }
+
+    #[test]
+    fn hub_operation_title_keeps_the_specific_intent_summary() {
+        let rendered = presentation(
+            "hub",
+            &json!({"op": "logs", "name": "stage-resume-app"}),
+            None,
+            Some("Reading staging prompt"),
+        );
+        assert_eq!(rendered.title, "Read process output");
+        assert_eq!(rendered.summary, "Reading staging prompt");
     }
 
     #[test]

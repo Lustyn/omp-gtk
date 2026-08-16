@@ -343,6 +343,7 @@ enum EmbeddedMarkdownContent {
     InlineMath(String),
     DisplayMath(String),
     Table(MarkdownTable),
+    HorizontalRule,
     Mermaid(String),
 }
 
@@ -448,6 +449,7 @@ struct MarkdownRenderer {
     quote_depth: usize,
     headings: Vec<MarkdownHeading>,
     active_heading: Option<ActiveHeading>,
+    explicit_rule_before_next_block: bool,
     seen_heading: bool,
 }
 
@@ -467,6 +469,7 @@ impl MarkdownRenderer {
             quote_depth: 0,
             headings: Vec::new(),
             active_heading: None,
+            explicit_rule_before_next_block: false,
             seen_heading: false,
         }
     }
@@ -494,6 +497,7 @@ impl MarkdownRenderer {
             }
             Event::DisplayMath(math) => {
                 if !self.append_captured(&math) {
+                    self.explicit_rule_before_next_block = false;
                     self.block();
                     self.embed(EmbeddedMarkdownContent::DisplayMath(math.into_string()));
                 }
@@ -521,9 +525,8 @@ impl MarkdownRenderer {
             }
             Event::Rule => {
                 self.block();
-                self.tag("<span foreground=\"#3d424a\">");
-                self.text("────────────────────────");
-                self.tag("</span>");
+                self.embed(EmbeddedMarkdownContent::HorizontalRule);
+                self.explicit_rule_before_next_block = true;
             }
             Event::TaskListMarker(checked) => {
                 let marker = if checked { "☑ " } else { "☐ " };
@@ -538,6 +541,7 @@ impl MarkdownRenderer {
     fn start(&mut self, tag: Tag<'_>) {
         match tag {
             Tag::Paragraph => {
+                self.explicit_rule_before_next_block = false;
                 if self.after_block_marker {
                     self.after_block_marker = false;
                 } else {
@@ -547,10 +551,10 @@ impl MarkdownRenderer {
             }
             Tag::Heading { level, .. } => {
                 self.block();
-                if self.seen_heading {
-                    self.tag("<span foreground=\"#3d424a\">");
-                    self.text("────────────────────────");
-                    self.tag("</span>");
+                let follows_explicit_rule =
+                    std::mem::take(&mut self.explicit_rule_before_next_block);
+                if self.seen_heading && !follows_explicit_rule {
+                    self.embed(EmbeddedMarkdownContent::HorizontalRule);
                     self.breaks(1);
                 }
                 self.seen_heading = true;
@@ -571,6 +575,7 @@ impl MarkdownRenderer {
                 ));
             }
             Tag::BlockQuote(_) => {
+                self.explicit_rule_before_next_block = false;
                 self.block();
                 self.quote_depth += 1;
                 self.tag("<span foreground=\"#777d88\">");
@@ -578,6 +583,7 @@ impl MarkdownRenderer {
                 self.after_block_marker = true;
             }
             Tag::CodeBlock(kind) => {
+                self.explicit_rule_before_next_block = false;
                 self.block();
                 self.quote_prefix();
                 let language = match kind {
@@ -593,8 +599,12 @@ impl MarkdownRenderer {
                     text: String::new(),
                 });
             }
-            Tag::HtmlBlock => self.block(),
+            Tag::HtmlBlock => {
+                self.explicit_rule_before_next_block = false;
+                self.block();
+            }
             Tag::List(start) => {
+                self.explicit_rule_before_next_block = false;
                 if self.lists.is_empty() {
                     self.block();
                 } else {
@@ -632,16 +642,21 @@ impl MarkdownRenderer {
                 self.after_block_marker = true;
             }
             Tag::FootnoteDefinition(name) => {
+                self.explicit_rule_before_next_block = false;
                 self.block();
                 self.text("[");
                 self.text(&name);
                 self.text("] ");
                 self.after_block_marker = true;
             }
-            Tag::DefinitionList => self.block(),
+            Tag::DefinitionList => {
+                self.explicit_rule_before_next_block = false;
+                self.block();
+            }
             Tag::DefinitionListTitle => self.tag("<b>"),
             Tag::DefinitionListDefinition => self.text(" — "),
             Tag::Table(alignments) => {
+                self.explicit_rule_before_next_block = false;
                 self.block();
                 self.quote_prefix();
                 self.table = Some(TableState::new(alignments));
@@ -1290,9 +1305,78 @@ impl InlineCodeAnchor {
     }
 }
 
+mod horizontal_rule_anchor {
+    use super::*;
+    use gtk::subclass::prelude::*;
+
+    #[derive(Default)]
+    pub(super) struct HorizontalRuleAnchor;
+
+    #[glib::object_subclass]
+    impl ObjectSubclass for HorizontalRuleAnchor {
+        const NAME: &'static str = "OmpHorizontalRuleAnchor";
+        type Type = super::HorizontalRuleAnchor;
+        type ParentType = gtk::Widget;
+    }
+
+    impl ObjectImpl for HorizontalRuleAnchor {
+        fn constructed(&self) {
+            self.parent_constructed();
+
+            let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
+            separator.add_css_class("markdown-horizontal-rule");
+            separator.set_parent(&*self.obj());
+        }
+
+        fn dispose(&self) {
+            if let Some(separator) = self.obj().first_child() {
+                separator.unparent();
+            }
+        }
+    }
+
+    impl WidgetImpl for HorizontalRuleAnchor {
+        fn measure(&self, orientation: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
+            let Some(separator) = self.obj().first_child() else {
+                return (0, 0, -1, -1);
+            };
+            if orientation == gtk::Orientation::Horizontal {
+                (560, 560, -1, -1)
+            } else {
+                separator.measure(orientation, for_size)
+            }
+        }
+
+        fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
+            if let Some(separator) = self.obj().first_child() {
+                separator.allocate(width, height, baseline, None);
+            }
+        }
+
+        fn snapshot(&self, snapshot: &gtk::Snapshot) {
+            if let Some(separator) = self.obj().first_child() {
+                self.obj().snapshot_child(&separator, snapshot);
+            }
+        }
+    }
+}
+
+glib::wrapper! {
+    struct HorizontalRuleAnchor(ObjectSubclass<horizontal_rule_anchor::HorizontalRuleAnchor>)
+        @extends gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
+}
+
+impl HorizontalRuleAnchor {
+    fn new() -> Self {
+        glib::Object::new()
+    }
+}
+
 fn embedded_markdown_widget(content: EmbeddedMarkdownContent) -> gtk::Widget {
     match content {
         EmbeddedMarkdownContent::InlineCode(text) => InlineCodeAnchor::new(&text).upcast(),
+        EmbeddedMarkdownContent::HorizontalRule => HorizontalRuleAnchor::new().upcast(),
         EmbeddedMarkdownContent::CodeBlock(text) => markdown_code_block_label(&text).upcast(),
         EmbeddedMarkdownContent::InlineMath(source) => latex_widget(&source, false),
         EmbeddedMarkdownContent::DisplayMath(source) => latex_widget(&source, true),
@@ -1430,7 +1514,8 @@ fn mermaid_widget(source: &str) -> gtk::Widget {
 
 fn render_mermaid_svg(source: &str) -> Result<String, String> {
     let parsed = mermaid_rs_renderer::parse_mermaid(source).map_err(|error| error.to_string())?;
-    let theme = mermaid_rs_renderer::Theme::dark();
+    let mut theme = mermaid_rs_renderer::Theme::dark();
+    theme.background = "none".to_owned();
     let config = mermaid_rs_renderer::LayoutConfig::default();
     let layout = mermaid_rs_renderer::compute_layout(&parsed.graph, &theme, &config);
     let dimensions = mermaid_rs_renderer::measure_svg_dimensions(&layout, &config, None);
@@ -2099,8 +2184,33 @@ mod tests {
 
         assert_eq!(
             plain_text,
-            "Heading\nParagraph\n│ Quote\n1. first\n\u{fffc}\n────────────────────────\nAfter"
+            "Heading\nParagraph\n│ Quote\n1. first\n\u{fffc}\n\u{fffc}\nAfter"
         );
+        assert!(matches!(
+            rendered.embedded.as_slice(),
+            [
+                super::EmbeddedMarkdown {
+                    content: EmbeddedMarkdownContent::CodeBlock(_),
+                    ..
+                },
+                super::EmbeddedMarkdown {
+                    content: EmbeddedMarkdownContent::HorizontalRule,
+                    ..
+                }
+            ]
+        ));
+    }
+
+    #[test]
+    fn explicit_rule_replaces_automatic_heading_rule() {
+        let rendered = render_markdown("# Overview\nIntro\n\n---\n\n## Design\nDetails");
+        let rule_count = rendered
+            .embedded
+            .iter()
+            .filter(|embedded| embedded.content == EmbeddedMarkdownContent::HorizontalRule)
+            .count();
+
+        assert_eq!(rule_count, 1);
     }
 
     #[test]
@@ -2113,7 +2223,7 @@ mod tests {
 
         assert_eq!(
             plain_text,
-            "Overview\nIntro\n────────────────────────\nDesign\nDetails\n────────────────────────\nParser\nImplementation"
+            "Overview\nIntro\n\u{fffc}\nDesign\nDetails\n\u{fffc}\nParser\nImplementation"
         );
         assert_eq!(
             rendered
@@ -2301,6 +2411,7 @@ A=
         assert!(mermaid.starts_with("<svg"));
         assert!(mermaid.contains("A"));
         assert!(mermaid.contains("B"));
+        assert!(!mermaid.contains("fill=\"#333333\""));
     }
 
     #[test]

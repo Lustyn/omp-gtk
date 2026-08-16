@@ -703,10 +703,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "omp-gtk-sound-pack-{}-{nonce}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("omp-gtk-sound-pack-{}-{nonce}", std::process::id()));
         fs::create_dir_all(root.join("sounds")).expect("create sound fixture");
         fs::write(root.join("sounds/done.ogg"), b"OggSdone").expect("write completion sound");
         fs::write(root.join("sounds/start.ogg"), b"OggSstart").expect("write start sound");

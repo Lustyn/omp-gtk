@@ -36,7 +36,7 @@ pub(crate) fn find(id: &str) -> Option<Story> {
     STORIES.iter().copied().find(|story| story.id == id)
 }
 
-const STORIES: [Story; 50] = [
+const STORIES: [Story; 51] = [
     Story {
         id: "header/ready",
         title: "Header · Ready",
@@ -360,6 +360,13 @@ const STORIES: [Story; 50] = [
         build: tool_group_running,
     },
     Story {
+        id: "tool-group/hub-process",
+        title: "Tool activity · Managed process",
+        width: 780,
+        height: 250,
+        build: tool_group_hub_process,
+    },
+    Story {
         id: "tool-group/completed",
         title: "Tool activity · Completed",
         width: 780,
@@ -555,13 +562,7 @@ This paragraph starts directly after its heading without running into it.
 
 $$\frac{-b \pm \sqrt{b^2 - 4ac}}{2a}$$
 
-### Structured output
-Tables and formulas become rich widgets as soon as their Markdown is complete.
-
-| Renderer | Output | Status |
-| :--- | :---: | ---: |
-| LaTeX | Vector formula | Ready |
-| Mermaid | Native SVG | Ready |
+---
 
 ## Diagrams and code
 
@@ -573,6 +574,14 @@ flowchart LR
     Formula --> GTK
     Mermaid --> GTK
 ```
+
+### Structured output
+Tables and formulas become rich widgets as soon as their Markdown is complete.
+
+| Renderer | Output | Status |
+| :--- | :---: | ---: |
+| LaTeX | Vector formula | Ready |
+| Mermaid | Native SVG | Ready |
 
 ```rust
 fn render(markdown: &str) {
@@ -1502,6 +1511,37 @@ fn tool_group_running() -> gtk::Widget {
             group.complete(id, &json!({"text": "Done"}), false);
         }
     }
+    group.root.clone().upcast()
+}
+
+fn tool_group_hub_process() -> gtk::Widget {
+    let group = ToolActivityGroup::new();
+    for (id, args, intent) in [
+        (
+            "start",
+            json!({
+                "op": "start",
+                "name": "stage-resume-app",
+                "application": "git",
+                "args": ["add", "-p", "src/app.rs"]
+            }),
+            "Staging resume controller hunks",
+        ),
+        (
+            "logs",
+            json!({"op": "logs", "name": "stage-resume-app", "lines": 80}),
+            "Reading staging prompt",
+        ),
+        (
+            "send",
+            json!({"op": "send", "name": "stage-resume-app", "text": "y"}),
+            "Selecting resume import",
+        ),
+    ] {
+        group.ensure_card(id, "hub", &args, Some(intent));
+        group.complete(id, &json!({"text": "Done"}), false);
+    }
+    group.finish();
     group.root.clone().upcast()
 }
 

@@ -267,12 +267,14 @@ textview.message-body text selection {
     border-right: 0;
 }
 
+.markdown-horizontal-rule {
+    min-height: 1px;
+    margin: 8px 0;
+    background: rgba(220, 224, 231, 0.12);
+}
+
 .markdown-mermaid {
-    margin: 7px 0;
-    padding: 10px;
-    border: 1px solid #343b47;
-    border-radius: 9px;
-    background: #11151b;
+    margin: 8px 0;
 }
 
 .markdown-latex-error,

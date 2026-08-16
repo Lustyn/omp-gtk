@@ -34,10 +34,8 @@ pub struct ProviderIcon {
 }
 
 pub fn initialize_lucide_font() -> Result<(), String> {
-    let path = std::env::temp_dir().join(format!(
-        "omp-gtk-lucide-{}.ttf",
-        env!("CARGO_PKG_VERSION")
-    ));
+    let path =
+        std::env::temp_dir().join(format!("omp-gtk-lucide-{}.ttf", env!("CARGO_PKG_VERSION")));
     let bytes = lucide_icons::LUCIDE_FONT_BYTES;
     let needs_write = std::fs::metadata(&path)
         .map(|metadata| metadata.len() != bytes.len() as u64)
