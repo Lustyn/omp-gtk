@@ -1,9 +1,3 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::ffi::CString;
-use std::os::unix::ffi::OsStrExt;
-
-use fontconfig_sys as fontconfig;
 use gtk::gdk;
 use gtk::glib;
 use gtk::prelude::*;
@@ -15,6 +9,11 @@ use simple_icons_pack::{
     SI_METAAI, SI_MINIMAX, SI_MISTRALAI, SI_MOONSHOTAI, SI_NVIDIA, SI_OLLAMA, SI_OPENCODE,
     SI_OPENROUTER, SI_QWEN, SI_VERCEL, SI_VLLM, SI_X, SI_XIAOMI,
 };
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+#[cfg(target_os = "macos")]
+use std::path::Path;
 
 const OPENAI_ICON: BrandIcon = BrandIcon {
     svg: include_str!("../assets/openai.svg"),
@@ -44,19 +43,67 @@ pub fn initialize_lucide_font() -> Result<(), String> {
         std::fs::write(&path, bytes)
             .map_err(|error| format!("failed to stage Lucide font: {error}"))?;
     }
-    let path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| "Lucide font path contains a null byte".to_owned())?;
-    unsafe {
-        let config = fontconfig::FcConfigGetCurrent();
-        if config.is_null() || fontconfig::FcConfigAppFontAddFile(config, path.as_ptr().cast()) == 0
-        {
-            return Err("fontconfig rejected the bundled Lucide font".to_owned());
-        }
-        if fontconfig::FcConfigBuildFonts(config) == 0 {
-            return Err("fontconfig could not rebuild its application font set".to_owned());
-        }
-    }
+    register_lucide_font(&path)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn register_lucide_font(path: &std::path::Path) -> Result<(), String> {
+    let context = gtk::Label::new(None).create_pango_context();
+    let font_map = context
+        .font_map()
+        .ok_or_else(|| "GTK did not provide a Pango font map".to_owned())?;
+    font_map
+        .add_font_file(path)
+        .map_err(|error| format!("failed to load bundled Lucide font: {error}"))?;
+    font_map.changed();
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn register_lucide_font(path: &Path) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    use objc2_core_foundation::CFURL;
+    use objc2_core_text::{CTFontManagerRegisterFontsForURL, CTFontManagerScope};
+
+    let path = path.as_os_str().as_bytes();
+    let path_length =
+        isize::try_from(path.len()).map_err(|_| "Lucide font path is too long".to_owned())?;
+    let font_url =
+        unsafe { CFURL::from_file_system_representation(None, path.as_ptr(), path_length, false) }
+            .ok_or_else(|| "CoreText rejected the Lucide font path".to_owned())?;
+
+    let registered = unsafe {
+        CTFontManagerRegisterFontsForURL(
+            &font_url,
+            CTFontManagerScope::Process,
+            std::ptr::null_mut(),
+        )
+    };
+    if registered {
+        Ok(())
+    } else {
+        Err("CoreText rejected the bundled Lucide font".to_owned())
+    }
+}
+
+pub fn verify_lucide_font() -> Result<(), String> {
+    let context = gtk::Label::new(None).create_pango_context();
+    let font_map = context
+        .font_map()
+        .ok_or_else(|| "GTK did not provide a Pango font map".to_owned())?;
+    let description = gtk::pango::FontDescription::from_string("lucide");
+    let loaded_font = font_map
+        .load_font(&context, &description)
+        .ok_or_else(|| "Pango could not resolve the bundled Lucide font".to_owned())?;
+    let loaded_family = loaded_font.describe().family().unwrap_or_default();
+    if loaded_family.eq_ignore_ascii_case("lucide") {
+        Ok(())
+    } else {
+        Err(format!(
+            "Pango resolved Lucide icons to fallback font {loaded_family:?}"
+        ))
+    }
 }
 
 fn texture(bytes: &'static [u8], description: &str) -> gdk::Texture {

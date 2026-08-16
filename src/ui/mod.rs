@@ -22,8 +22,6 @@ use gtk::gdk;
 use gtk4 as gtk;
 
 pub(crate) fn initialize() {
-    icons::initialize_lucide_font().expect("failed to load bundled Lucide icon font");
-
     let provider = gtk::CssProvider::new();
     provider.load_from_string(include_str!("style.css"));
     let display = gdk::Display::default().expect("a graphical display");

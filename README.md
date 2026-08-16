@@ -72,7 +72,7 @@ Model providers, credentials, tools, extensions, and session storage are configu
 
 ## Requirements
 
-- Linux or macOS with a graphical GTK session
+- Linux or macOS
 - GTK 4.22+
 - libadwaita 1.9+
 - Fontconfig, plus ALSA development libraries on Linux
@@ -115,7 +115,7 @@ macOS with [Homebrew](https://brew.sh/):
 
 ```bash
 xcode-select --install
-brew install fontconfig gtk4 libadwaita pkgconf
+brew install fontconfig gsettings-desktop-schemas gtk4 libadwaita pkgconf
 ```
 
 Install Rust separately if it is not already available:

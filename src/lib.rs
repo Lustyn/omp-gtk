@@ -27,10 +27,47 @@ pub fn run_ui_gallery() -> glib::ExitCode {
     ui::gallery::run()
 }
 
+#[cfg(target_os = "macos")]
+fn configure_macos_gsettings() {
+    use std::path::{Path, PathBuf};
+
+    if std::env::var_os("GSETTINGS_SCHEMA_DIR").is_some() {
+        return;
+    }
+
+    let schema_dir = std::env::var_os("HOMEBREW_PREFIX")
+        .map(PathBuf::from)
+        .map(|prefix| prefix.join("share/glib-2.0/schemas"))
+        .filter(|directory| directory.join("gschemas.compiled").is_file())
+        .or_else(|| {
+            ["/opt/homebrew", "/usr/local"]
+                .into_iter()
+                .map(Path::new)
+                .map(|prefix| prefix.join("share/glib-2.0/schemas"))
+                .find(|directory| directory.join("gschemas.compiled").is_file())
+        });
+
+    if let Some(schema_dir) = schema_dir {
+        // GTK has not started any threads yet, so changing the process environment is safe.
+        unsafe {
+            std::env::set_var("GSETTINGS_SCHEMA_DIR", schema_dir);
+        }
+    }
+}
+
 pub(crate) fn initialize_gtk() {
+    #[cfg(target_os = "macos")]
+    configure_macos_gsettings();
+
     gtk::gio::resources_register_include!("omp-gtk.gresource")
         .expect("Failed to register application resources");
+    #[cfg(target_os = "macos")]
+    ui::icons::initialize_lucide_font().expect("failed to load bundled Lucide icon font");
+
     gtk::init().expect("GTK initialization failed");
+    #[cfg(not(target_os = "macos"))]
+    ui::icons::initialize_lucide_font().expect("failed to load bundled Lucide icon font");
+    ui::icons::verify_lucide_font().expect("failed to resolve bundled Lucide icon font");
 
     let display = gtk::gdk::Display::default().expect("Failed to connect to a display");
     gtk::IconTheme::for_display(&display).add_resource_path("/dev/omp/Gtk/icons");
