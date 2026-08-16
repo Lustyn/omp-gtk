@@ -129,48 +129,43 @@ paned > separator {
     font-weight: 700;
 }
 
-.message-outline {
-    min-width: 30px;
-    min-height: 30px;
-    padding: 4px;
-    border: 1px solid #343a45;
-    border-radius: 9px;
-    background: rgba(20, 24, 32, 0.9);
-    color: #aeb5c1;
-    opacity: 0.72;
-    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.24);
+.message-outline-pane {
+    border-right: 1px solid #22262d;
+    background: #0b0d10;
 }
 
-.message-outline:hover,
-.message-outline:checked {
-    color: #f4c867;
-    opacity: 1;
+.message-outline-pane .message-outline-scroll,
+.message-outline-pane .message-outline-scroll > viewport,
+.message-outline-pane .message-outline-scroll > undershoot,
+.message-outline-pane .message-outline-scroll > overshoot,
+.message-outline-list,
+.message-outline-header,
+.message-outline-entry {
+    background: transparent;
 }
 
-.message-outline-popover contents {
-    padding: 8px;
-    border: 1px solid #343a45;
-    border-radius: 12px;
-    background: #171b22;
-}
-
-.message-outline-list {
-    padding: 2px;
+.message-outline-header {
+    min-height: 34px;
+    padding: 6px 12px;
+    border-bottom: 1px solid #22262d;
+    color: #858d99;
 }
 
 .message-outline-title {
-    padding: 6px 8px 7px;
-    color: #9299a6;
+    color: #aab1bc;
     font-size: 11px;
     font-weight: 700;
 }
 
+.message-outline-list {
+    padding: 8px 10px 12px;
+}
+
 .message-outline-entry {
-    min-height: 30px;
-    padding: 4px 8px;
+    min-height: 32px;
+    padding: 6px 8px;
     border: 0;
-    border-radius: 7px;
-    background: transparent;
+    border-radius: 0;
     color: #dce0e7;
     font-size: 13px;
     font-weight: 500;
@@ -178,7 +173,7 @@ paned > separator {
 
 .message-outline-entry:hover,
 .message-outline-entry:focus {
-    background: #252b35;
+    background: transparent;
     color: #f4c867;
 }
 

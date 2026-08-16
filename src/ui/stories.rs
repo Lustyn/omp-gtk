@@ -564,7 +564,7 @@ $$\frac{-b \pm \sqrt{b^2 - 4ac}}{2a}$$
 
 ---
 
-## Diagrams and code
+## Diagrams, code, and structured native output without truncated heading text
 
 ```mermaid
 flowchart LR

@@ -22,7 +22,7 @@ pub(crate) struct ConversationView {
 }
 
 struct ConversationOutline {
-    button: gtk::MenuButton,
+    root: gtk::Box,
     list: gtk::Box,
     scroller: glib::WeakRef<gtk::ScrolledWindow>,
     items: glib::WeakRef<gtk::Box>,
@@ -31,52 +31,41 @@ struct ConversationOutline {
 
 impl ConversationOutline {
     fn new(items: &gtk::Box, scroller: &gtk::ScrolledWindow) -> Rc<Self> {
-        let button = gtk::MenuButton::new();
-        button.set_child(Some(&super::icons::icon(
-            super::icons::Icon::TableOfContents,
-            16,
-        )));
-        button.set_tooltip_text(Some("Outline for the message in view"));
-        button.update_property(&[gtk::accessible::Property::Label("Message outline")]);
-        button.set_halign(gtk::Align::End);
-        button.set_valign(gtk::Align::Start);
-        button.set_margin_top(12);
-        button.set_margin_end(12);
-        button.add_css_class("message-outline");
-        button.set_visible(false);
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        root.set_size_request(360, -1);
+        root.set_vexpand(true);
+        root.set_visible(false);
+        root.add_css_class("message-outline-pane");
+
+        let header = gtk::Box::new(gtk::Orientation::Horizontal, 7);
+        header.add_css_class("message-outline-header");
+        header.append(&super::icons::icon(super::icons::Icon::TableOfContents, 14));
+        let title = gtk::Label::new(Some("On this message"));
+        title.set_xalign(0.0);
+        title.set_hexpand(true);
+        title.add_css_class("message-outline-title");
+        header.append(&title);
 
         let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
         list.add_css_class("message-outline-list");
-        let scroll = gtk::ScrolledWindow::new();
-        scroll.set_hscrollbar_policy(gtk::PolicyType::Never);
-        scroll.set_max_content_height(420);
-        scroll.set_min_content_width(280);
-        scroll.set_propagate_natural_height(true);
-        scroll.set_child(Some(&list));
-        let popover = gtk::Popover::new();
-        popover.set_autohide(true);
-        popover.add_css_class("message-outline-popover");
-        popover.set_child(Some(&scroll));
-        button.set_popover(Some(&popover));
+        let scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vscrollbar_policy(gtk::PolicyType::Automatic)
+            .vexpand(true)
+            .child(&list)
+            .build();
+        scroll.add_css_class("message-outline-scroll");
 
-        let outline = Rc::new(Self {
-            button,
+        root.append(&header);
+        root.append(&scroll);
+
+        Rc::new(Self {
+            root,
             list,
             scroller: scroller.downgrade(),
             items: items.downgrade(),
             messages: RefCell::new(Vec::new()),
-        });
-        let motion = gtk::EventControllerMotion::new();
-        let weak = Rc::downgrade(&outline);
-        motion.connect_enter(move |_, _, _| {
-            if let Some(outline) = weak.upgrade()
-                && outline.button.is_visible()
-            {
-                outline.button.popup();
-            }
-        });
-        outline.button.add_controller(motion);
-        outline
+        })
     }
 
     fn track(self: &Rc<Self>, body: MessageBody) {
@@ -92,8 +81,7 @@ impl ConversationOutline {
 
     fn clear(&self) {
         self.messages.borrow_mut().clear();
-        self.button.set_visible(false);
-        self.button.popdown();
+        self.root.set_visible(false);
     }
 
     fn schedule_refresh(self: &Rc<Self>) {
@@ -135,17 +123,12 @@ impl ConversationOutline {
             .max_by(|left, right| left.0.total_cmp(&right.0));
 
         let Some((_, body, headings)) = active else {
-            self.button.set_visible(false);
-            self.button.popdown();
+            self.root.set_visible(false);
             return;
         };
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
-        let title = gtk::Label::new(Some("On this message"));
-        title.set_xalign(0.0);
-        title.add_css_class("message-outline-title");
-        self.list.append(&title);
         let minimum_level = headings
             .iter()
             .map(|heading| heading.level)
@@ -154,7 +137,7 @@ impl ConversationOutline {
         for heading in headings {
             self.append_heading(&body, &heading, minimum_level);
         }
-        self.button.set_visible(true);
+        self.root.set_visible(true);
     }
 
     fn append_heading(&self, body: &MessageBody, heading: &MarkdownHeading, minimum_level: u8) {
@@ -163,7 +146,10 @@ impl ConversationOutline {
         button.add_css_class("message-outline-entry");
         let label = gtk::Label::new(Some(&heading.title));
         label.set_xalign(0.0);
-        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        label.set_hexpand(true);
+        label.set_wrap(true);
+        label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        label.set_max_width_chars(42);
         label.set_margin_start(i32::from(heading.level.saturating_sub(minimum_level)) * 14);
         button.set_child(Some(&label));
         button.update_property(&[gtk::accessible::Property::Label(&format!(
@@ -173,12 +159,10 @@ impl ConversationOutline {
         let body = body.clone();
         let heading = heading.clone();
         let scroller = self.scroller.clone();
-        let menu = self.button.clone();
         button.connect_clicked(move |_| {
             if let Some(scroller) = scroller.upgrade() {
                 body.scroll_to_heading(&heading, &scroller);
             }
-            menu.popdown();
         });
         self.list.append(&button);
     }
@@ -207,15 +191,18 @@ impl ConversationView {
             .build();
         let scroller = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
+            .hexpand(true)
             .vexpand(true)
             .child(&clamp)
             .build();
         scroller.add_css_class("message-scroll");
 
-        let root = gtk::Overlay::new();
-        root.set_child(Some(&scroller));
         let outline = ConversationOutline::new(&items, &scroller);
-        root.add_overlay(&outline.button);
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        content.append(&outline.root);
+        content.append(&scroller);
+        let root = gtk::Overlay::new();
+        root.set_child(Some(&content));
         let weak_outline = Rc::downgrade(&outline);
         scroller.vadjustment().connect_value_changed(move |_| {
             if let Some(outline) = weak_outline.upgrade() {
