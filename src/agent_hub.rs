@@ -227,10 +227,6 @@ impl AgentHubState {
         Some(id)
     }
 
-    pub(crate) fn rows(&self) -> Vec<AgentTreeRow> {
-        self.project_rows(&HashSet::new())
-    }
-
     pub(crate) fn visible_rows(&self, collapsed: &HashSet<String>) -> Vec<AgentTreeRow> {
         self.project_rows(collapsed)
     }
@@ -427,7 +423,7 @@ mod tests {
 
         assert_eq!(hub.len(), 1);
         assert_eq!(hub.active_count(), 1);
-        assert_eq!(hub.rows()[0].agent.id, "Researcher");
+        assert_eq!(hub.visible_rows(&HashSet::new())[0].agent.id, "Researcher");
     }
 
     #[test]
@@ -490,7 +486,7 @@ mod tests {
         .unwrap();
         hub.apply_snapshot(vec![child, parent]);
 
-        let rows = hub.rows();
+        let rows = hub.visible_rows(&HashSet::new());
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].agent.id, "Parent");
         assert_eq!(rows[0].depth, 0);

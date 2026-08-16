@@ -1,5 +1,6 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::SystemTime;
@@ -1314,7 +1315,7 @@ fn agent_hub_story(
     view.set_counts(state.active_count(), state.len());
 
     let pairs = state
-        .rows()
+        .visible_rows(&HashSet::new())
         .into_iter()
         .map(|tree_row| {
             let rendered = agent_hub::agent_row(&tree_row, true);
