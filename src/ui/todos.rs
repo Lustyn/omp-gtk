@@ -45,33 +45,13 @@ pub(crate) enum TodoEdit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TodoAction {
     AddPhase,
-    AddTask {
-        phase: usize,
-    },
-    Start {
-        phase: usize,
-        task: usize,
-    },
-    Complete {
-        phase: usize,
-        task: usize,
-    },
-    Drop {
-        phase: usize,
-        task: usize,
-    },
-    Block {
-        phase: usize,
-        task: usize,
-    },
-    Unblock {
-        phase: usize,
-        task: usize,
-    },
-    Remove {
-        phase: usize,
-        task: usize,
-    },
+    AddTask { phase: usize },
+    Start { phase: usize, task: usize },
+    Complete { phase: usize, task: usize },
+    Drop { phase: usize, task: usize },
+    Block { phase: usize, task: usize },
+    Unblock { phase: usize, task: usize },
+    Remove { phase: usize, task: usize },
     Clear,
 }
 
@@ -118,14 +98,20 @@ pub(crate) fn validate_phases(phases: &[TodoPhase]) -> Result<(), String> {
             return Err("A todo phase name cannot be empty.".to_owned());
         }
         if !phase_names.insert(phase.name.as_str()) {
-            return Err(format!("A todo phase named “{}” already exists.", phase.name));
+            return Err(format!(
+                "A todo phase named “{}” already exists.",
+                phase.name
+            ));
         }
         for task in &phase.tasks {
             if task.content.trim().is_empty() {
                 return Err("A todo task cannot be empty.".to_owned());
             }
             if !task_contents.insert(task.content.as_str()) {
-                return Err(format!("A todo task named “{}” already exists.", task.content));
+                return Err(format!(
+                    "A todo task named “{}” already exists.",
+                    task.content
+                ));
             }
         }
     }
@@ -242,11 +228,7 @@ fn ensure_task(phases: &[TodoPhase], phase: usize, task: usize) -> Result<(), St
         .ok_or_else(|| "That todo no longer exists. Refresh and try again.".to_owned())
 }
 
-fn task_mut(
-    phases: &mut [TodoPhase],
-    phase: usize,
-    task: usize,
-) -> Result<&mut TodoItem, String> {
+fn task_mut(phases: &mut [TodoPhase], phase: usize, task: usize) -> Result<&mut TodoItem, String> {
     phases
         .get_mut(phase)
         .and_then(|phase| phase.tasks.get_mut(task))
@@ -259,12 +241,19 @@ type ActionHandler = Rc<RefCell<Option<Box<dyn Fn(TodoAction)>>>>;
 pub(crate) struct TodoPanel {
     pub(crate) root: gtk::Box,
     summary: gtk::ToggleButton,
+    summary_context: gtk::Label,
+    summary_current: gtk::Label,
+    summary_count: gtk::Label,
+    summary_progress: gtk::ProgressBar,
+    summary_blocked: gtk::Label,
+    summary_disclosure: gtk::Label,
+    summary_description: Rc<RefCell<String>>,
     details: gtk::Revealer,
     list: gtk::Box,
     status: gtk::Label,
     phases: Rc<RefCell<Vec<TodoPhase>>>,
     action_handler: ActionHandler,
-    action_buttons: Rc<RefCell<Vec<gtk::Button>>>,
+    action_controls: Rc<RefCell<Vec<gtk::Widget>>>,
     pending: Rc<Cell<bool>>,
 }
 
@@ -273,22 +262,54 @@ impl TodoPanel {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
         root.add_css_class("todo-panel");
 
-        let summary = gtk::ToggleButton::with_label("Todos · No tasks");
+        let summary_context = gtk::Label::new(Some("PROGRESS"));
+        summary_context.set_xalign(0.0);
+        summary_context.add_css_class("todo-summary-context");
+        let summary_current = gtk::Label::new(None);
+        summary_current.set_xalign(0.0);
+        summary_current.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        summary_current.set_hexpand(true);
+        summary_current.add_css_class("todo-summary-current");
+        let summary_copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        summary_copy.set_hexpand(true);
+        summary_copy.append(&summary_context);
+        summary_copy.append(&summary_current);
+
+        let summary_count = gtk::Label::new(None);
+        summary_count.add_css_class("todo-summary-count");
+        let summary_progress = gtk::ProgressBar::new();
+        summary_progress.set_valign(gtk::Align::Center);
+        summary_progress.add_css_class("todo-summary-progress");
+        let summary_blocked = gtk::Label::new(None);
+        summary_blocked.add_css_class("todo-summary-blocked");
+        let summary_disclosure = gtk::Label::new(Some("Show"));
+        summary_disclosure.add_css_class("todo-summary-disclosure");
+        let summary_meta = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        summary_meta.append(&summary_count);
+        summary_meta.append(&summary_progress);
+        summary_meta.append(&summary_blocked);
+        summary_meta.append(&summary_disclosure);
+
+        let summary_content = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+        summary_content.append(&summary_copy);
+        summary_content.append(&summary_meta);
+        let summary = gtk::ToggleButton::new();
+        summary.set_child(Some(&summary_content));
         summary.add_css_class("todo-summary");
         summary.set_hexpand(true);
         summary.set_halign(gtk::Align::Fill);
-        summary.set_tooltip_text(Some("Expand todo details"));
+        summary.set_tooltip_text(Some("Expand work plan"));
 
-        let list = gtk::Box::new(gtk::Orientation::Vertical, 10);
-        list.set_margin_top(10);
-        list.set_margin_bottom(10);
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        list.set_margin_top(12);
+        list.set_margin_bottom(12);
         list.set_margin_start(12);
         list.set_margin_end(12);
 
         let scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vscrollbar_policy(gtk::PolicyType::Automatic)
-            .max_content_height(320)
+            .max_content_height(400)
             .propagate_natural_height(true)
             .child(&list)
             .build();
@@ -308,28 +329,42 @@ impl TodoPanel {
         root.append(&details);
         root.append(&status);
 
+        let summary_description = Rc::new(RefCell::new(String::new()));
         summary.connect_toggled({
             let details = details.clone();
+            let disclosure = summary_disclosure.clone();
+            let description = summary_description.clone();
             move |button| {
                 let expanded = button.is_active();
                 details.set_reveal_child(expanded);
-                button.set_tooltip_text(Some(if expanded {
-                    "Collapse todo details"
+                disclosure.set_text(if expanded { "Hide" } else { "Show" });
+                let action = if expanded {
+                    "Collapse work plan"
                 } else {
-                    "Expand todo details"
-                }));
+                    "Expand work plan"
+                };
+                button.set_tooltip_text(Some(action));
+                let accessible = format!("{action}. {}", description.borrow());
+                button.update_property(&[gtk::accessible::Property::Label(&accessible)]);
             }
         });
 
         let panel = Self {
             root,
             summary,
+            summary_context,
+            summary_current,
+            summary_count,
+            summary_progress,
+            summary_blocked,
+            summary_disclosure,
+            summary_description,
             details,
             list,
             status,
             phases: Rc::new(RefCell::new(Vec::new())),
             action_handler: Rc::new(RefCell::new(None)),
-            action_buttons: Rc::new(RefCell::new(Vec::new())),
+            action_controls: Rc::new(RefCell::new(Vec::new())),
             pending: Rc::new(Cell::new(false)),
         };
         panel.render();
@@ -348,16 +383,18 @@ impl TodoPanel {
     pub(crate) fn set_expanded(&self, expanded: bool) {
         self.summary.set_active(expanded);
         self.details.set_reveal_child(expanded);
+        self.summary_disclosure
+            .set_text(if expanded { "Hide" } else { "Show" });
     }
 
     pub(crate) fn set_pending(&self, pending: bool) {
         self.pending.set(pending);
-        for button in self.action_buttons.borrow().iter() {
-            button.set_sensitive(!pending);
+        for control in self.action_controls.borrow().iter() {
+            control.set_sensitive(!pending);
         }
         if pending {
             self.status.remove_css_class("error");
-            self.status.set_text("Saving todo changes…");
+            self.status.set_text("Saving plan changes…");
             self.status.set_visible(true);
         } else if !self.status.has_css_class("error") {
             self.status.set_visible(false);
@@ -379,60 +416,85 @@ impl TodoPanel {
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
-        self.action_buttons.borrow_mut().clear();
+        self.action_controls.borrow_mut().clear();
 
         let phases = self.phases.borrow();
         let summary = summarize(&phases);
-        let mut summary_text = if summary.total == 0 {
-            "Todos · No tasks".to_owned()
+        self.root.set_visible(summary.total > 0);
+        if summary.total == 0 {
+            self.details.set_reveal_child(false);
+            return;
+        }
+
+        let (context, current) = if let Some(active) = summary.active.as_deref() {
+            ("CURRENT TASK", active)
+        } else if summary.blocked > 0 {
+            ("NEEDS ATTENTION", "Resolve blocked work to continue")
+        } else if summary.completed + summary.abandoned == summary.total {
+            ("PLAN COMPLETE", "All planned work is resolved")
         } else {
-            format!(
-                "Todos · {} of {} complete",
-                summary.completed, summary.total
-            )
+            ("UP NEXT", "Choose the next task from the work plan")
         };
-        if summary.abandoned > 0 {
-            summary_text.push_str(&format!(" · {} abandoned", summary.abandoned));
-        }
-        if summary.blocked > 0 {
-            summary_text.push_str(&format!(" · {} blocked", summary.blocked));
-        }
-        if let Some(active) = summary.active.as_deref() {
-            summary_text.push_str(&format!(" · Active: {active}"));
-        }
-        self.summary.set_label(&summary_text);
-        self.summary.set_tooltip_text(Some(&format!(
-            "{}. {}",
-            summary_text,
-            if self.summary.is_active() {
-                "Collapse todo details"
-            } else {
-                "Expand todo details"
-            }
+        self.summary_context.set_text(context);
+        self.summary_current.set_text(current);
+        self.summary_count
+            .set_text(&format!("{} of {} done", summary.completed, summary.total));
+        self.summary_progress
+            .set_fraction(summary.completed as f64 / summary.total as f64);
+        self.summary_progress.set_tooltip_text(Some(&format!(
+            "{} of {} tasks complete",
+            summary.completed, summary.total
         )));
+        self.summary_blocked.set_visible(summary.blocked > 0);
+        self.summary_blocked
+            .set_text(&format!("{} blocked", summary.blocked));
+        self.summary_disclosure
+            .set_text(if self.summary.is_active() {
+                "Hide"
+            } else {
+                "Show"
+            });
+
+        let mut description = format!(
+            "{current}. {} of {} tasks complete",
+            summary.completed, summary.total
+        );
+        if summary.blocked > 0 {
+            description.push_str(&format!(", {} blocked", summary.blocked));
+        }
+        if summary.abandoned > 0 {
+            description.push_str(&format!(", {} abandoned", summary.abandoned));
+        }
+        description.push('.');
+        self.summary_description.replace(description.clone());
+        let action = if self.summary.is_active() {
+            "Collapse work plan"
+        } else {
+            "Expand work plan"
+        };
+        let accessible = format!("{action}. {description}");
+        self.summary
+            .update_property(&[gtk::accessible::Property::Label(&accessible)]);
 
         let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let heading = gtk::Label::new(Some("Ordered todo phases"));
+        let heading = gtk::Label::new(Some("Work plan"));
         heading.set_xalign(0.0);
         heading.set_hexpand(true);
         heading.add_css_class("todo-panel-heading");
         toolbar.append(&heading);
-        toolbar.append(&self.action_button("Add phase", TodoAction::AddPhase, false));
-        let clear = self.action_button("Clear", TodoAction::Clear, true);
-        clear.set_sensitive(!phases.is_empty() && !self.pending.get());
-        toolbar.append(&clear);
+        toolbar.append(&self.action_button(
+            "Add phase",
+            "Add a phase to the work plan",
+            TodoAction::AddPhase,
+            false,
+        ));
+        toolbar.append(&self.action_button(
+            "Clear",
+            "Clear the entire work plan",
+            TodoAction::Clear,
+            true,
+        ));
         self.list.append(&toolbar);
-
-        if phases.is_empty() {
-            let empty = gtk::Label::new(Some(
-                "No todos yet. Add a phase and its first task to initialize the list.",
-            ));
-            empty.set_xalign(0.0);
-            empty.set_wrap(true);
-            empty.add_css_class("todo-empty");
-            self.list.append(&empty);
-            return;
-        }
 
         for (phase_index, phase) in phases.iter().enumerate() {
             self.list.append(&self.phase_view(phase_index, phase));
@@ -440,25 +502,46 @@ impl TodoPanel {
     }
 
     fn phase_view(&self, phase_index: usize, phase: &TodoPhase) -> gtk::Widget {
-        let root = gtk::Box::new(gtk::Orientation::Vertical, 7);
+        let root = gtk::Box::new(gtk::Orientation::Vertical, 8);
         root.add_css_class("todo-phase");
 
         let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        let title = gtk::Label::new(Some(&format!("{}. {}", phase_index + 1, phase.name)));
+        let heading = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        heading.set_hexpand(true);
+        let index = gtk::Label::new(Some(&format!("PHASE {}", phase_index + 1)));
+        index.set_xalign(0.0);
+        index.add_css_class("todo-phase-index");
+        let title = gtk::Label::new(Some(&phase.name));
         title.set_xalign(0.0);
-        title.set_hexpand(true);
         title.set_wrap(true);
         title.add_css_class("todo-phase-title");
-        header.append(&title);
+        heading.append(&index);
+        heading.append(&title);
+        header.append(&heading);
+
+        let completed = phase
+            .tasks
+            .iter()
+            .filter(|task| task.status == TodoStatus::Completed)
+            .count();
+        let progress = gtk::Label::new(Some(&format!("{} / {}", completed, phase.tasks.len())));
+        progress.set_tooltip_text(Some(&format!(
+            "{} of {} phase tasks complete",
+            completed,
+            phase.tasks.len()
+        )));
+        progress.add_css_class("todo-phase-progress");
+        header.append(&progress);
         header.append(&self.action_button(
             "Add task",
+            &format!("Add a task to phase {}", phase.name),
             TodoAction::AddTask { phase: phase_index },
             false,
         ));
         root.append(&header);
 
         if phase.tasks.is_empty() {
-            let empty = gtk::Label::new(Some("No tasks in this phase."));
+            let empty = gtk::Label::new(Some("This phase has no tasks yet."));
             empty.set_xalign(0.0);
             empty.add_css_class("todo-empty");
             root.append(&empty);
@@ -471,17 +554,18 @@ impl TodoPanel {
     }
 
     fn task_view(&self, phase: usize, task_index: usize, task: &TodoItem) -> gtk::Widget {
-        let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         row.add_css_class("todo-task");
         row.add_css_class(task.status.css_class());
 
         let marker = gtk::Label::new(Some(task.status.marker()));
         marker.set_valign(gtk::Align::Start);
         marker.set_tooltip_text(Some(task.status.label()));
+        marker.set_accessible_role(gtk::AccessibleRole::Presentation);
         marker.add_css_class("todo-task-marker");
         row.append(&marker);
 
-        let copy = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        let copy = gtk::Box::new(gtk::Orientation::Vertical, 4);
         copy.set_hexpand(true);
         let content = gtk::Label::new(Some(&task.content));
         content.set_xalign(0.0);
@@ -504,123 +588,198 @@ impl TodoPanel {
 
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         actions.set_valign(gtk::Align::Start);
-        match task.status {
-            TodoStatus::Pending => {
-                actions.append(&self.action_button(
-                    "Start",
-                    TodoAction::Start {
+        let (primary_label, primary_action, secondary) = match task.status {
+            TodoStatus::Pending => (
+                "Start",
+                TodoAction::Start {
+                    phase,
+                    task: task_index,
+                },
+                vec![
+                    (
+                        "Mark complete",
+                        TodoAction::Complete {
+                            phase,
+                            task: task_index,
+                        },
+                        false,
+                    ),
+                    (
+                        "Mark blocked",
+                        TodoAction::Block {
+                            phase,
+                            task: task_index,
+                        },
+                        false,
+                    ),
+                    (
+                        "Abandon",
+                        TodoAction::Drop {
+                            phase,
+                            task: task_index,
+                        },
+                        false,
+                    ),
+                    (
+                        "Remove",
+                        TodoAction::Remove {
+                            phase,
+                            task: task_index,
+                        },
+                        true,
+                    ),
+                ],
+            ),
+            TodoStatus::InProgress => (
+                "Complete",
+                TodoAction::Complete {
+                    phase,
+                    task: task_index,
+                },
+                vec![
+                    (
+                        "Mark blocked",
+                        TodoAction::Block {
+                            phase,
+                            task: task_index,
+                        },
+                        false,
+                    ),
+                    (
+                        "Abandon",
+                        TodoAction::Drop {
+                            phase,
+                            task: task_index,
+                        },
+                        false,
+                    ),
+                    (
+                        "Remove",
+                        TodoAction::Remove {
+                            phase,
+                            task: task_index,
+                        },
+                        true,
+                    ),
+                ],
+            ),
+            TodoStatus::Blocked => (
+                "Unblock",
+                TodoAction::Unblock {
+                    phase,
+                    task: task_index,
+                },
+                vec![
+                    (
+                        "Mark complete",
+                        TodoAction::Complete {
+                            phase,
+                            task: task_index,
+                        },
+                        false,
+                    ),
+                    (
+                        "Abandon",
+                        TodoAction::Drop {
+                            phase,
+                            task: task_index,
+                        },
+                        false,
+                    ),
+                    (
+                        "Remove",
+                        TodoAction::Remove {
+                            phase,
+                            task: task_index,
+                        },
+                        true,
+                    ),
+                ],
+            ),
+            TodoStatus::Completed | TodoStatus::Abandoned => (
+                "Reopen",
+                TodoAction::Start {
+                    phase,
+                    task: task_index,
+                },
+                vec![(
+                    "Remove",
+                    TodoAction::Remove {
                         phase,
                         task: task_index,
                     },
-                    false,
-                ));
-                actions.append(&self.action_button(
-                    "Complete",
-                    TodoAction::Complete {
-                        phase,
-                        task: task_index,
-                    },
-                    false,
-                ));
-                actions.append(&self.action_button(
-                    "Block",
-                    TodoAction::Block {
-                        phase,
-                        task: task_index,
-                    },
-                    false,
-                ));
-                actions.append(&self.action_button(
-                    "Drop",
-                    TodoAction::Drop {
-                        phase,
-                        task: task_index,
-                    },
-                    false,
-                ));
-            }
-            TodoStatus::InProgress => {
-                actions.append(&self.action_button(
-                    "Complete",
-                    TodoAction::Complete {
-                        phase,
-                        task: task_index,
-                    },
-                    false,
-                ));
-                actions.append(&self.action_button(
-                    "Block",
-                    TodoAction::Block {
-                        phase,
-                        task: task_index,
-                    },
-                    false,
-                ));
-                actions.append(&self.action_button(
-                    "Drop",
-                    TodoAction::Drop {
-                        phase,
-                        task: task_index,
-                    },
-                    false,
-                ));
-            }
-            TodoStatus::Blocked => {
-                actions.append(&self.action_button(
-                    "Unblock",
-                    TodoAction::Unblock {
-                        phase,
-                        task: task_index,
-                    },
-                    false,
-                ));
-                actions.append(&self.action_button(
-                    "Complete",
-                    TodoAction::Complete {
-                        phase,
-                        task: task_index,
-                    },
-                    false,
-                ));
-                actions.append(&self.action_button(
-                    "Drop",
-                    TodoAction::Drop {
-                        phase,
-                        task: task_index,
-                    },
-                    false,
-                ));
-            }
-            TodoStatus::Completed | TodoStatus::Abandoned => {
-                actions.append(&self.action_button(
-                    "Start",
-                    TodoAction::Start {
-                        phase,
-                        task: task_index,
-                    },
-                    false,
-                ));
-            }
-        }
-        actions.append(&self.action_button(
-            "Remove",
-            TodoAction::Remove {
-                phase,
-                task: task_index,
-            },
-            true,
-        ));
+                    true,
+                )],
+            ),
+        };
+        let primary = self.task_action_button(primary_label, &task.content, primary_action, false);
+        primary.add_css_class("todo-primary-action");
+        actions.append(&primary);
+        actions.append(&self.task_action_menu(&task.content, secondary));
         row.append(&actions);
         row.upcast()
     }
 
-    fn action_button(&self, label: &str, action: TodoAction, destructive: bool) -> gtk::Button {
+    fn task_action_button(
+        &self,
+        label: &str,
+        task: &str,
+        action: TodoAction,
+        destructive: bool,
+    ) -> gtk::Button {
+        self.action_button(label, &format!("{label} task: {task}"), action, destructive)
+    }
+
+    fn task_action_menu(
+        &self,
+        task: &str,
+        actions: Vec<(&'static str, TodoAction, bool)>,
+    ) -> gtk::MenuButton {
+        let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        menu.add_css_class("todo-actions-menu");
+        let popover = gtk::Popover::builder()
+            .has_arrow(true)
+            .autohide(true)
+            .child(&menu)
+            .build();
+        popover.add_css_class("todo-actions-popover");
+        for (label, action, destructive) in actions {
+            let button = self.task_action_button(label, task, action, destructive);
+            button.add_css_class("todo-menu-action");
+            let popover_for_click = popover.clone();
+            button.connect_clicked(move |_| popover_for_click.popdown());
+            menu.append(&button);
+        }
+
+        let button = gtk::MenuButton::new();
+        button.set_label("More");
+        button.set_popover(Some(&popover));
+        button.set_tooltip_text(Some(&format!("More actions for {task}")));
+        let accessible = format!("More actions for task: {task}");
+        button.update_property(&[gtk::accessible::Property::Label(&accessible)]);
+        button.add_css_class("todo-action");
+        button.add_css_class("todo-more-action");
+        button.set_sensitive(!self.pending.get());
+        self.action_controls
+            .borrow_mut()
+            .push(button.clone().upcast());
+        button
+    }
+
+    fn action_button(
+        &self,
+        label: &str,
+        accessible_label: &str,
+        action: TodoAction,
+        destructive: bool,
+    ) -> gtk::Button {
         let button = gtk::Button::with_label(label);
         button.add_css_class("todo-action");
         if destructive {
             button.add_css_class("destructive-action");
         }
-        button.set_tooltip_text(Some(label));
+        button.set_tooltip_text(Some(accessible_label));
+        button.update_property(&[gtk::accessible::Property::Label(accessible_label)]);
         button.set_sensitive(!self.pending.get());
         let handler = self.action_handler.clone();
         button.connect_clicked(move |_| {
@@ -628,7 +787,9 @@ impl TodoPanel {
                 handler(action.clone());
             }
         });
-        self.action_buttons.borrow_mut().push(button.clone());
+        self.action_controls
+            .borrow_mut()
+            .push(button.clone().upcast());
         button
     }
 }
@@ -741,7 +902,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(blocked[1].tasks[0].status, TodoStatus::Blocked);
-        assert_eq!(blocked[1].tasks[0].blocker.as_deref(), Some("Waiting for owner"));
+        assert_eq!(
+            blocked[1].tasks[0].blocker.as_deref(),
+            Some("Waiting for owner")
+        );
         let unblocked = apply_edit(&blocked, TodoEdit::Unblock { phase: 1, task: 0 }).unwrap();
         assert_eq!(unblocked[1].tasks[0].status, TodoStatus::Pending);
         assert!(unblocked[1].tasks[0].blocker.is_none());
