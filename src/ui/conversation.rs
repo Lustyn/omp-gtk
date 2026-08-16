@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
@@ -23,7 +23,9 @@ pub(crate) struct ConversationView {
 
 struct ConversationOutline {
     root: gtk::Box,
+    revealer: gtk::Revealer,
     list: gtk::Box,
+    pointer: gtk::Scale,
     scroller: glib::WeakRef<gtk::ScrolledWindow>,
     items: glib::WeakRef<gtk::Box>,
     messages: RefCell<Vec<MessageBody>>,
@@ -31,11 +33,32 @@ struct ConversationOutline {
 
 impl ConversationOutline {
     fn new(items: &gtk::Box, scroller: &gtk::ScrolledWindow) -> Rc<Self> {
-        let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        root.set_size_request(360, -1);
+        let root = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        root.set_halign(gtk::Align::Start);
+        root.set_valign(gtk::Align::Fill);
         root.set_vexpand(true);
         root.set_visible(false);
-        root.add_css_class("message-outline-pane");
+        root.add_css_class("message-outline-surface");
+
+        let adjustment = scroller.vadjustment();
+        let track = gtk::Scale::with_range(gtk::Orientation::Vertical, 0.0, 1.0, 0.01);
+        track.set_draw_value(false);
+        track.set_vexpand(true);
+        track.set_tooltip_text(Some("Hover to show the outline for the message in view"));
+        track.update_property(&[gtk::accessible::Property::Label(
+            "Message outline and scroll position",
+        )]);
+        track.add_css_class("message-outline-track");
+        let adjustment_for_track = adjustment.clone();
+        track.connect_value_changed(move |track| {
+            let limit = (adjustment_for_track.upper() - adjustment_for_track.page_size()).max(0.0);
+            adjustment_for_track.set_value(track.value() * limit);
+        });
+
+        let pane = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        pane.set_size_request(360, -1);
+        pane.set_vexpand(true);
+        pane.add_css_class("message-outline-pane");
 
         let header = gtk::Box::new(gtk::Orientation::Horizontal, 7);
         header.add_css_class("message-outline-header");
@@ -56,12 +79,60 @@ impl ConversationOutline {
             .build();
         scroll.add_css_class("message-outline-scroll");
 
-        root.append(&header);
-        root.append(&scroll);
+        pane.append(&header);
+        pane.append(&scroll);
+
+        let revealer = gtk::Revealer::new();
+        revealer.set_transition_type(gtk::RevealerTransitionType::SlideRight);
+        revealer.set_transition_duration(160);
+        revealer.set_vexpand(true);
+        revealer.set_child(Some(&pane));
+        root.append(&track);
+        root.append(&revealer);
+
+        let hovered = Rc::new(Cell::new(false));
+        let focused = Rc::new(Cell::new(false));
+        let motion = gtk::EventControllerMotion::new();
+        let hovered_for_enter = hovered.clone();
+        let revealer_for_enter = revealer.clone();
+        motion.connect_enter(move |_, _, _| {
+            hovered_for_enter.set(true);
+            revealer_for_enter.set_reveal_child(true);
+        });
+        let hovered_for_leave = hovered.clone();
+        let focused_for_leave = focused.clone();
+        let revealer_for_leave = revealer.clone();
+        motion.connect_leave(move |_| {
+            hovered_for_leave.set(false);
+            if !focused_for_leave.get() {
+                revealer_for_leave.set_reveal_child(false);
+            }
+        });
+        root.add_controller(motion);
+
+        let focus = gtk::EventControllerFocus::new();
+        let focused_for_enter = focused.clone();
+        let revealer_for_focus_enter = revealer.clone();
+        focus.connect_enter(move |_| {
+            focused_for_enter.set(true);
+            revealer_for_focus_enter.set_reveal_child(true);
+        });
+        let focused_for_leave = focused;
+        let hovered_for_focus_leave = hovered;
+        let revealer_for_focus_leave = revealer.clone();
+        focus.connect_leave(move |_| {
+            focused_for_leave.set(false);
+            if !hovered_for_focus_leave.get() {
+                revealer_for_focus_leave.set_reveal_child(false);
+            }
+        });
+        root.add_controller(focus);
 
         Rc::new(Self {
             root,
+            revealer,
             list,
+            pointer: track,
             scroller: scroller.downgrade(),
             items: items.downgrade(),
             messages: RefCell::new(Vec::new()),
@@ -81,6 +152,7 @@ impl ConversationOutline {
 
     fn clear(&self) {
         self.messages.borrow_mut().clear();
+        self.revealer.set_reveal_child(false);
         self.root.set_visible(false);
     }
 
@@ -93,6 +165,18 @@ impl ConversationOutline {
         });
     }
 
+    fn update_pointer(&self, adjustment: &gtk::Adjustment) {
+        let limit = (adjustment.upper() - adjustment.page_size()).max(0.0);
+        let position = if limit > 0.0 {
+            (adjustment.value() / limit).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        if (self.pointer.value() - position).abs() > f64::EPSILON {
+            self.pointer.set_value(position);
+        }
+    }
+
     fn refresh(&self) {
         let (Some(scroller), Some(items)) = (self.scroller.upgrade(), self.items.upgrade()) else {
             return;
@@ -100,6 +184,7 @@ impl ConversationOutline {
         let adjustment = scroller.vadjustment();
         let viewport_start = adjustment.value();
         let viewport_end = viewport_start + adjustment.page_size();
+        self.update_pointer(&adjustment);
         let active = self
             .messages
             .borrow()
@@ -123,6 +208,7 @@ impl ConversationOutline {
             .max_by(|left, right| left.0.total_cmp(&right.0));
 
         let Some((_, body, headings)) = active else {
+            self.revealer.set_reveal_child(false);
             self.root.set_visible(false);
             return;
         };
@@ -177,6 +263,11 @@ impl ConversationView {
         Self::new(20, 28, 28, false)
     }
 
+    #[cfg(feature = "ui-stories")]
+    pub(crate) fn set_outline_revealed(&self, revealed: bool) {
+        self.outline.revealer.set_reveal_child(revealed);
+    }
+
     fn new(spacing: i32, margin_top: i32, margin_bottom: i32, with_empty_state: bool) -> Self {
         let items = gtk::Box::new(gtk::Orientation::Vertical, spacing);
         items.set_margin_top(margin_top);
@@ -198,11 +289,9 @@ impl ConversationView {
         scroller.add_css_class("message-scroll");
 
         let outline = ConversationOutline::new(&items, &scroller);
-        let content = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        content.append(&outline.root);
-        content.append(&scroller);
         let root = gtk::Overlay::new();
-        root.set_child(Some(&content));
+        root.set_child(Some(&scroller));
+        root.add_overlay(&outline.root);
         let weak_outline = Rc::downgrade(&outline);
         scroller.vadjustment().connect_value_changed(move |_| {
             if let Some(outline) = weak_outline.upgrade() {

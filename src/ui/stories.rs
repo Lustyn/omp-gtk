@@ -36,7 +36,7 @@ pub(crate) fn find(id: &str) -> Option<Story> {
     STORIES.iter().copied().find(|story| story.id == id)
 }
 
-const STORIES: [Story; 51] = [
+const STORIES: [Story; 52] = [
     Story {
         id: "header/ready",
         title: "Header · Ready",
@@ -85,6 +85,13 @@ const STORIES: [Story; 51] = [
         width: 900,
         height: 700,
         build: conversation_tool_use,
+    },
+    Story {
+        id: "conversation/outline-track",
+        title: "Conversation · Collapsed outline track",
+        width: 900,
+        height: 720,
+        build: conversation_outline_track,
     },
     Story {
         id: "conversation/markdown",
@@ -544,6 +551,39 @@ fn conversation_tool_use() -> gtk::Widget {
     );
     view.widget().clone()
 }
+fn conversation_outline_track() -> gtk::Widget {
+    let view = ConversationView::main();
+    view.append_message(
+        MessageRole::Assistant,
+        r#"# Deployment guide
+
+## Prepare the release workspace
+Confirm the selected branch, review pending changes, and keep the release inputs together.
+
+## Back up persisted state
+Capture the current data before changing schemas or replacing deployed binaries.
+
+## Install the new build
+Stage the release artifact and verify its checksum before switching the active version.
+
+## Migrate stored data
+Run the supported migration path once, then preserve its output for the release record.
+
+## Restart background services
+Restart each dependent service in dependency order and wait for observable readiness.
+
+## Verify user-facing behavior
+Exercise the primary workflow, error state, and recovery path against the live build.
+
+## Review runtime health
+Check resource usage and recent errors after traffic reaches the updated process.
+
+## Complete the release
+Record the deployed revision and retain the rollback inputs until the release is stable."#,
+    );
+    view.widget().clone()
+}
+
 fn conversation_markdown() -> gtk::Widget {
     let view = ConversationView::main();
     view.append_message(
@@ -589,6 +629,7 @@ fn render(markdown: &str) {
 }
 ```"#,
     );
+    view.set_outline_revealed(true);
     view.widget().clone()
 }
 fn conversation_streaming_markdown() -> gtk::Widget {

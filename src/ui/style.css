@@ -129,11 +129,12 @@ paned > separator {
     font-weight: 700;
 }
 
-.message-outline-pane {
+.message-outline-surface {
     border-right: 1px solid #22262d;
     background: #0b0d10;
 }
 
+.message-outline-pane,
 .message-outline-pane .message-outline-scroll,
 .message-outline-pane .message-outline-scroll > viewport,
 .message-outline-pane .message-outline-scroll > undershoot,
@@ -142,6 +143,31 @@ paned > separator {
 .message-outline-header,
 .message-outline-entry {
     background: transparent;
+}
+
+.message-outline-track {
+    min-width: 24px;
+    padding: 7px 8px;
+    background: transparent;
+}
+
+.message-outline-track trough {
+    min-width: 4px;
+    border: 0;
+    border-radius: 999px;
+    background: #272d36;
+}
+
+.message-outline-track slider {
+    min-width: 8px;
+    min-height: 24px;
+    margin: -2px;
+    border-radius: 999px;
+    background: #f4c867;
+}
+
+.message-outline-track:hover slider {
+    background: #ffda7d;
 }
 
 .message-outline-header {
