@@ -1,0 +1,59 @@
+name: macOS package
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Apple Silicon package
+    runs-on: macos-15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify runner architecture
+        run: test "$(uname -m)" = arm64
+
+      - name: Install native dependencies
+        run: >-
+          brew install
+          adwaita-icon-theme
+          dylibbundler
+          gsettings-desktop-schemas
+          gtk4
+          hicolor-icon-theme
+          libadwaita
+          librsvg
+          pkgconf
+
+      - name: Restore Rust package cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            target
+          key: macos-package-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            macos-package-rust-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}-
+            macos-package-rust-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build unsigned disk image
+        run: ./packaging/build-macos.sh
+
+      - name: Upload disk image
+        uses: actions/upload-artifact@v4
+        with:
+          name: omp-gtk-macos-arm64-${{ github.ref_name }}
+          path: dist/*-macos-arm64.dmg
+          if-no-files-found: error

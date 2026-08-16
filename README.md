@@ -173,6 +173,27 @@ For a locally built Debian package, use the included installer so apt handles de
 ./packaging/install-deb.sh dist/omp-gtk_*.deb
 ```
 
+## Build an unsigned macOS package
+
+Apple Silicon packaging requires the source-build dependencies plus the native bundling tools:
+
+```bash
+brew install \
+  adwaita-icon-theme dylibbundler gsettings-desktop-schemas \
+  gtk4 hicolor-icon-theme libadwaita librsvg pkgconf
+./packaging/build-macos.sh
+```
+
+The script writes `dist/omp-gtk-<version>-macos-arm64.dmg`. The application bundle includes its Homebrew dynamic libraries, GSettings schemas, and icon themes; `omp` remains a separate required installation.
+
+The disk image is intentionally not Developer ID signed or notarized. Its Mach-O files receive only the ad-hoc signature required to load modified binaries on Apple Silicon; that signature provides no publisher identity or Gatekeeper trust. macOS may quarantine a downloaded build. After verifying that the artifact came from a trusted workflow or checkout, remove that quarantine attribute from the installed application:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/omp-gtk.app
+```
+
+The **macOS package** GitHub Actions workflow builds and uploads the same Apple Silicon disk image when run manually or when a `v*` tag is pushed.
+
 ## Development
 
 Run the Rust test suite:
