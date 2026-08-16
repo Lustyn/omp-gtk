@@ -35,15 +35,15 @@ impl ConversationOutline {
     fn new(items: &gtk::Box, scroller: &gtk::ScrolledWindow) -> Rc<Self> {
         let root = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         root.set_halign(gtk::Align::Start);
-        root.set_valign(gtk::Align::Fill);
-        root.set_vexpand(true);
+        root.set_valign(gtk::Align::Center);
         root.set_visible(false);
         root.add_css_class("message-outline-surface");
 
         let adjustment = scroller.vadjustment();
         let track = gtk::Scale::with_range(gtk::Orientation::Vertical, 0.0, 1.0, 0.01);
         track.set_draw_value(false);
-        track.set_vexpand(true);
+        track.set_size_request(-1, 144);
+        track.set_valign(gtk::Align::Center);
         track.set_tooltip_text(Some("Hover to show the outline for the message in view"));
         track.update_property(&[gtk::accessible::Property::Label(
             "Message outline and scroll position",
@@ -57,7 +57,6 @@ impl ConversationOutline {
 
         let pane = gtk::Box::new(gtk::Orientation::Vertical, 0);
         pane.set_size_request(360, -1);
-        pane.set_vexpand(true);
         pane.add_css_class("message-outline-pane");
 
         let header = gtk::Box::new(gtk::Orientation::Horizontal, 7);
@@ -74,7 +73,8 @@ impl ConversationOutline {
         let scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vscrollbar_policy(gtk::PolicyType::Automatic)
-            .vexpand(true)
+            .max_content_height(420)
+            .propagate_natural_height(true)
             .child(&list)
             .build();
         scroll.add_css_class("message-outline-scroll");
@@ -85,7 +85,6 @@ impl ConversationOutline {
         let revealer = gtk::Revealer::new();
         revealer.set_transition_type(gtk::RevealerTransitionType::SlideRight);
         revealer.set_transition_duration(160);
-        revealer.set_vexpand(true);
         revealer.set_child(Some(&pane));
         root.append(&track);
         root.append(&revealer);

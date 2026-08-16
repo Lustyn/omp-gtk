@@ -147,6 +147,7 @@ paned > separator {
 
 .message-outline-track {
     min-width: 24px;
+    min-height: 144px;
     padding: 7px 8px;
     background: transparent;
 }
