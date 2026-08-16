@@ -71,16 +71,16 @@ def find_node(*, root=None, app_name="omp-native", role=None, name=None, contain
 
 
 def click(node):
-    """Invoke a node's accessible click action."""
+    """Invoke a node's accessible click or activation action."""
     actions = node.queryAction()
     for index in range(actions.nActions):
-        if actions.getName(index) == "click":
+        if actions.getName(index) in {"click", "activate"}:
             if not actions.doAction(index):
-                raise RuntimeError(f"AT-SPI click was rejected for {node.name!r}")
+                raise RuntimeError(f"AT-SPI activation was rejected for {node.name!r}")
             return
     available = [actions.getName(index) for index in range(actions.nActions)]
     raise RuntimeError(
-        f"No click action for {node.getRoleName()} {node.name!r}; actions={available}"
+        f"No click or activate action for {node.getRoleName()} {node.name!r}; actions={available}"
     )
 
 
