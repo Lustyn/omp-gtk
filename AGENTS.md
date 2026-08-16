@@ -6,12 +6,12 @@
 - Response style: follow the vendored Attention-kind instructions in `.omp/APPEND_SYSTEM.md`. `omp` loads this automatically when launched from the repository root; other agents should read it before responding.
 - Keep commits atomic and use Conventional Commit messages.
 
-## Jujutsu change workflow
+## Git worktree workflow
 
-- Before working on any change, read and follow the installed `jj-stacks` skill at `skill://jj-stacks`. It is the source of truth for workspace creation, ownership, rebases, conflicts, handoffs, and recovery; these repository rules choose the default path through that skill.
-- Use jj's native [`workspace`](https://docs.jj-vcs.dev/latest/cli-reference/#jj-workspace) command for every change; `jj help workspace` is the authoritative local reference. Create a uniquely named secondary workspace outside the primary checkout from an immutable commit ID resolved from `main`, and perform all inspection, editing, generation, building, testing, integration, and landing there. One owner uses one workspace.
-- If `jj root` reports that this checkout is Git-only, this repository policy authorizes the one-time `jj git init` bootstrap from the primary checkout. Do not mix Git worktrees or mutating Git commands with the resulting shared jj repository.
-- Keep an ordinary task as one atomic, described change with a real author. Run `jj status`, inspect the diff, resolve all conflicts, and complete focused verification in the task workspace.
-- Landing on `main` is serialized. The task or integration owner resolves the latest `main`, rebases the owned stack onto that immutable commit, resolves conflicts, and repeats focused verification in the secondary workspace. The designated landing owner then advances `main` with `jj bookmark move main --to <verified-tip>` and runs `jj git export` so the colocated Git branch resolves to the same commit.
-- After `main` resolves to the verified tip, forget the current task workspace with `jj workspace forget`, stop using that directory, and delete it from outside the workspace. The primary working tree remains untouched for the entire task.
-- For a requested change stack or pull request, preserve its commit boundaries and dedicated workspace instead of landing it on `main`. Follow the skill's handoff format and report the workspace path, base, root and tip change IDs, conflicts, verification, next owner, and task bookmarks or pushed revisions.
+- The primary checkout stays on `main`. Agents MUST create a uniquely named branch and linked worktree under the repository's ignored `.worktrees/` directory before inspecting implementation files, editing, generating code, building, or testing.
+- Create the task worktree from the current local `main` with `git worktree add .worktrees/<task-name> -b <type>/<task-name> main`, then perform the entire task inside that worktree. One owner uses one worktree and branch.
+- Keep each task as one atomic, described change with a real author and a Conventional Commit message. Before integration, inspect `git status` and `git diff`, resolve every conflict, and complete focused verification in the task worktree.
+- Integration is serialized. Rebase the task branch onto the latest local `main` inside its worktree and repeat focused verification there. From the clean primary checkout on `main`, integrate with `git merge --ff-only <task-branch>`.
+- After the fast-forward succeeds, remove the linked checkout with `git worktree remove .worktrees/<task-name>` and delete the merged task branch with `git branch -d <task-branch>`.
+- If the primary checkout is not clean and attached to `main`, leave it untouched and block integration until its owner resolves the state.
+- For a requested pull request or multi-commit stack, preserve the task branch and worktree until the review lifecycle is complete instead of integrating and deleting them locally.
