@@ -72,10 +72,10 @@ Model providers, credentials, tools, extensions, and session storage are configu
 
 ## Requirements
 
-- Linux with a graphical GTK session
+- Linux or macOS with a graphical GTK session
 - GTK 4.22+
 - libadwaita 1.9+
-- Fontconfig and ALSA development libraries
+- Fontconfig, plus ALSA development libraries on Linux
 - A C toolchain and `pkg-config`
 - A current stable Rust toolchain with Rust 2024 edition support
 - An installed `omp` with `--mode rpc-ui` support
@@ -109,6 +109,13 @@ Arch Linux:
 ```bash
 sudo pacman -S --needed \
   base-devel pkgconf alsa-lib fontconfig gtk4 libadwaita rust
+```
+
+macOS with [Homebrew](https://brew.sh/):
+
+```bash
+xcode-select --install
+brew install fontconfig gtk4 libadwaita pkgconf
 ```
 
 Install Rust separately if it is not already available:
