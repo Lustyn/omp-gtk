@@ -346,6 +346,12 @@ impl ConversationView {
         body
     }
 
+    pub(crate) fn remove_message(&self, body: &MessageBody) {
+        if body.row().parent().as_ref() == Some(self.items.upcast_ref::<gtk::Widget>()) {
+            self.items.remove(body.row());
+        }
+    }
+
     pub(crate) fn append_streaming_message(&self, role: MessageRole, text: &str) -> MessageBody {
         self.hide_empty();
         let body = chat::append_streaming_message(&self.items, role, text);

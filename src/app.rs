@@ -380,7 +380,7 @@ struct PendingSubmission {
     request_id: String,
     draft_text: String,
     message: String,
-    display_message: Option<String>,
+    displayed_message: Option<MessageBody>,
     attachment_ids: Vec<AttachmentId>,
 }
 
@@ -1479,11 +1479,17 @@ impl AppController {
         }
     }
 
-    fn reject_submission_response(&self, request_id: Option<&str>) {
+    fn reject_submission_response(self: &Rc<Self>, request_id: Option<&str>) {
         let Some(submission) = self.take_pending_submission(request_id) else {
             return;
         };
         self.remove_pending_user_message(&submission.message);
+        if let Some(message) = submission.displayed_message {
+            self.ui.conversation().remove_message(&message);
+            if self.ui.conversation().is_empty() {
+                self.show_empty_state();
+            }
+        }
         self.attachments
             .borrow_mut()
             .resolve_submission(&submission.attachment_ids, false);
@@ -1525,11 +1531,6 @@ impl AppController {
         self.record_prompt_sound();
         self.set_window_status(WindowStatus::Working);
         self.remove_empty_state();
-        if let Some(message) = submission.display_message.as_deref() {
-            self.ui
-                .conversation()
-                .append_message(MessageRole::User, message);
-        }
         if self.ui.composer.text() == submission.draft_text {
             self.ui.composer.set_text("");
         }
@@ -3541,6 +3542,14 @@ impl AppController {
                 } else {
                     message.clone()
                 };
+                let displayed_message = (!resume).then(|| {
+                    let body = self
+                        .ui
+                        .conversation()
+                        .append_message(MessageRole::User, &message);
+                    self.scroll_to_bottom();
+                    body
+                });
                 self.pending_user_messages
                     .borrow_mut()
                     .push_back(submitted_message.clone());
@@ -3550,7 +3559,7 @@ impl AppController {
                         request_id,
                         draft_text,
                         message: submitted_message,
-                        display_message: (!resume).then_some(message),
+                        displayed_message,
                         attachment_ids,
                     });
                 self.ui.chat_status.activity("Sending");
