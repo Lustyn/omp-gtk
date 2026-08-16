@@ -129,10 +129,11 @@ jj diff
 
 Resolve conflicts and repeat focused verification after the rebase. For several independent inputs, use the merge workflow below in the integration owner's workspace, with the current shared target as one merge parent.
 
-Advance the shared bookmark from the verified workspace with the descendant-only bookmark move:
+Advance the shared bookmark from the verified workspace with the descendant-only bookmark move. In a colocated Git repository, export the updated bookmark before cleanup:
 
 ```bash
 jj bookmark move "$TARGET" --to <stack-tip>
+jj git export
 jj log -r "$TARGET" --no-graph \
   -T 'change_id ++ " " ++ commit_id ++ " " ++ description.first_line() ++ "\n"'
 ```
