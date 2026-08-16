@@ -148,6 +148,9 @@ impl AgentHubState {
     pub(crate) fn apply_update(&mut self, update: SubagentUpdate) -> Option<String> {
         let id = update.id.clone()?;
         if update.kind == SubagentUpdateKind::Event {
+            if update.activity_event.is_none() {
+                return None;
+            }
             return self.agents.contains_key(&id).then_some(id);
         }
 
@@ -183,12 +186,16 @@ impl AgentHubState {
                 .agent
                 .or_else(|| existing.as_ref().map(|agent| agent.agent.clone()))
                 .unwrap_or_else(|| "subagent".to_owned()),
-            agent_source: update
-                .agent_source
-                .or_else(|| existing.as_ref().and_then(|agent| agent.agent_source.clone())),
-            description: update
-                .description
-                .or_else(|| existing.as_ref().and_then(|agent| agent.description.clone())),
+            agent_source: update.agent_source.or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|agent| agent.agent_source.clone())
+            }),
+            description: update.description.or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|agent| agent.description.clone())
+            }),
             status,
             task: update
                 .task
@@ -196,9 +203,11 @@ impl AgentHubState {
             assignment: update
                 .assignment
                 .or_else(|| existing.as_ref().and_then(|agent| agent.assignment.clone())),
-            session_file: update
-                .session_file
-                .or_else(|| existing.as_ref().and_then(|agent| agent.session_file.clone())),
+            session_file: update.session_file.or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|agent| agent.session_file.clone())
+            }),
             parent_tool_call_id: update.parent_tool_call_id.or_else(|| {
                 existing
                     .as_ref()
@@ -340,10 +349,10 @@ mod tests {
     use serde_json::json;
 
     use super::AgentHubState;
+    use crate::bridge::protocol::RpcEvent;
     use crate::bridge::protocol::{
         SubagentSnapshot, SubagentUpdate, SubagentUpdateKind, decode_event,
     };
-    use crate::bridge::protocol::RpcEvent;
 
     fn snapshot(id: &str, index: usize, status: &str) -> SubagentSnapshot {
         serde_json::from_value(json!({
@@ -475,7 +484,10 @@ mod tests {
         let agent = hub.get("Builder").unwrap();
         assert_eq!(agent.session_file.as_deref(), Some("/tmp/builder.jsonl"));
         assert_eq!(agent.current_task(), Some("Build runtime hub"));
-        assert_eq!(agent.current_activity().as_deref(), Some("Inspecting RPC · using read"));
+        assert_eq!(
+            agent.current_activity().as_deref(),
+            Some("Inspecting RPC · using read")
+        );
         assert_eq!(agent.progress.as_ref().unwrap().tokens, 12_000);
     }
 
