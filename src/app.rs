@@ -41,7 +41,6 @@ use workspace::WorkspaceView;
 const TASK_PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 const PROMPT_BURST_WINDOW: Duration = Duration::from_secs(5);
 const PROMPT_BURST_THRESHOLD: usize = 3;
-const WARM_SESSION_VIEW_LIMIT: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolResultSource {
@@ -89,17 +88,6 @@ fn cloned_or_insert_with<T: Clone>(slot: &RefCell<Option<T>>, create: impl FnOnc
     let value = create();
     slot.replace(Some(value.clone()));
     value
-}
-fn touch_bounded_lru(order: &mut VecDeque<u64>, value: u64, limit: usize) -> Vec<u64> {
-    order.retain(|existing| *existing != value);
-    order.push_back(value);
-    let mut evicted = Vec::new();
-    while order.len() > limit {
-        if let Some(value) = order.pop_front() {
-            evicted.push(value);
-        }
-    }
-    evicted
 }
 fn identifies_same_session(left: &SessionEntry, right: &SessionEntry) -> bool {
     left.runtime_id
@@ -186,13 +174,8 @@ pub(crate) fn build(app: &adw::Application) {
         active_sessions: RefCell::new(recent_sessions),
         conversation_views: RefCell::new(HashMap::from([(
             initial_runtime_id,
-            WarmConversation {
-                view: initial_conversation,
-                messages: None,
-                hydrated: false,
-            },
+            WarmConversation::new(initial_conversation),
         )])),
-        conversation_view_lru: RefCell::new(VecDeque::from([initial_runtime_id])),
         unread_runtimes: RefCell::new(HashSet::new()),
         current_session_file: RefCell::new(None),
         hydrated_agent_session: RefCell::new(None),
@@ -412,11 +395,35 @@ struct SessionRuntime {
     workspace: Option<PathBuf>,
     state: Option<SessionState>,
 }
-// Retains the rendered widget tree, scroll position, and matching RPC snapshot as one LRU entry.
+// Keeps every open conversation's widgets and live rendering bindings in memory.
 struct WarmConversation {
     view: ConversationView,
     messages: Option<Vec<Value>>,
     hydrated: bool,
+    pending_user_messages: VecDeque<String>,
+    streaming_message: Option<StreamingMessage>,
+    streaming_thinking: Option<ThinkingBlock>,
+    active_tool_group: Option<ToolActivityGroup>,
+    tool_groups_by_call_id: HashMap<String, ToolActivityGroup>,
+    deferred_events: VecDeque<RpcEvent>,
+    session_cost: f64,
+}
+
+impl WarmConversation {
+    fn new(view: ConversationView) -> Self {
+        Self {
+            view,
+            messages: None,
+            hydrated: false,
+            pending_user_messages: VecDeque::new(),
+            streaming_message: None,
+            streaming_thinking: None,
+            active_tool_group: None,
+            tool_groups_by_call_id: HashMap::new(),
+            deferred_events: VecDeque::new(),
+            session_cost: 0.0,
+        }
+    }
 }
 
 fn insert_session_by_creation(entries: &mut Vec<SessionEntry>, entry: SessionEntry) {
@@ -502,7 +509,6 @@ struct AppController {
     session_rows: RefCell<Vec<SessionRow>>,
     active_sessions: RefCell<Vec<SessionEntry>>,
     conversation_views: RefCell<HashMap<u64, WarmConversation>>,
-    conversation_view_lru: RefCell<VecDeque<u64>>,
     current_session_file: RefCell<Option<PathBuf>>,
     hydrated_agent_session: RefCell<Option<PathBuf>>,
     current_session_title: RefCell<String>,
@@ -781,46 +787,99 @@ impl AppController {
             .conversation_views
             .borrow()
             .get(&runtime_id)
-            .map(|conversation| conversation.view.clone());
-        let was_cached = cached.is_some();
-        let conversation = cached.unwrap_or_else(|| {
+            .map(|conversation| (conversation.view.clone(), conversation.hydrated));
+        let was_loaded = cached.as_ref().is_some_and(|(_, hydrated)| *hydrated);
+        let conversation = cached.map(|(view, _)| view).unwrap_or_else(|| {
             let view = ConversationView::main();
             view.show_loading(
                 "Opening conversation",
                 "Restoring messages, tools, and session state.",
                 "Reading conversation history",
             );
-            self.conversation_views.borrow_mut().insert(
-                runtime_id,
-                WarmConversation {
-                    view: view.clone(),
-                    messages: None,
-                    hydrated: false,
-                },
-            );
+            self.conversation_views
+                .borrow_mut()
+                .insert(runtime_id, WarmConversation::new(view.clone()));
             view
         });
         self.ui.show_session_conversation(runtime_id, &conversation);
-        let evicted = touch_bounded_lru(
-            &mut self.conversation_view_lru.borrow_mut(),
-            runtime_id,
-            WARM_SESSION_VIEW_LIMIT,
-        );
-        for evicted_runtime_id in evicted {
-            self.conversation_views
-                .borrow_mut()
-                .remove(&evicted_runtime_id);
-            self.ui.remove_session_conversation(evicted_runtime_id);
-        }
-        was_cached
+        was_loaded
     }
 
     fn remove_runtime_conversation(&self, runtime_id: u64) {
         self.conversation_views.borrow_mut().remove(&runtime_id);
-        self.conversation_view_lru
-            .borrow_mut()
-            .retain(|existing| *existing != runtime_id);
         self.ui.remove_session_conversation(runtime_id);
+    }
+
+    fn stash_conversation_bindings(&self, runtime_id: u64) {
+        let pending_user_messages = std::mem::take(&mut *self.pending_user_messages.borrow_mut());
+        let streaming_message = self.streaming_message.borrow_mut().take();
+        let streaming_thinking = self.streaming_thinking.borrow_mut().take();
+        let active_tool_group = self.active_tool_group.borrow_mut().take();
+        let tool_groups_by_call_id = std::mem::take(&mut *self.tool_groups_by_call_id.borrow_mut());
+        let session_cost = self.session_cost.get();
+        let mut conversations = self.conversation_views.borrow_mut();
+        let Some(conversation) = conversations.get_mut(&runtime_id) else {
+            return;
+        };
+        conversation.pending_user_messages = pending_user_messages;
+        conversation.streaming_message = streaming_message;
+        conversation.streaming_thinking = streaming_thinking;
+        conversation.active_tool_group = active_tool_group;
+        conversation.tool_groups_by_call_id = tool_groups_by_call_id;
+        conversation.session_cost = session_cost;
+    }
+
+    fn restore_conversation_bindings(&self, runtime_id: u64) {
+        let mut conversations = self.conversation_views.borrow_mut();
+        let Some(conversation) = conversations.get_mut(&runtime_id) else {
+            return;
+        };
+        self.pending_user_messages
+            .replace(std::mem::take(&mut conversation.pending_user_messages));
+        self.streaming_message
+            .replace(conversation.streaming_message.take());
+        self.streaming_thinking
+            .replace(conversation.streaming_thinking.take());
+        self.active_tool_group
+            .replace(conversation.active_tool_group.take());
+        self.tool_groups_by_call_id
+            .replace(std::mem::take(&mut conversation.tool_groups_by_call_id));
+        self.session_cost.set(conversation.session_cost);
+        self.ui.telemetry.set_cost(conversation.session_cost);
+    }
+
+    fn replay_deferred_conversation_events(&self, runtime_id: u64) {
+        let events = self
+            .conversation_views
+            .borrow_mut()
+            .get_mut(&runtime_id)
+            .map(|conversation| std::mem::take(&mut conversation.deferred_events))
+            .unwrap_or_default();
+        for event in events {
+            match event {
+                RpcEvent::AgentStart => self.finish_active_tool_group(),
+                RpcEvent::AgentEnd => {
+                    if let Some(thinking) = self.streaming_thinking.borrow_mut().take() {
+                        thinking.finish(None);
+                        self.refresh_active_activity_summary();
+                    }
+                    self.finish_active_tool_group();
+                    self.streaming_message.borrow_mut().take();
+                }
+                RpcEvent::MessageStart(message) => self.message_started(&message),
+                RpcEvent::TextDelta(delta) => self.append_stream_delta(&delta),
+                RpcEvent::ThinkingDelta(delta) => self.append_thinking_delta(&delta),
+                RpcEvent::MessageEnd(message) => {
+                    self.message_ended(&message, ToolResultSource::History);
+                }
+                RpcEvent::ToolStart(tool) => {
+                    self.ensure_grouped_tool(&tool);
+                }
+                RpcEvent::ToolUpdate(tool) => self.tool_updated(tool),
+                RpcEvent::ToolEnd(tool) => self.tool_ended(tool, ToolResultSource::History),
+                _ => {}
+            }
+        }
     }
 
     fn apply_global_delivery_preferences(&self, runtime_id: u64, state: &SessionState) {
@@ -1057,6 +1116,12 @@ impl AppController {
         if let Some(running) = running {
             if let Some(runtime) = self.runtimes.borrow_mut().get_mut(&runtime_id) {
                 runtime.running = running;
+                if let Some(state) = runtime.state.as_mut() {
+                    state.is_streaming = running;
+                    if !running {
+                        state.is_compacting = false;
+                    }
+                }
             }
             for entry in self.active_sessions.borrow_mut().iter_mut() {
                 if entry.runtime_id == Some(runtime_id) {
@@ -1068,7 +1133,9 @@ impl AppController {
         if self.active_runtime.get() != Some(runtime_id)
             && matches!(
                 event,
-                RpcEvent::MessageStart(_)
+                RpcEvent::AgentStart
+                    | RpcEvent::AgentEnd
+                    | RpcEvent::MessageStart(_)
                     | RpcEvent::TextDelta(_)
                     | RpcEvent::ThinkingDelta(_)
                     | RpcEvent::MessageEnd(_)
@@ -1078,7 +1145,9 @@ impl AppController {
             )
             && let Some(conversation) = self.conversation_views.borrow_mut().get_mut(&runtime_id)
         {
-            conversation.hydrated = false;
+            if conversation.hydrated {
+                conversation.deferred_events.push_back(event.clone());
+            }
         }
 
         if self.active_runtime.get() != Some(runtime_id) {
@@ -1134,7 +1203,9 @@ impl AppController {
             RpcEvent::MessageStart(message) => self.message_started(&message),
             RpcEvent::TextDelta(delta) => self.append_stream_delta(&delta),
             RpcEvent::ThinkingDelta(delta) => self.append_thinking_delta(&delta),
-            RpcEvent::MessageEnd(message) => self.message_ended(&message),
+            RpcEvent::MessageEnd(message) => {
+                self.message_ended(&message, ToolResultSource::Live);
+            }
             RpcEvent::AgentStart => {
                 self.finish_active_tool_group();
                 self.running.set(true);
@@ -1570,6 +1641,13 @@ impl AppController {
         if let Some(client) = self.active_client() {
             let _ = client.refresh_state();
             let _ = client.refresh_messages();
+            let _ = client.refresh_subagents();
+        }
+    }
+
+    fn refresh_open_session_state(&self) {
+        if let Some(client) = self.active_client() {
+            let _ = client.refresh_state();
             let _ = client.refresh_subagents();
         }
     }
@@ -2239,6 +2317,9 @@ impl AppController {
         else {
             return;
         };
+        if let Some(previous_runtime_id) = self.active_runtime.get() {
+            self.stash_conversation_bindings(previous_runtime_id);
+        }
         self.active_runtime.set(Some(runtime_id));
         self.unread_runtimes.borrow_mut().remove(&runtime_id);
         self.ready.set(ready);
@@ -2248,21 +2329,31 @@ impl AppController {
         self.pending_submissions.borrow_mut().clear();
         self.current_session_file.replace(entry.path.clone());
         self.current_session_title.replace(entry.title.clone());
-        self.reset_message_bindings();
-        let was_cached = self.show_runtime_conversation(runtime_id);
+        let was_loaded = self.show_runtime_conversation(runtime_id);
+        self.restore_conversation_bindings(runtime_id);
         self.clear_subagents();
         self.set_session_title(&entry.title);
         if let Some(state) = cached_state {
             self.apply_state(state);
         }
+        self.replay_deferred_conversation_events(runtime_id);
+        self.running.set(running);
         self.ui.composer.set_input_sensitive(ready);
         if let Some(message) = disconnected {
             self.set_window_status(WindowStatus::Disconnected);
             self.ui.chat_status.disconnected();
             self.ui.conversation().show_disconnected(&message);
         } else {
-            self.ui.chat_status.activity("Opening conversation");
-            if !was_cached {
+            if was_loaded {
+                if running {
+                    self.ui.chat_status.activity("Working");
+                    self.set_window_status(WindowStatus::Working);
+                } else {
+                    self.ui.chat_status.idle();
+                    self.set_window_status(WindowStatus::Ready);
+                }
+            } else {
+                self.ui.chat_status.activity("Opening conversation");
                 self.ui.conversation().show_loading(
                     "Opening conversation",
                     "Restoring messages, tools, and session state.",
@@ -2270,7 +2361,11 @@ impl AppController {
                 );
             }
             if ready {
-                self.refresh_after_session_change();
+                if was_loaded {
+                    self.refresh_open_session_state();
+                } else {
+                    self.refresh_after_session_change();
+                }
             }
         }
         self.update_send_state();
@@ -2756,7 +2851,7 @@ impl AppController {
         self.scroll_to_bottom();
     }
 
-    fn message_ended(&self, message: &Value) {
+    fn message_ended(&self, message: &Value, source: ToolResultSource) {
         match message_role(message) {
             Some("assistant") => {
                 let final_thinking = message_thinking(message);
@@ -2799,7 +2894,7 @@ impl AppController {
                             result,
                             is_error,
                         },
-                        ToolResultSource::Live,
+                        source,
                     );
                 }
             }
@@ -4298,38 +4393,24 @@ async fn encode_image_in_background(
 mod tests {
     use super::{
         ComposerKeyAction, DeliveryModes, SubmissionAction, SubmissionIntent, ToolResultSource,
-        WARM_SESSION_VIEW_LIMIT, cloned_or_insert_with, completion_is_unread, composer_key_action,
+        cloned_or_insert_with, completion_is_unread, composer_key_action,
         delivery_preference_updates, gdk, has_visible_text, identifies_same_session,
         insert_session_by_creation, is_hidden_resume_message, is_resume_shortcut,
         messages_need_hydration, reorder_session_entries, session_actions_are_relevant,
         should_finish_hydrated_tool_group, should_send_delivery_preference_updates,
-        touch_bounded_lru, update_current_session,
+        update_current_session,
     };
     use crate::alerts::Preferences;
     use crate::bridge::protocol::{InterruptMode, QueueMode, SessionState};
     use crate::session_catalog::{SessionEntry, session_entry};
     use serde_json::json;
     use std::cell::RefCell;
-    use std::collections::VecDeque;
     use std::time::{Duration, SystemTime};
 
     #[test]
     fn tabbing_back_to_streaming_session_keeps_rolling_tool_group_open() {
         assert!(!should_finish_hydrated_tool_group(true));
         assert!(should_finish_hydrated_tool_group(false));
-    }
-
-    #[test]
-    fn warm_session_cache_evicts_the_least_recently_viewed_session() {
-        let mut order = VecDeque::from([1, 2, 3, 4]);
-
-        assert!(touch_bounded_lru(&mut order, 2, WARM_SESSION_VIEW_LIMIT).is_empty());
-        assert_eq!(order, [1, 3, 4, 2]);
-        assert_eq!(
-            touch_bounded_lru(&mut order, 5, WARM_SESSION_VIEW_LIMIT),
-            [1]
-        );
-        assert_eq!(order, [3, 4, 2, 5]);
     }
 
     #[test]
